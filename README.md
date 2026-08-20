@@ -10,6 +10,17 @@ Claude Code (Orchestrator) ─┬─ Sonnet Subagents (Routine Implementation)
                              └─ Codex CLI (Planning & Complex Code)
 ```
 
+## このリポジトリのアプリ
+
+**歩み値リプレイ** — J-Quants のティックデータを、その日の時間の流れのまま
+再生する Web アプリ（ティック / 分足チャート + 歩み値テープ）。
+
+```bash
+uv sync && uv run python run.py
+```
+
+詳細は [docs/tick-replay.md](./docs/tick-replay.md)。
+
 ## Quick Start
 
 Confirm that both AI CLIs are installed and authenticated first:

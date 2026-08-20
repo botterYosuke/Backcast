@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>歩み値リプレイ</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23faf8f4'/%3E%3Crect x='5' y='2' width='1' height='12' fill='%23c0392b'/%3E%3Crect x='3' y='4' width='5' height='7' fill='%23c0392b'/%3E%3Crect x='11' y='3' width='1' height='11' fill='%231d5fa8'/%3E%3Crect x='9' y='6' width='5' height='6' fill='%231d5fa8'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/static/styles.css" />
+<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>歩み値リプレイ</h1>
+    <p>J-Quants ティックデータを、その日の時間の流れのまま再生する</p>
+  </div>
+
+  <div class="picker">
+    <label class="field">
+      <span class="field-label">銘柄</span>
+      <input id="symbol-input" list="symbol-list" placeholder="7203" autocomplete="off" spellcheck="false" />
+      <datalist id="symbol-list"></datalist>
+    </label>
+
+    <label class="field">
+      <span class="field-label">日付</span>
+      <input id="date-input" type="date" />
+    </label>
+
+    <div class="day-nav">
+      <button id="prev-day" type="button" title="前の営業日">前日</button>
+      <button id="next-day" type="button" title="次の営業日">翌日</button>
+    </div>
+
+    <button id="load-button" class="primary" type="button">読み込む</button>
+  </div>
+</header>
+
+<div id="status-bar" class="status-bar" hidden></div>
+
+<main class="layout">
+
+  <section class="readout">
+    <div class="readout-item">
+      <span class="readout-label">銘柄</span>
+      <strong id="rd-code" class="readout-value">—</strong>
+    </div>
+    <div class="readout-item">
+      <span class="readout-label">現在値</span>
+      <strong id="rd-price" class="readout-value price">—</strong>
+    </div>
+    <div class="readout-item">
+      <span class="readout-label">始値比</span>
+      <strong id="rd-change" class="readout-value">—</strong>
+    </div>
+    <div class="readout-item">
+      <span class="readout-label">VWAP</span>
+      <strong id="rd-vwap" class="readout-value">—</strong>
+    </div>
+    <div class="readout-item">
+      <span class="readout-label">出来高</span>
+      <strong id="rd-volume" class="readout-value">—</strong>
+    </div>
+    <div class="readout-item">
+      <span class="readout-label">約定</span>
+      <strong id="rd-ticks" class="readout-value">—</strong>
+    </div>
+  </section>
+
+  <section class="card chart-card minute-card">
+    <div class="card-head">
+      <h2>分足</h2>
+      <p class="card-note">形成中の足は歩み値の進行に合わせて伸縮します（陽線＝赤／陰線＝青）</p>
+    </div>
+    <div id="minute-chart" class="chart"></div>
+  </section>
+
+  <div class="split">
+    <section class="card chart-card tick-card">
+      <div class="card-head">
+        <h2>ティック</h2>
+        <p class="card-note">約定ごとの価格推移</p>
+      </div>
+      <div id="tick-chart" class="chart"></div>
+    </section>
+
+    <section class="card tape-card">
+      <div class="card-head">
+        <h2>歩み値</h2>
+        <p class="card-note">新しい約定が上</p>
+      </div>
+      <div class="tape-head">
+        <span>時刻</span><span>価格</span><span>数量</span><span>区分</span>
+      </div>
+      <ol id="tape" class="tape"></ol>
+    </section>
+  </div>
+
+  <section class="transport">
+    <div class="transport-buttons">
+      <button id="reset-button" type="button" title="先頭に戻す">⏮</button>
+      <button id="play-button" class="play" type="button" title="再生 / 一時停止">▶</button>
+    </div>
+
+    <div id="speed-group" class="speed-group" role="group" aria-label="再生速度">
+      <button type="button" data-speed="1">x1</button>
+      <button type="button" data-speed="5">x5</button>
+      <button type="button" data-speed="20" class="active">x20</button>
+      <button type="button" data-speed="100">x100</button>
+      <button type="button" data-speed="500">x500</button>
+    </div>
+
+    <label class="toggle">
+      <input id="skip-gaps" type="checkbox" checked />
+      <span>空白時間をスキップ</span>
+    </label>
+
+    <input id="scrubber" class="scrubber" type="range" min="0" max="1000" value="0" step="1" />
+    <output id="clock" class="clock">--:--:-- / --:--:--</output>
+  </section>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
