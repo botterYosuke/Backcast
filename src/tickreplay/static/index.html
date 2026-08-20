@@ -41,84 +41,109 @@
 
 <main class="layout">
 
-  <section class="readout">
-    <div class="readout-item">
-      <span class="readout-label">銘柄</span>
-      <strong id="rd-code" class="readout-value">—</strong>
-    </div>
-    <div class="readout-item">
-      <span class="readout-label">現在値</span>
-      <strong id="rd-price" class="readout-value price">—</strong>
-    </div>
-    <div class="readout-item">
-      <span class="readout-label">始値比</span>
-      <strong id="rd-change" class="readout-value">—</strong>
-    </div>
-    <div class="readout-item">
-      <span class="readout-label">VWAP</span>
-      <strong id="rd-vwap" class="readout-value">—</strong>
-    </div>
-    <div class="readout-item">
-      <span class="readout-label">出来高</span>
-      <strong id="rd-volume" class="readout-value">—</strong>
-    </div>
-    <div class="readout-item">
-      <span class="readout-label">約定</span>
-      <strong id="rd-ticks" class="readout-value">—</strong>
-    </div>
-  </section>
+  <div class="layout-main">
 
-  <section class="card chart-card minute-card">
+    <section class="readout">
+      <div class="readout-item">
+        <span class="readout-label">銘柄</span>
+        <strong id="rd-code" class="readout-value">—</strong>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">現在値</span>
+        <strong id="rd-price" class="readout-value price">—</strong>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">始値比</span>
+        <strong id="rd-change" class="readout-value">—</strong>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">VWAP</span>
+        <strong id="rd-vwap" class="readout-value">—</strong>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">出来高</span>
+        <strong id="rd-volume" class="readout-value">—</strong>
+      </div>
+      <div class="readout-item">
+        <span class="readout-label">約定</span>
+        <strong id="rd-ticks" class="readout-value">—</strong>
+      </div>
+    </section>
+
+    <section class="card chart-card minute-card">
+      <div class="card-head">
+        <h2>分足</h2>
+        <p class="card-note">形成中の足は歩み値の進行に合わせて伸縮します（陽線＝赤／陰線＝青）</p>
+      </div>
+      <div id="minute-chart" class="chart"></div>
+    </section>
+
+    <div class="split">
+      <section class="card chart-card tick-card">
+        <div class="card-head">
+          <h2>ティック</h2>
+          <p class="card-note">約定ごとの価格推移</p>
+        </div>
+        <div id="tick-chart" class="chart"></div>
+      </section>
+
+      <section class="card tape-card">
+        <div class="card-head">
+          <h2>歩み値</h2>
+          <p class="card-note">新しい約定が上</p>
+        </div>
+        <div class="tape-head">
+          <span>時刻</span><span>価格</span><span>数量</span><span>区分</span>
+        </div>
+        <ol id="tape" class="tape"></ol>
+      </section>
+    </div>
+
+    <section class="transport">
+      <div class="transport-buttons">
+        <button id="reset-button" type="button" title="先頭に戻す">⏮</button>
+        <button id="play-button" class="play" type="button" title="再生 / 一時停止">▶</button>
+      </div>
+
+      <div id="speed-group" class="speed-group" role="group" aria-label="再生速度">
+        <button type="button" data-speed="1">x1</button>
+        <button type="button" data-speed="5">x5</button>
+        <button type="button" data-speed="20" class="active">x20</button>
+        <button type="button" data-speed="100">x100</button>
+        <button type="button" data-speed="500">x500</button>
+      </div>
+
+      <label class="toggle">
+        <input id="skip-gaps" type="checkbox" checked />
+        <span>空白時間をスキップ</span>
+      </label>
+
+      <input id="scrubber" class="scrubber" type="range" min="0" max="1000" value="0" step="1" />
+      <output id="clock" class="clock">--:--:-- / --:--:--</output>
+    </section>
+
+  </div><!-- /.layout-main -->
+
+  <aside class="card board-card">
     <div class="card-head">
-      <h2>分足</h2>
-      <p class="card-note">形成中の足は歩み値の進行に合わせて伸縮します（陽線＝赤／陰線＝青）</p>
-    </div>
-    <div id="minute-chart" class="chart"></div>
-  </section>
-
-  <div class="split">
-    <section class="card chart-card tick-card">
-      <div class="card-head">
-        <h2>ティック</h2>
-        <p class="card-note">約定ごとの価格推移</p>
-      </div>
-      <div id="tick-chart" class="chart"></div>
-    </section>
-
-    <section class="card tape-card">
-      <div class="card-head">
-        <h2>歩み値</h2>
-        <p class="card-note">新しい約定が上</p>
-      </div>
-      <div class="tape-head">
-        <span>時刻</span><span>価格</span><span>数量</span><span>区分</span>
-      </div>
-      <ol id="tape" class="tape"></ol>
-    </section>
-  </div>
-
-  <section class="transport">
-    <div class="transport-buttons">
-      <button id="reset-button" type="button" title="先頭に戻す">⏮</button>
-      <button id="play-button" class="play" type="button" title="再生 / 一時停止">▶</button>
+      <h2>板</h2>
+      <p class="card-note">板固定</p>
     </div>
 
-    <div id="speed-group" class="speed-group" role="group" aria-label="再生速度">
-      <button type="button" data-speed="1">x1</button>
-      <button type="button" data-speed="5">x5</button>
-      <button type="button" data-speed="20" class="active">x20</button>
-      <button type="button" data-speed="100">x100</button>
-      <button type="button" data-speed="500">x500</button>
+    <div class="board-head">
+      <span>売数量</span><span>価格</span><span>買数量</span>
     </div>
+    <ol id="board" class="board"></ol>
 
-    <label class="toggle">
-      <input id="skip-gaps" type="checkbox" checked />
-      <span>空白時間をスキップ</span>
-    </label>
-
-    <input id="scrubber" class="scrubber" type="range" min="0" max="1000" value="0" step="1" />
-    <output id="clock" class="clock">--:--:-- / --:--:--</output>
-  </section>
+    <div class="board-foot">
+      <label class="toggle">
+        <input id="board-fix" type="checkbox" checked />
+        <span>板固定</span>
+      </label>
+      <button id="board-center" type="button" title="現在値を板の中央へ">中央へ</button>
+      <span id="board-quote" class="board-quote">—</span>
+    </div>
+  </aside>
 
 </main>
 

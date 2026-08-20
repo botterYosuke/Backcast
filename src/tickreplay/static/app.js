@@ -29,6 +29,14 @@ const MAX_TAPE_INSERTS_PER_FRAME = 40;
 const MAX_TICK_UPDATES_PER_FRAME = 600;
 const MAX_TICK_POINTS_AFTER_SEEK = 20000;
 
+const BOARD_ROWS = 41;            // 板の行数（奇数・固定）
+const BOARD_QTY_SPAN = 10;        // 現在値の上下この行数だけ数量を出す
+const BOARD_MAX_FLASH = 6;        // 1 フレームで光らせる行の上限
+const BOARD_EMOJI = ['🍌', '🍑', '🍓', '🍒', '🍇', '🍎', '🍊', '🍐', '🥝', '🍡', '🍩', '🌸'];
+const BOARD_MAX_UNITS = 4;        // 1 行に並べる記号の最大個数
+// 呼値の候補。実データの価格差から一番近いものを選ぶ。
+const TICK_CANDIDATES = [0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000];
+
 const els = {
   symbolInput: document.getElementById('symbol-input'),
   symbolList: document.getElementById('symbol-list'),
@@ -50,6 +58,10 @@ const els = {
   rdVwap: document.getElementById('rd-vwap'),
   rdVolume: document.getElementById('rd-volume'),
   rdTicks: document.getElementById('rd-ticks'),
+  board: document.getElementById('board'),
+  boardFix: document.getElementById('board-fix'),
+  boardCenter: document.getElementById('board-center'),
+  boardQuote: document.getElementById('board-quote'),
 };
 
 // --------------------------------------------------------------- utilities
@@ -297,6 +309,215 @@ function rebuildTape() {
   els.tape.appendChild(fragment);
 }
 
+// ------------------------------------------------------------------- 板
+
+/*
+ * 板固定（呼値固定モード）の板。価格の列は動かさず、現在値の方が板の中を
+ * 上下する。歩み値には板情報が無いので、数量は「らしさ」の演出:
+ *   - 現在値の上下 BOARD_QTY_SPAN 行だけ記号を並べ、外は空白
+ *   - 最良買と最良売の間は 0/1/2 呼値ぶん空ける（0 > 1 > 2 の確率）
+ *   - 直近約定が上昇なら現在値＝最良売、下降なら現在値＝最良買とみなす
+ *   - 約定した価格の行は一瞬光らせる
+ */
+
+const board = {
+  tick: 1,          // 呼値（データから推定）
+  topLevel: null,   // 最上段（最高値）の呼値レベル。板固定の錨。
+  rows: [],         // {li, ask, price, bid, askText, bidText, className}
+  qty: new Map(),   // level -> 記号文字列
+  spread: 0,        // 最良買と最良売の間に空ける呼値の数 (0/1/2)
+  side: 'buy',      // 直近約定が売り板を食った(buy) / 買い板を食った(sell)
+};
+
+/** 価格差の最小値から呼値を推定する（データに呼値の情報が無いため）。 */
+function inferTickSize() {
+  const limit = Math.min(state.price.length, 4000);
+  const seen = new Set();
+  for (let index = 0; index < limit; index += 1) seen.add(state.price[index]);
+  const sorted = Array.from(seen).sort((a, b) => a - b);
+
+  let minDiff = Infinity;
+  for (let index = 1; index < sorted.length; index += 1) {
+    const diff = sorted[index] - sorted[index - 1];
+    if (diff > 1e-9 && diff < minDiff) minDiff = diff;
+  }
+  if (!Number.isFinite(minDiff)) return 1;
+
+  let best = TICK_CANDIDATES[0];
+  let bestError = Infinity;
+  TICK_CANDIDATES.forEach((candidate) => {
+    const error = Math.abs(Math.log(candidate / minDiff));
+    if (error < bestError) {
+      bestError = error;
+      best = candidate;
+    }
+  });
+  return best;
+}
+
+function levelOf(price) {
+  return Math.round(price / board.tick);
+}
+
+function priceOfLevel(level) {
+  return Math.round(level * board.tick * 1e4) / 1e4;
+}
+
+/** スプレッドを 0 > 1 > 2 の確率で引く。 */
+function rollSpread() {
+  const roll = Math.random();
+  if (roll < 0.6) return 0;
+  if (roll < 0.9) return 1;
+  return 2;
+}
+
+function randomQuantity() {
+  const emoji = BOARD_EMOJI[Math.floor(Math.random() * BOARD_EMOJI.length)];
+  return emoji.repeat(1 + Math.floor(Math.random() * BOARD_MAX_UNITS));
+}
+
+/** 呼値レベルの数量。一度決めた行は約定するまで変えない（チラつき防止）。 */
+function quantityAt(level) {
+  let quantity = board.qty.get(level);
+  if (quantity === undefined) {
+    quantity = randomQuantity();
+    board.qty.set(level, quantity);
+  }
+  return quantity;
+}
+
+function buildBoardRows() {
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < BOARD_ROWS; index += 1) {
+    const li = document.createElement('li');
+    const ask = document.createElement('span');
+    const price = document.createElement('span');
+    const bid = document.createElement('span');
+    ask.className = 'board-ask';
+    price.className = 'board-price';
+    bid.className = 'board-bid';
+    li.appendChild(ask);
+    li.appendChild(price);
+    li.appendChild(bid);
+    // 光り終わったらクラスを外す。付けっぱなしにすると売買の色が戻らない。
+    li.addEventListener('animationend', () => li.classList.remove('flash'));
+    fragment.appendChild(li);
+    board.rows.push({ li, ask, price, bid, askText: '', bidText: '', className: '' });
+  }
+  els.board.appendChild(fragment);
+}
+
+/** 板を張り直す（中央 = centerLevel）。価格の列はここでだけ動く。 */
+function anchorBoard(centerLevel) {
+  board.topLevel = centerLevel + (BOARD_ROWS - 1) / 2;
+  board.rows.forEach((row, index) => {
+    row.price.textContent = priceFormat.format(priceOfLevel(board.topLevel - index));
+  });
+
+  // 板が画面に入りきらない高さのときは、中央の行を見えるところへ寄せる。
+  // 張り直したときだけ動かすので、板固定中はスクロール位置も固定される。
+  const center = board.rows[(BOARD_ROWS - 1) / 2].li;
+  els.board.scrollTop = center.offsetTop - (els.board.clientHeight - center.offsetHeight) / 2;
+}
+
+function clearBoard() {
+  board.topLevel = null;
+  board.qty.clear();
+  board.rows.forEach((row) => {
+    row.price.textContent = '';
+    row.ask.textContent = '';
+    row.bid.textContent = '';
+    row.li.className = '';
+    row.askText = '';
+    row.bidText = '';
+    row.className = '';
+  });
+  els.boardQuote.textContent = '—';
+}
+
+function setRowText(row, ask, bid, className) {
+  if (row.askText !== ask) {
+    row.ask.textContent = ask;
+    row.askText = ask;
+  }
+  if (row.bidText !== bid) {
+    row.bid.textContent = bid;
+    row.bidText = bid;
+  }
+  if (row.className !== className) {
+    // flash は再生中に付いたり外れたりするので、行の状態クラスとは別に温存する。
+    const flashing = row.li.classList.contains('flash');
+    row.li.className = flashing ? (className + ' flash').trim() : className;
+    row.className = className;
+  }
+}
+
+function updateBoard() {
+  if (state.last === null) {
+    clearBoard();
+    return;
+  }
+
+  const lastLevel = levelOf(state.last);
+  const bottomLevel = board.topLevel === null ? null : board.topLevel - BOARD_ROWS + 1;
+  if (
+    board.topLevel === null ||
+    !els.boardFix.checked ||
+    lastLevel > board.topLevel ||
+    lastLevel < bottomLevel
+  ) {
+    // 板固定でも、現在値が板から出てしまったら張り直すしかない。
+    anchorBoard(lastLevel);
+  }
+
+  const askLevel = board.side === 'buy' ? lastLevel : lastLevel + board.spread + 1;
+  const bidLevel = board.side === 'buy' ? lastLevel - board.spread - 1 : lastLevel;
+
+  board.rows.forEach((row, index) => {
+    const level = board.topLevel - index;
+    const near = Math.abs(level - lastLevel) <= BOARD_QTY_SPAN;
+    const isAsk = near && level >= askLevel;
+    const isBid = near && level <= bidLevel;
+    const side = isAsk ? 'ask-side' : isBid ? 'bid-side' : '';
+    const className = level === lastLevel ? (side + ' last').trim() : side;
+    setRowText(row, isAsk ? quantityAt(level) : '', isBid ? quantityAt(level) : '', className);
+  });
+
+  els.boardQuote.textContent =
+    '売 ' + priceFormat.format(priceOfLevel(askLevel)) +
+    ' / 買 ' + priceFormat.format(priceOfLevel(bidLevel)) +
+    ' ・ スプレッド ' + board.spread;
+}
+
+/** 約定した価格の行を光らせる（アニメーションを頭から流し直す）。 */
+function flashBoardLevel(level) {
+  if (board.topLevel === null) return;
+  const index = board.topLevel - level;
+  if (index < 0 || index >= board.rows.length) return;
+  const li = board.rows[index].li;
+  li.classList.remove('flash');
+  void li.offsetWidth; // reflow を挟まないと同じ行の連続約定でアニメが再生されない
+  li.classList.add('flash');
+}
+
+/** 1 フレーム分の約定を板に反映する。 */
+function applyTradesToBoard(fromIndex, toIndex) {
+  const direction = tapeDirection(toIndex - 1);
+  if (direction === 'up') board.side = 'buy';
+  else if (direction === 'down') board.side = 'sell';
+  board.spread = rollSpread();
+
+  // 高速再生では 1 フレームに数千件届く。板に効かせるのは直近ぶんだけ。
+  const start = Math.max(fromIndex, toIndex - BOARD_MAX_FLASH);
+  for (let index = start; index < toIndex; index += 1) {
+    board.qty.delete(levelOf(state.price[index])); // 約定した板は入れ替わったとみなす
+  }
+  updateBoard();
+  for (let index = start; index < toIndex; index += 1) {
+    flashBoardLevel(levelOf(state.price[index]));
+  }
+}
+
 // ---------------------------------------------------------------- readouts
 
 function updateReadouts() {
@@ -383,6 +604,8 @@ function redrawAll() {
   tickSeries.setData(points);
 
   rebuildTape();
+  board.topLevel = null; // シークは不連続なので、板固定でも張り直す
+  updateBoard();
   updateReadouts();
   updateClock();
   syncScrubber();
@@ -442,6 +665,7 @@ function step(timestamp) {
     }
     pushTickPoints(from, state.cursor);
     pushTapeRows(from, state.cursor);
+    applyTradesToBoard(from, state.cursor);
     updateReadouts();
   }
 
@@ -519,6 +743,11 @@ async function loadSession(stem, date, direction) {
     state.qty = Float64Array.from(session.qty);
     state.type = session.type;
     els.dateInput.value = session.date;
+
+    board.tick = state.price.length ? inferTickSize() : 1;
+    board.side = 'buy';
+    board.spread = rollSpread();
+    clearBoard();
 
     if (!state.t.length) {
       setStatus(session.date + ' は約定がありません', 'error');
@@ -607,6 +836,16 @@ els.scrubber.addEventListener('input', () => {
   seekTo(target);
 });
 
+els.boardFix.addEventListener('change', () => {
+  board.topLevel = null; // 固定を切り替えたら、その場で現在値を中央へ
+  updateBoard();
+});
+
+els.boardCenter.addEventListener('click', () => {
+  board.topLevel = null;
+  updateBoard();
+});
+
 document.addEventListener('keydown', (event) => {
   if (event.target instanceof HTMLInputElement) return;
   if (event.code === 'Space') {
@@ -617,6 +856,7 @@ document.addEventListener('keydown', (event) => {
 
 // ------------------------------------------------------------------ start
 
+buildBoardRows();
 requestAnimationFrame(step);
 
 (async function bootstrap() {

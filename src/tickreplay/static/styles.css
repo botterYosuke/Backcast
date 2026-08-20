@@ -151,11 +151,19 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 
 .layout {
   display: flex;
-  flex-direction: column;
   flex: 1;
   min-height: 0;
   gap: 12px;
   padding: 14px 28px 18px;
+}
+
+.layout-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  gap: 12px;
 }
 
 .card {
@@ -348,11 +356,121 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------------------ 板 */
+
+.board-card {
+  width: 244px;
+  flex: none;
+}
+
+.board-head,
+.board li {
+  display: grid;
+  grid-template-columns: 1fr 62px 1fr;
+  gap: 6px;
+  align-items: center;
+  padding: 0 10px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.board-head {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-muted);
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-align: center;
+}
+
+.board {
+  position: relative; /* 行の offsetTop をこの中の座標にするため */
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.board li {
+  height: 20px;
+  border-bottom: 1px solid #f6f3ec;
+}
+
+.board-ask,
+.board-bid {
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10.5px;
+  letter-spacing: -0.04em;
+}
+
+.board-ask { text-align: right; }
+.board-bid { text-align: left; }
+
+.board-price {
+  text-align: center;
+  color: var(--ink-soft);
+  background: var(--surface-sunken);
+  border-radius: 3px;
+}
+
+/* 売気配は青、買気配は赤（国内証券の板の慣行） */
+.board li.ask-side .board-price { color: var(--down); }
+.board li.bid-side .board-price { color: var(--up); }
+.board li.ask-side { background: var(--down-soft); }
+.board li.bid-side { background: var(--up-soft); }
+
+.board li.last .board-price {
+  background: var(--accent);
+  color: #f7f4ee;
+  font-weight: 600;
+}
+
+/* 約定した価格の行を一瞬光らせる */
+@keyframes board-flash {
+  from { background: #ffe9a8; }
+  to { background: transparent; }
+}
+
+.board li.flash { animation: board-flash 420ms ease-out; }
+
+.board-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.board-foot button {
+  padding: 4px 8px;
+  font-size: 11.5px;
+}
+
+.board-foot .toggle { font-size: 11.5px; }
+
+.board-quote {
+  width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ------------------------------------------------------------ responsive */
 
 @media (max-width: 1180px) {
   .split { flex-direction: column; }
   .tape-card { width: auto; min-height: 200px; }
   .topbar { padding: 14px 18px; }
-  .layout { padding: 12px 18px 14px; }
+  .layout { flex-direction: column; padding: 12px 18px 14px; }
+  .board-card { width: auto; min-height: 320px; }
 }
