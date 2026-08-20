@@ -1,0 +1,62 @@
+[project]
+name = "my-project"
+version = "0.1.0"
+description = "LLM/Agent development project"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "ty>=0.0.58,<0.1",
+    "pytest>=8.0",
+    "poethepoet>=0.31",
+]
+
+# This template repo is not a Python package — pyproject.toml exists to carry
+# dev tooling (ruff/ty/pytest/poe). Downstream projects that ship a package
+# should add their own [build-system].
+[tool.uv]
+package = false
+
+# ============================================================
+# ruff
+# ============================================================
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ============================================================
+# pytest
+# ============================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+# ============================================================
+# poethepoet
+# ============================================================
+[tool.poe.tasks]
+lint = "ruff check . && ruff format --check ."
+format = "ruff check --fix . && ruff format ."
+typecheck = "ty check src/"
+test = "pytest -v"
+all = ["lint", "typecheck", "test"]

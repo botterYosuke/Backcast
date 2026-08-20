@@ -1,0 +1,66 @@
+# Claude Code local settings
+.claude/settings.local.json
+.claude/settings.orchestra.json
+CLAUDE.local.md
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Secrets
+*.pem
+*.key
+credentials*
+*secret*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.ruff_cache/
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+!.agents/logs/
+.agents/logs/*
+!.agents/logs/.gitkeep
+
+# Checkpoints (session-specific, may contain sensitive info)
+.agents/checkpoints/*
+!.agents/checkpoints/.gitkeep
+.orchestra-backup-*/
+
+# Jupyter
+.ipynb_checkpoints/
