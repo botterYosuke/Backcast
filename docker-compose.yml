@@ -1,0 +1,30 @@
+# 自宅 Docker 運用用。使い方:
+#   1. source を、実行ホストからローカルディスクとして見える DuckDB データルート
+#      （<この下>/stocks_trades/<銘柄>.duckdb がある場所）に書き換える
+#
+#      注意: S:\jp のような Windows のネットワークドライブ（NAS の SMB 共有）は
+#      Docker Desktop（WSL2 バックエンド）の Linux VM からは見えず、
+#      バインドマウントすると中身が空になる（このマシンで実機検証済み）。
+#      docker cifs ボリューム経由の直接マウントも試したが、NAS 側のアカウント
+#      権限の壁があり断念（cloud-run の Dockerfile が /cache の出所を関知しない
+#      のと同様、データをどうこのホストに持ってくるかは本ファイルの管轄外とする）。
+#      ローカルディスク上のパス、または NAS を SMB マウントできる別ホスト
+#      （例: Linux で /etc/fstab に cifs マウントしてそのパスを source に渡す）
+#      で実行すること。
+#   2. docker compose up -d --build
+#   3. http://<このホストのIP>:8765/ にアクセス
+services:
+  tickreplay:
+    build: .
+    image: backcast-tickreplay:latest
+    container_name: backcast-tickreplay
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      BACKCAST_JQUANTS_DUCKDB_ROOT: /data
+    volumes:
+      - type: bind
+        source: /StockData/jp   # ← 実行ホストから見えるデータルート
+        target: /data
+        read_only: true
