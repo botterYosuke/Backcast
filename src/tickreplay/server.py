@@ -21,6 +21,7 @@ operation-start handshake, consumed by Step 8's frontend polling).
 
 from __future__ import annotations
 
+import mimetypes
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -468,5 +469,14 @@ def read_session(
 def read_index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
+
+# Python's mimetypes module derives its table from the OS registry on
+# Windows, which commonly has no entry for ".mjs" and falls back to
+# "text/plain" — a browser refuses to execute a <script type="module">
+# served with that Content-Type ("Failed to load module script"), so
+# request-coordinator.mjs would 200 but silently never run. Registered
+# explicitly so StaticFiles' guess_type() reports it correctly regardless
+# of the host OS's registry contents.
+mimetypes.add_type("text/javascript", ".mjs")
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

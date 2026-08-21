@@ -273,6 +273,25 @@ def test_index_and_static_assets_are_served(client):
     assert "Lightweight Charts" in library.text[:400]
 
 
+def test_mjs_static_assets_are_served_with_a_javascript_content_type(client):
+    """Regression test: Python's ``mimetypes`` derives its table from the OS
+    registry on Windows, which commonly has no entry for ``.mjs`` and falls
+    back to ``text/plain``. A browser refuses to execute a
+    ``<script type="module">`` served with that Content-Type ("Failed to
+    load module script"), so ``request-coordinator.mjs`` would 200 but
+    silently never run — found only by loading the app in a real browser,
+    not by any status-code/body assertion. See ``server.py``'s
+    ``mimetypes.add_type("text/javascript", ".mjs")`` call.
+    """
+    response = client.get("/static/request-coordinator.mjs")
+    assert response.status_code == 200
+    content_type = response.headers["content-type"]
+    assert content_type.split(";")[0].strip() in {
+        "text/javascript",
+        "application/javascript",
+    }, content_type
+
+
 # ------------------------------------------ pending/operationId handshake
 
 
