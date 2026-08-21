@@ -8,12 +8,12 @@ import datetime
 import logging
 import os
 import re
-from typing import List, Optional
+from http import HTTPStatus
 
 import duckdb as _duckdb
 import strawberry
 from dotenv import load_dotenv
-from flask import Flask, send_from_directory
+from flask import Flask, jsonify, send_from_directory
 from strawberry.flask.views import GraphQLView
 from werkzeug.exceptions import HTTPException, NotFound
 
@@ -24,6 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.environ.get("STOCKDATA_CACHE_DIR", "/cache")
+STOCKS_TRADES_SUBDIR = os.path.join("jp", "stocks_trades")
 
 # Whitelist: only allow known file patterns
 ALLOWED_PATHS = re.compile(
@@ -36,6 +37,33 @@ def health():
     return "OK", 200
 
 
+@app.route("/api/stocks-trades", methods=["GET"])
+def list_stocks_trades():
+    """List the `jp/stocks_trades/*.duckdb` stems actually present on disk.
+
+    Returns a sorted, de-duplicated JSON array of stems (filenames without
+    the `.duckdb` suffix). The client (Backcast's ``tickreplay`` app)
+    re-filters this list through its own, stricter ``SYMBOL_STEM_RE`` before
+    trusting any entry — this endpoint intentionally does not attempt to
+    replicate that validation, it only reports what files exist.
+    """
+    directory = os.path.join(DATA_DIR, STOCKS_TRADES_SUBDIR)
+    try:
+        with os.scandir(directory) as entries:
+            stems = {
+                entry.name[: -len(".duckdb")]
+                for entry in entries
+                if entry.name.endswith(".duckdb") and entry.is_file()
+            }
+    except OSError:
+        logger.exception("Unable to list stocks_trades directory: %s", directory)
+        return (
+            jsonify({"error": "stocks_trades listing unavailable"}),
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    return jsonify({"stems": sorted(stems)})
+
+
 @app.route("/<path:file_path>", methods=["GET"])
 def download_file(file_path: str):
     if not ALLOWED_PATHS.match(file_path):
@@ -44,8 +72,17 @@ def download_file(file_path: str):
     directory = DATA_DIR
     logger.info("Serving: %s", file_path)
     try:
+        # send_from_directory (-> Werkzeug's send_file) already handles the
+        # full conditional-GET / Range contract by default (conditional=True
+        # since Flask 2.0): ETag + Last-Modified, If-None-Match/
+        # If-Modified-Since -> 304, Range/If-Range -> 206 with Content-Range,
+        # and an unsatisfiable Range -> 416. Verified in
+        # tests/test_cloud_run_main.py; nothing bespoke needed here.
         return send_from_directory(
-            directory, file_path, mimetype="application/octet-stream"
+            directory,
+            file_path,
+            mimetype="application/octet-stream",
+            conditional=True,
         )
     except NotFound:
         logger.warning("File not found: %s", file_path)
@@ -119,8 +156,8 @@ class DailyRankingItem:
     date: str
     code: str
     close: float
-    sort_value: Optional[float]
-    volume: Optional[float]
+    sort_value: float | None
+    volume: float | None
     rank: int
 
 
@@ -134,7 +171,7 @@ class Query:
         sort_by: str = "(Close - Close[-1]) / Close[-1] * 100",
         order: str = "desc",  # "desc" | "asc"
         limit: int = 20,
-    ) -> List[DailyRankingItem]:
+    ) -> list[DailyRankingItem]:
         """汎用ランキング（sortBy に DuckDB 計算式を直接指定）
         式中では Close[-N] / Open[-N] 等で N 営業日前の値を参照できる。
         例: (Close - Close[-2]) / Close[-2] * 100
@@ -152,8 +189,10 @@ class Query:
         try:
             from_dt = datetime.datetime.strptime(from_date, "%Y-%m-%d")
             to_dt = datetime.datetime.strptime(to_date, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("from_date and to_date must be in YYYY-MM-DD format")
+        except ValueError as error:
+            raise ValueError(
+                "from_date and to_date must be in YYYY-MM-DD format"
+            ) from error
 
         safe_from_date = from_dt.strftime("%Y-%m-%d")
         safe_to_date = to_dt.strftime("%Y-%m-%d")
@@ -166,7 +205,7 @@ class Query:
         boundary_sql = f"""
             SELECT "Date"
             FROM stocks_daily
-            WHERE "Code" = '7203' 
+            WHERE "Code" = '7203'
               AND "Date" >= '{min_date_val}' AND "Date" < '{safe_from_date}'
             ORDER BY "Date" DESC
             LIMIT {max_lag}

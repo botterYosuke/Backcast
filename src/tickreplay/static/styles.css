@@ -147,6 +147,12 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   color: #8c3324;
 }
 
+.status-bar[data-tone="degraded"] {
+  background: #fdf1e0;
+  border-bottom-color: #edcf9a;
+  color: #8a5a12;
+}
+
 /* ---------------------------------------------------------------- layout */
 
 .layout {

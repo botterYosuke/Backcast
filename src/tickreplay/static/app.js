@@ -1,3 +1,5 @@
+import { RequestCoordinator, isCancellationError } from './request-coordinator.mjs';
+
 /*
  * 歩み値リプレイ — tick / 分足のプレイバック
  *
@@ -99,8 +101,8 @@ function setStatus(message, tone) {
   els.statusBar.dataset.tone = tone || 'info';
 }
 
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, { signal } = {}) {
+  const response = await fetch(url, { signal });
   if (!response.ok) {
     let detail = response.statusText;
     try {
@@ -112,6 +114,32 @@ async function getJson(url) {
     throw new Error(detail);
   }
   return response.json();
+}
+
+const requests = new RequestCoordinator({
+  fetchJson: getJson,
+  onActivityChange: (kind, active) => {
+    if (kind === 'session') els.loadButton.disabled = active;
+  },
+});
+
+function showCacheStatus(stem, status) {
+  if (!status) {
+    setStatus('');
+    return;
+  }
+  if (status.state === 'stale-served') {
+    setStatus('⚠ 縮退運転: サーバーに接続できないため ' + stem + ' の既存キャッシュを使用します', 'degraded');
+    return;
+  }
+  if (status.state !== 'downloading') return;
+
+  let progress = intFormat.format(status.bytesReceived || 0) + ' bytes';
+  if (status.totalBytes) {
+    const percent = Math.min(100, Math.floor((status.bytesReceived || 0) * 100 / status.totalBytes));
+    progress = percent + '% (' + progress + ')';
+  }
+  setStatus('データをダウンロード中… ' + stem + ' ' + progress, 'info');
 }
 
 function addDays(isoDate, days) {
@@ -276,11 +304,18 @@ function tapeDirection(index) {
 function tapeRow(index) {
   const row = document.createElement('li');
   row.className = tapeDirection(index);
-  row.innerHTML =
-    '<span>' + formatClock(state.t[index], true) + '</span>' +
-    '<span class="tape-price">' + priceFormat.format(state.price[index]) + '</span>' +
-    '<span>' + intFormat.format(state.qty[index]) + '</span>' +
-    '<span>' + (state.type[index] || '') + '</span>';
+  const cells = [
+    [formatClock(state.t[index], true), ''],
+    [priceFormat.format(state.price[index]), 'tape-price'],
+    [intFormat.format(state.qty[index]), ''],
+    [state.type[index] || '', ''],
+  ];
+  cells.forEach(([text, className]) => {
+    const cell = document.createElement('span');
+    cell.className = className;
+    cell.textContent = text;
+    row.appendChild(cell);
+  });
   return row;
 }
 
@@ -706,7 +741,7 @@ function setPlaying(playing) {
 
 async function loadSymbols(prefix) {
   const query = prefix ? '?q=' + encodeURIComponent(prefix) : '';
-  const data = await getJson('/api/symbols' + query);
+  const data = await requests.fetchLatest('symbols', '/api/symbols' + query);
   els.symbolList.textContent = '';
   const fragment = document.createDocumentFragment();
   data.symbols.forEach((stem) => {
@@ -719,23 +754,33 @@ async function loadSymbols(prefix) {
 }
 
 async function loadSymbolInfo(stem) {
-  const info = await getJson('/api/symbols/' + encodeURIComponent(stem));
+  requests.cancel('session');
+  const result = await requests.fetchUntilReady(
+    'symbol-info',
+    '/api/symbols/' + encodeURIComponent(stem),
+    { stem, onStatus: (status) => showCacheStatus(stem, status) },
+  );
+  const info = result.data;
   els.dateInput.min = info.firstDate;
   els.dateInput.max = info.lastDate;
   if (!els.dateInput.value) els.dateInput.value = info.lastDate;
+  showCacheStatus(stem, result.status);
   return info;
 }
 
 async function loadSession(stem, date, direction) {
+  requests.cancel('symbol-info');
   setPlaying(false);
   setStatus('読み込み中… ' + stem + ' ' + date, 'info');
-  els.loadButton.disabled = true;
   try {
-    const session = await getJson(
+    const result = await requests.fetchUntilReady(
+      'session',
       '/api/session?stem=' + encodeURIComponent(stem) +
       '&date=' + encodeURIComponent(date) +
-      '&direction=' + direction
+      '&direction=' + direction,
+      { stem, onStatus: (status) => showCacheStatus(stem, status) },
     );
+    const session = result.data;
 
     state.meta = { stem: session.stem, code: session.code, date: session.date, count: session.count };
     state.t = Float64Array.from(session.us, (value) => value / 1e6);
@@ -756,15 +801,17 @@ async function loadSession(stem, date, direction) {
 
     seekTo(state.t[0] - 0.001);
     minuteChart.timeScale().applyOptions({ rightOffset: 3 });
-    setStatus(
-      session.code + ' / ' + session.date + ' — 約定 ' + intFormat.format(session.count) + ' 件 (' +
-      formatClock(state.t[0], false) + '–' + formatClock(state.t[state.t.length - 1], false) + ')',
-      'info'
-    );
+    const summary = session.code + ' / ' + session.date + ' — 約定 ' +
+      intFormat.format(session.count) + ' 件 (' + formatClock(state.t[0], false) +
+      '–' + formatClock(state.t[state.t.length - 1], false) + ')';
+    if (result.status?.state === 'stale-served') {
+      setStatus('⚠ 縮退運転（既存キャッシュ）: ' + summary, 'degraded');
+    } else {
+      setStatus(summary, 'info');
+    }
   } catch (error) {
+    if (isCancellationError(error)) return;
     setStatus('読み込みに失敗しました: ' + error.message, 'error');
-  } finally {
-    els.loadButton.disabled = false;
   }
 }
 
@@ -785,8 +832,8 @@ els.symbolInput.addEventListener('change', async () => {
   if (!stem) return;
   try {
     await loadSymbolInfo(stem);
-    setStatus('');
   } catch (error) {
+    if (isCancellationError(error)) return;
     setStatus('銘柄が見つかりません: ' + stem, 'error');
   }
 });
@@ -861,14 +908,9 @@ requestAnimationFrame(step);
 
 (async function bootstrap() {
   try {
-    const status = await getJson('/api/status');
-    if (!status.ok) {
-      setStatus('データの場所を解決できません: ' + status.error, 'error');
-      return;
-    }
     const data = await loadSymbols('');
     if (!data.symbols.length) {
-      setStatus('銘柄ファイルが見つかりません: ' + status.tradesDir, 'error');
+      setStatus('銘柄ファイルが見つかりません', 'error');
       return;
     }
     // 既定は 7203。存在しない環境では一覧の先頭にフォールバックする。
@@ -881,6 +923,7 @@ requestAnimationFrame(step);
     els.symbolInput.value = preferred;
     await loadSession(preferred, info.lastDate, -1);
   } catch (error) {
+    if (isCancellationError(error)) return;
     setStatus('初期化に失敗しました: ' + error.message, 'error');
   }
 })();

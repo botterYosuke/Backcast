@@ -8,6 +8,7 @@ dependencies = [
     "duckdb>=1.5.5",
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.52.4",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,13 @@ dev = [
 # should add their own [build-system].
 [tool.uv]
 package = false
+# `cloud-run-test` carries cloud-run/main.py's own runtime deps (Flask,
+# strawberry-graphql, python-dotenv — duckdb is already a root runtime dep)
+# so tests/test_cloud_run_main.py can import it without a second Python
+# environment. It is a default group (not an extra) so a plain `uv run
+# pytest` picks it up without an extra flag (a non-default `uv` dependency
+# group is NOT installed by a plain `uv run pytest` otherwise).
+default-groups = ["cloud-run-test"]
 
 # ============================================================
 # ruff
@@ -66,6 +74,11 @@ test = "pytest -v"
 all = ["lint", "typecheck", "test"]
 
 [dependency-groups]
-dev = [
-    "httpx>=0.28.1",
+# cloud-run/main.py's own runtime deps, needed only to import and test it
+# from the root uv environment (see tests/test_cloud_run_main.py). duckdb is
+# already in [project.dependencies] above, so it is not repeated here.
+cloud-run-test = [
+    "flask>=3.0",
+    "strawberry-graphql[flask]>=0.250",
+    "python-dotenv>=1.0",
 ]
