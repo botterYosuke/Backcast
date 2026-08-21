@@ -98,6 +98,7 @@ EXIT_EXTERNAL_FAILURE = 3
 
 def _emit(obj: dict) -> None:
     """Print a single JSON object to stdout."""
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
@@ -158,7 +159,8 @@ def run_git(root: Path, args: list[str]) -> tuple[str | None, str | None]:
             ["git", *args],
             cwd=root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:

@@ -14,10 +14,13 @@ failed git subcommand is never rendered as a clean tree.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -37,7 +40,7 @@ def run(project: Path, *extra: str) -> subprocess.CompletedProcess[str]:
             *extra,
         ],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         check=False,
     )
 
@@ -61,12 +64,52 @@ def project(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def collector_module() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("catchup_collect_repo_state", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def write_skill(root: Path, name: str, frontmatter: str) -> None:
     skill_dir = root / ".agents" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
         f"---\n{frontmatter}\n---\n\n# {name}\n", encoding="utf-8"
     )
+
+
+# --- git decoding regression -------------------------------------------------
+
+
+def test_run_git_decodes_utf8_independently_of_platform_locale(
+    collector_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = "cache\u2014"
+    real_run = subprocess.run
+
+    def emit_utf8(_command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        return real_run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write('cache\\u2014'.encode('utf-8'))",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(collector_module.subprocess, "run", emit_utf8)
+
+    output, error = collector_module.run_git(tmp_path, ["log"])
+
+    assert error is None
+    assert output == marker
 
 
 # --- the frontmatter regression ---------------------------------------------
@@ -76,7 +119,10 @@ def test_every_real_skill_reports_a_purpose() -> None:
     """Run against the actual repository: the empty purpose column was the
     defect, so the fixture that matters is the repo itself."""
     result = subprocess.run(
-        [sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False
+        [sys.executable, str(SCRIPT)],
+        capture_output=True,
+        encoding="utf-8",
+        check=False,
     )
     assert result.returncode == 0, result.stdout[-2000:]
     payload = json.loads(result.stdout)
@@ -358,7 +404,9 @@ def test_an_unreadable_rule_file_is_reported_not_blank(project: Path) -> None:
 
 def test_help_exits_zero_and_documents_project_root() -> None:
     result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True
+        [sys.executable, str(SCRIPT), "--help"],
+        capture_output=True,
+        encoding="utf-8",
     )
     assert result.returncode == 0
     assert "--project-root" in result.stdout
