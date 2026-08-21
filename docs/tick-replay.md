@@ -27,7 +27,11 @@ uv run python run.py
 `.duckdb` はもうローカルに同期済みのディレクトリを直接読まない。自宅サーバー
 `http://backcast.i234.me:8080`（`cloud-run/main.py`）から
 `stocks_trades/<銘柄>.duckdb` を必要なときにダウンロードし、ローカルの
-キャッシュディレクトリに保存して読む（DB は常に read-only で開く）。
+キャッシュディレクトリの `stocks_trades/` サブディレクトリに保存して読む
+（DB は常に read-only で開く）。サーバー側と同じ `stocks_trades/` の階層に
+するのは、`BACKCAST_DUCKDB_CACHE_DIR` に既存の `jp` データルート（例:
+`S:\jp`）を直接指定したとき、すでにある `jp\stocks_trades\<銘柄>.duckdb` を
+キャッシュ済みと認識してダウンロードをスキップできるようにするため。
 
 環境変数は環境変数 → リポジトリ直下 `.env` の順で解決する
 （`.env.example` を `.env` にコピーして使う。手元でファイルが作れない場合は

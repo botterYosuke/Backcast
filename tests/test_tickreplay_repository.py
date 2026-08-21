@@ -73,8 +73,8 @@ def test_a_malformed_symbol_identifier_raises_symbol_not_found(repository):
 def test_a_first_access_downloads_the_file_into_the_cache_dir(repository, cache_dir):
     repository.symbol_info("1301")
 
-    assert (cache_dir / "1301.duckdb").is_file()
-    assert (cache_dir / "1301.duckdb.sidecar.json").is_file()
+    assert cache.live_file_path(cache_dir, "1301").is_file()
+    assert cache.live_sidecar_path(cache_dir, "1301").is_file()
 
 
 def test_corrupt_existing_cache_forces_redownload_and_publishes_one_generation(

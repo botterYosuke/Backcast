@@ -31,6 +31,14 @@ import httpx
 
 STEM_PATH_TEMPLATE = "jp/stocks_trades/{stem}.duckdb"
 
+# Local cache files live under this subdirectory of `cache_dir`, mirroring
+# the server's own `jp/stocks_trades/` layout. This lets `BACKCAST_DUCKDB_
+# CACHE_DIR` point straight at an existing `jp`-style data root (e.g.
+# `S:\jp`) and have already-present `stocks_trades/<stem>.duckdb` files
+# recognized as cached, instead of every stem looking missing and being
+# redownloaded.
+STOCKS_TRADES_DIRNAME = "stocks_trades"
+
 MAX_DOWNLOAD_ATTEMPTS = 3
 RETRY_BACKOFF_BASE_SECONDS = 0.5
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MiB — streamed, never buffered whole.
@@ -75,20 +83,33 @@ class _RetryableTransportError(DownloadError):
 # --------------------------------------------------------------------------
 
 
+def stocks_trades_dir(cache_dir: Path) -> Path:
+    """The `stocks_trades` subdirectory of `cache_dir`, created on demand.
+
+    Created here (not only in `config.resolve_cache_config`) because this is
+    storage the app owns and manages, exactly like `cache_dir` itself — every
+    caller below can write straight to the returned paths without a separate
+    mkdir.
+    """
+    directory = cache_dir / STOCKS_TRADES_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def live_file_path(cache_dir: Path, stem: str) -> Path:
-    return cache_dir / f"{stem}.duckdb"
+    return stocks_trades_dir(cache_dir) / f"{stem}.duckdb"
 
 
 def live_sidecar_path(cache_dir: Path, stem: str) -> Path:
-    return cache_dir / f"{stem}.duckdb.sidecar.json"
+    return stocks_trades_dir(cache_dir) / f"{stem}.duckdb.sidecar.json"
 
 
 def staged_part_path(cache_dir: Path, stem: str) -> Path:
-    return cache_dir / f"{stem}.duckdb.part"
+    return stocks_trades_dir(cache_dir) / f"{stem}.duckdb.part"
 
 
 def staged_sidecar_tmp_path(cache_dir: Path, stem: str) -> Path:
-    return cache_dir / f"{stem}.duckdb.sidecar.json.tmp"
+    return stocks_trades_dir(cache_dir) / f"{stem}.duckdb.sidecar.json.tmp"
 
 
 @dataclass(frozen=True)
@@ -151,7 +172,7 @@ def discard_orphaned_part_files(cache_dir: Path) -> list[str]:
     the stems that had an orphan removed, for startup logging.
     """
     removed: list[str] = []
-    for part_path in sorted(cache_dir.glob("*.duckdb.part")):
+    for part_path in sorted(stocks_trades_dir(cache_dir).glob("*.duckdb.part")):
         stem = part_path.name[: -len(".duckdb.part")]
         try:
             part_path.unlink()

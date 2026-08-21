@@ -188,7 +188,7 @@ def reconcile_all_at_startup(cache_dir: Path, repository: TickRepository) -> lis
     """
     stems = sorted(
         path.name[: -len(".duckdb.sidecar.json.tmp")]
-        for path in cache_dir.glob("*.duckdb.sidecar.json.tmp")
+        for path in cache.stocks_trades_dir(cache_dir).glob("*.duckdb.sidecar.json.tmp")
     )
     for stem in stems:
         with repository.symbol_lock(stem):

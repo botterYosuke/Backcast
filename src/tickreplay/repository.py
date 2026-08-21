@@ -2,10 +2,14 @@
 
 Layout (verified against the live data set):
 
-* ``<cache_dir>/<stem>.duckdb`` holds ``stocks_board`` and
+* ``<cache_dir>/stocks_trades/<stem>.duckdb`` holds ``stocks_board`` and
   ``stocks_board_metadata``, downloaded on demand from the file server
   (``cache.py``/``cache_commit.py``, Steps 4-5 of
-  ``.agents/docs/plans/duckdb-server-cache.md``) and cached locally.
+  ``.agents/docs/plans/duckdb-server-cache.md``) and cached locally. The
+  ``stocks_trades`` subdirectory mirrors the server's own layout so that
+  pointing ``BACKCAST_DUCKDB_CACHE_DIR`` at an existing ``jp``-style data
+  root recognizes files already present under ``jp/stocks_trades`` as
+  cached, rather than redownloading them.
 * ``stocks_board``: ``Price DOUBLE, Qty BIGINT, Type VARCHAR, source VARCHAR,
   Code VARCHAR, Timestamp VARCHAR`` with a primary key on ``(Code, Timestamp)``.
   That primary key is what makes a single-session range scan fast even on the
@@ -338,7 +342,7 @@ class TickRepository:
     def _local_cached_stems(self) -> set[str]:
         return {
             path.name[: -len(".duckdb")]
-            for path in self.cache_dir.glob("*.duckdb")
+            for path in cache.stocks_trades_dir(self.cache_dir).glob("*.duckdb")
             if SYMBOL_STEM_RE.fullmatch(path.name[: -len(".duckdb")])
         }
 
