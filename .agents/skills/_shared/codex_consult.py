@@ -43,6 +43,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
+# Windows' default console codepage (cp932/Shift-JIS) can't encode most
+# Unicode punctuation (em dash, etc.) that shows up in Codex's Japanese
+# responses; without this, printing the final JSON summary crashes with
+# UnicodeEncodeError after codex exec already succeeded. utf-8 is safe
+# everywhere this script actually runs (it only ever prints one JSON line).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 
 DEFAULT_MODEL = "gpt-5.6-sol"
@@ -362,7 +373,12 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
     write_access = sandbox != "read-only"
 
     # --- codex must be resolvable on PATH before we attempt to run it ---
-    if shutil.which("codex") is None:
+    # Resolved (not the bare "codex" string) because on Windows the only
+    # match is often codex.cmd: subprocess.run(["codex", ...]) with
+    # shell=False cannot launch a .cmd file directly and fails with
+    # WinError 2, so the resolved path (with extension) is what gets execed.
+    codex_executable = shutil.which("codex")
+    if codex_executable is None:
         _emit(
             _not_found_report(
                 model, sandbox, write_access, "codex CLI not found on PATH"
@@ -400,7 +416,7 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
         return EXIT_FAILED
 
     cwd = args.cwd if args.cwd is not None else project_root
-    argv = ["codex", "exec", "--model", model, "--sandbox", sandbox]
+    argv = [codex_executable, "exec", "--model", model, "--sandbox", sandbox]
     if args.skip_git_repo_check:
         argv.append("--skip-git-repo-check")
     for override in args.config:
@@ -421,6 +437,8 @@ def main() -> int:  # noqa: C901 — single-function CLI entry point
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=args.timeout,
             cwd=cwd,
         )
