@@ -1,0 +1,5 @@
+flask>=3.0
+gunicorn>=22.0
+python-dotenv>=1.0
+strawberry-graphql[flask]>=0.250
+duckdb>=1.0
