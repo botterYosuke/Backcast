@@ -382,6 +382,8 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   color: var(--ink-soft);
   background: var(--surface-sunken);
   border-radius: 3px;
+  cursor: default;
+  user-select: none;
 }
 
 /* 売気配は青、買気配は赤（国内証券の板の慣行） */

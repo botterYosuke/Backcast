@@ -76,7 +76,24 @@ def sample_files(data_dir):
     board_dir.mkdir()
     board_target = board_dir / "7203.duckdb"
     board_target.write_bytes(b"board-data")
-    return {"dir": trades_dir, "target": target, "board_target": board_target}
+    # Minute files are keyed by the same stem as stocks_trades, so the set
+    # here mirrors it: a digits-only stem and a letter-bearing one.
+    minute_dir = data_dir / "jp" / "stocks_minute"
+    minute_dir.mkdir()
+    (minute_dir / "7203.duckdb").write_bytes(b"minute-data")
+    (minute_dir / "285A.duckdb").write_bytes(b"minute-data-285A")
+    # `130a` deliberately lowercase, and no uppercase sibling: the real
+    # dataset spells some minute files in the opposite case from their
+    # stocks_trades counterpart, which clients always request upper-cased.
+    # (Only one case of the stem is created — on a case-insensitive host
+    # filesystem the two names would be the same file.)
+    (minute_dir / "130a.duckdb").write_bytes(b"minute-data-130a")
+    return {
+        "dir": trades_dir,
+        "target": target,
+        "board_target": board_target,
+        "minute_dir": minute_dir,
+    }
 
 
 # ------------------------------------------------------------------- healthz
@@ -189,6 +206,87 @@ def test_download_stocks_board_file_remains_allowed(client, sample_files):
 
     assert response.status_code == 200
     assert response.content == b"board-data"
+
+
+def test_download_stocks_minute_file_is_allowed(client, sample_files):
+    response = client.get("/jp/stocks_minute/7203.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == b"minute-data"
+
+
+def test_download_stocks_minute_file_with_letter_in_stem_is_allowed(
+    client, sample_files
+):
+    """A letter-bearing stem's minute file must be served, same as its
+    stocks_trades counterpart. The whitelist used to accept digits only for
+    `stocks_minute`, which 404'd every such symbol (including the UI's
+    default, `285A`) before the file on disk was ever consulted — the minute
+    chart then silently came up empty for them.
+    """
+    response = client.get("/jp/stocks_minute/285A.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == b"minute-data-285A"
+
+
+def test_download_absent_stocks_minute_file_is_404(client, sample_files):
+    assert client.get("/jp/stocks_minute/9999.duckdb").status_code == 404
+
+
+def test_download_resolves_a_stem_stored_under_the_other_case(client, sample_files):
+    """An upper-cased request must find a lowercase-only file on disk.
+
+    Clients only ever ask for upper-cased stems, while the dataset spells
+    some minute files lowercase — on the case-sensitive filesystem of the
+    deployment container (unlike the Windows host the tree is authored on)
+    that mismatch is a 404 for a file that exists.
+    """
+    response = client.get("/jp/stocks_minute/130A.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == b"minute-data-130a"
+
+
+def test_stem_case_variants_tries_both_cases_of_a_letter_bearing_stem(
+    cloud_run_main,
+):
+    variants = cloud_run_main._stem_case_variants(
+        Path("/data/jp/stocks_minute/285A.duckdb")
+    )
+
+    # The request as it came in stays first, so an exactly-matching file
+    # always wins over a differently-cased sibling.
+    assert [path.name for path in variants] == ["285A.duckdb", "285a.duckdb"]
+
+
+def test_stem_case_variants_of_a_lowercase_request_includes_the_upper_case(
+    cloud_run_main,
+):
+    variants = cloud_run_main._stem_case_variants(
+        Path("/data/jp/stocks_trades/130a.duckdb")
+    )
+
+    assert [path.name for path in variants] == ["130a.duckdb", "130A.duckdb"]
+
+
+def test_stem_case_variants_of_a_digits_only_stem_is_just_itself(cloud_run_main):
+    variants = cloud_run_main._stem_case_variants(
+        Path("/data/jp/stocks_minute/7203.duckdb")
+    )
+
+    assert [path.name for path in variants] == ["7203.duckdb"]
+
+
+def test_stem_case_variants_never_leaves_the_requested_directory(cloud_run_main):
+    """Only the stem's case varies — the directory and suffix are untouched,
+    so this cannot widen what `ALLOWED_PATHS` already let through."""
+    source = Path("/data/jp/stocks_minute/285A.duckdb")
+
+    for variant in cloud_run_main._stem_case_variants(source):
+        assert variant.parent == source.parent
+        assert variant.suffix == source.suffix
+        assert variant.stem.lower() == source.stem.lower()
 
 
 # --------------------------------------------------------------- conditional

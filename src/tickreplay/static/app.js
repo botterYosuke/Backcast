@@ -14,6 +14,17 @@ import {
   cutoffKey,
   normalizeMinuteBars,
 } from './minute-history.mjs';
+import {
+  boardRowCount,
+  centeredScrollTop,
+  centeredTopLevel,
+  createBoardPriceFormatter,
+  hasProgrammaticScrollDrift,
+  levelAtRow,
+  pendingQuantityAtRow,
+  planBoardRebase,
+  rowIndexForLevel,
+} from './board-ladder.mjs';
 
 /*
  * 歩み値リプレイ — tick / 分足のプレイバック
@@ -52,7 +63,11 @@ const MAX_TICK_POINTS_AFTER_SEEK = 20000;
 const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロードする直前の分足の本数
 const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
-const BOARD_ROWS = 41;            // 板の行数（奇数・固定）
+const BOARD_MIN_ROWS = 41;        // 板の行数（奇数・表示領域に応じて拡張）
+const BOARD_ROW_HEIGHT = 20;
+const BOARD_OVERSCAN_ROWS = 12;
+const BOARD_REBASE_EDGE_ROWS = 4;
+const BOARD_REBASE_SHIFT_ROWS = 8;
 const BOARD_QTY_SPAN = 10;        // 現在値の上下この行数だけ数量を出す
 const BOARD_MAX_FLASH = 6;        // 1 フレームで光らせる行の上限
 const BOARD_EMOJI = ['🍌', '🍑', '🍓', '🍒', '🍇', '🍎', '🍊', '🍐', '🥝', '🍡', '🍩', '🌸'];
@@ -396,10 +411,20 @@ function rebuildTape() {
 const board = {
   tick: 1,          // 呼値（データから推定）
   topLevel: null,   // 最上段（最高値）の呼値レベル。板固定の錨。
-  rows: [],         // {li, ask, price, bid, askText, bidText, className}
+  rows: [],         // bounded physical row pool; every repaint derives a logical level
   qty: new Map(),   // level -> 記号文字列
+  flashLevels: new Set(),
   spread: 0,        // 最良買と最良売の間に空ける呼値の数 (0/1/2)
   side: 'buy',      // 直近約定が売り板を食った(buy) / 買い板を食った(sell)
+  manual: false,    // 板固定中にユーザーが現在値から離れているか
+  priceFormatter: createBoardPriceFormatter(1),
+  programmaticScroll: false,
+  programmaticScrollTarget: null,
+  deferredScrollTop: null,
+  deferredScrollMarksManual: false,
+  scrollFrame: null,
+  scrollReleaseFrame: null,
+  scrollGeneration: 0,
 };
 
 /** 価格差の最小値から呼値を推定する（データに呼値の情報が無いため）。 */
@@ -459,9 +484,93 @@ function quantityAt(level) {
   return quantity;
 }
 
+function cancelBoardScrollWork() {
+  board.scrollGeneration += 1;
+  if (board.scrollFrame !== null) cancelAnimationFrame(board.scrollFrame);
+  if (board.scrollReleaseFrame !== null) cancelAnimationFrame(board.scrollReleaseFrame);
+  board.scrollFrame = null;
+  board.scrollReleaseFrame = null;
+  board.programmaticScroll = false;
+  board.programmaticScrollTarget = null;
+  board.deferredScrollTop = null;
+  board.deferredScrollMarksManual = false;
+}
+
+function setBoardScrollTop(scrollTop) {
+  board.programmaticScroll = true;
+  board.programmaticScrollTarget = scrollTop;
+  board.deferredScrollTop = null;
+  board.deferredScrollMarksManual = false;
+  els.board.scrollTop = scrollTop;
+  if (board.scrollReleaseFrame !== null) cancelAnimationFrame(board.scrollReleaseFrame);
+  const generation = board.scrollGeneration;
+  board.scrollReleaseFrame = requestAnimationFrame(() => {
+    board.scrollReleaseFrame = null;
+    if (generation !== board.scrollGeneration) return;
+    const targetScrollTop = board.programmaticScrollTarget;
+    const actualScrollTop = els.board.scrollTop;
+    board.programmaticScroll = false;
+    board.deferredScrollTop = null;
+    if (hasProgrammaticScrollDrift(actualScrollTop, targetScrollTop)) {
+      board.programmaticScrollTarget = null;
+      scheduleBoardScrollReconcile(actualScrollTop, true);
+    }
+  });
+}
+
+function resetBoardNavigation() {
+  cancelBoardScrollWork();
+  board.manual = false;
+  board.topLevel = null;
+  setBoardScrollTop(0);
+}
+
+function boardRowHeight() {
+  if (board.rows.length > 1) {
+    const height = board.rows[1].li.offsetTop - board.rows[0].li.offsetTop;
+    if (height > 0) return height;
+  }
+  return board.rows[0]?.li.offsetHeight || BOARD_ROW_HEIGHT;
+}
+
+function centerBoardLevelInViewport(level) {
+  if (board.topLevel === null) return;
+  const rowIndex = rowIndexForLevel(board.topLevel, level, board.rows.length);
+  if (rowIndex < 0) return;
+  const row = board.rows[rowIndex].li;
+  setBoardScrollTop(centeredScrollTop({
+    rowOffsetTop: row.offsetTop,
+    rowHeight: row.offsetHeight || boardRowHeight(),
+    viewportHeight: els.board.clientHeight,
+    maxScrollTop: Math.max(0, els.board.scrollHeight - els.board.clientHeight),
+  }));
+}
+
 function buildBoardRows() {
+  const nextRowCount = boardRowCount(els.board.clientHeight, {
+    rowHeight: BOARD_ROW_HEIGHT,
+    minRows: BOARD_MIN_ROWS,
+    overscanRows: BOARD_OVERSCAN_ROWS,
+  });
+  if (board.rows.length === nextRowCount) return;
+
+  let visibleCenterLevel = null;
+  const wasManual = board.manual;
+  if (board.topLevel !== null && board.rows.length) {
+    const firstOffset = board.rows[0].li.offsetTop;
+    const centerOffset = els.board.scrollTop + els.board.clientHeight / 2 - firstOffset;
+    const centerIndex = Math.max(
+      0,
+      Math.min(board.rows.length - 1, Math.floor(centerOffset / boardRowHeight())),
+    );
+    visibleCenterLevel = levelAtRow(board.topLevel, centerIndex);
+  }
+
+  cancelBoardScrollWork();
+  els.board.textContent = '';
+  board.rows = [];
   const fragment = document.createDocumentFragment();
-  for (let index = 0; index < BOARD_ROWS; index += 1) {
+  for (let index = 0; index < nextRowCount; index += 1) {
     const li = document.createElement('li');
     li.dataset.index = String(index); // クリック位置 → 呼値レベルの逆算に使う
     const sellOrder = document.createElement('span');
@@ -481,34 +590,49 @@ function buildBoardRows() {
     li.appendChild(price);
     li.appendChild(bid);
     li.appendChild(buyOrder);
-    // 光り終わったらクラスを外す。付けっぱなしにすると売買の色が戻らない。
-    li.addEventListener('animationend', () => li.classList.remove('flash'));
     fragment.appendChild(li);
-    board.rows.push({
+    const row = {
       li, ask, price, bid, sellOrder, buyOrder,
-      askText: '', bidText: '', className: '',
+      askText: '', priceText: '', bidText: '', className: '',
       sellOrderText: '', buyOrderText: '',
+      flashLevel: null,
+    };
+    // 光り終わったら論理レベルとクラスを一緒に外す。
+    li.addEventListener('animationend', () => {
+      if (row.flashLevel !== null) board.flashLevels.delete(row.flashLevel);
+      row.flashLevel = null;
+      li.classList.remove('flash');
     });
+    board.rows.push(row);
   }
   els.board.appendChild(fragment);
+
+  if (state.last === null) {
+    resetBoardNavigation();
+    return;
+  }
+  if (wasManual && visibleCenterLevel !== null) {
+    board.manual = true;
+    board.topLevel = centeredTopLevel(visibleCenterLevel, board.rows.length);
+    updateBoard();
+    centerBoardLevelInViewport(visibleCenterLevel);
+    return;
+  }
+  resetBoardNavigation();
+  updateBoard();
 }
 
-/** 板を張り直す（中央 = centerLevel）。価格の列はここでだけ動く。 */
+/** 板を現在値へ張り直す（中央 = centerLevel）。 */
 function anchorBoard(centerLevel) {
-  board.topLevel = centerLevel + (BOARD_ROWS - 1) / 2;
-  board.rows.forEach((row, index) => {
-    row.price.textContent = priceFormat.format(priceOfLevel(board.topLevel - index));
-  });
-
-  // 板が画面に入りきらない高さのときは、中央の行を見えるところへ寄せる。
-  // 張り直したときだけ動かすので、板固定中はスクロール位置も固定される。
-  const center = board.rows[(BOARD_ROWS - 1) / 2].li;
-  els.board.scrollTop = center.offsetTop - (els.board.clientHeight - center.offsetHeight) / 2;
+  board.manual = false;
+  board.topLevel = centeredTopLevel(centerLevel, board.rows.length);
+  centerBoardLevelInViewport(centerLevel);
 }
 
 function clearBoard() {
-  board.topLevel = null;
+  resetBoardNavigation();
   board.qty.clear();
+  board.flashLevels.clear();
   board.rows.forEach((row) => {
     row.price.textContent = '';
     row.ask.textContent = '';
@@ -519,10 +643,12 @@ function clearBoard() {
     row.buyOrder.className = 'board-order order-buy';
     row.li.className = '';
     row.askText = '';
+    row.priceText = '';
     row.bidText = '';
     row.sellOrderText = '';
     row.buyOrderText = '';
     row.className = '';
+    row.flashLevel = null;
   });
   els.boardQuote.textContent = '—';
 }
@@ -554,6 +680,15 @@ function setOrderCell(row, key, quantity) {
   cell.classList.toggle('has-order', text !== '');
 }
 
+function syncRowFlash(row, level) {
+  if (row.flashLevel === level && board.flashLevels.has(level)) return;
+  row.li.classList.remove('flash');
+  row.flashLevel = null;
+  if (!board.flashLevels.has(level)) return;
+  row.flashLevel = level;
+  row.li.classList.add('flash');
+}
+
 function updateBoard() {
   if (state.last === null) {
     clearBoard();
@@ -561,14 +696,15 @@ function updateBoard() {
   }
 
   const lastLevel = levelOf(state.last);
-  const bottomLevel = board.topLevel === null ? null : board.topLevel - BOARD_ROWS + 1;
+  const bottomLevel = board.topLevel === null
+    ? null
+    : levelAtRow(board.topLevel, board.rows.length - 1);
   if (
     board.topLevel === null ||
     !els.boardFix.checked ||
-    lastLevel > board.topLevel ||
-    lastLevel < bottomLevel
+    (!board.manual && (lastLevel > board.topLevel || lastLevel < bottomLevel))
   ) {
-    // 板固定でも、現在値が板から出てしまったら張り直すしかない。
+    // 手動位置でなければ、固定中も現在値が行プールを出たところで張り直す。
     anchorBoard(lastLevel);
   }
 
@@ -577,31 +713,112 @@ function updateBoard() {
 
   const pendingSell = pendingByLevel('sell');
   const pendingBuy = pendingByLevel('buy');
+  board.flashLevels.forEach((level) => {
+    if (rowIndexForLevel(board.topLevel, level, board.rows.length) < 0) {
+      board.flashLevels.delete(level);
+    }
+  });
 
   board.rows.forEach((row, index) => {
-    const level = board.topLevel - index;
+    const level = levelAtRow(board.topLevel, index);
+    const priceText = board.priceFormatter.format(priceOfLevel(level));
+    if (row.priceText !== priceText) {
+      row.price.textContent = priceText;
+      row.priceText = priceText;
+    }
     const near = Math.abs(level - lastLevel) <= BOARD_QTY_SPAN;
     const isAsk = near && level >= askLevel;
     const isBid = near && level <= bidLevel;
     const side = isAsk ? 'ask-side' : isBid ? 'bid-side' : '';
     const className = level === lastLevel ? (side + ' last').trim() : side;
     setRowText(row, isAsk ? quantityAt(level) : '', isBid ? quantityAt(level) : '', className);
-    setOrderCell(row, 'sellOrder', pendingSell.get(level));
-    setOrderCell(row, 'buyOrder', pendingBuy.get(level));
+    syncRowFlash(row, level);
+    setOrderCell(
+      row,
+      'sellOrder',
+      pendingQuantityAtRow(pendingSell, board.topLevel, index, board.rows.length),
+    );
+    setOrderCell(
+      row,
+      'buyOrder',
+      pendingQuantityAtRow(pendingBuy, board.topLevel, index, board.rows.length),
+    );
   });
 
   els.boardQuote.textContent =
-    '売 ' + priceFormat.format(priceOfLevel(askLevel)) +
-    ' / 買 ' + priceFormat.format(priceOfLevel(bidLevel)) +
+    '売 ' + board.priceFormatter.format(priceOfLevel(askLevel)) +
+    ' / 買 ' + board.priceFormatter.format(priceOfLevel(bidLevel)) +
     ' ・ スプレッド ' + board.spread;
+}
+
+function centerBoardOnCurrent() {
+  resetBoardNavigation();
+  updateBoard();
+}
+
+function scheduleBoardScrollReconcile(scrollTop, marksManual) {
+  board.deferredScrollTop = scrollTop;
+  board.deferredScrollMarksManual = board.deferredScrollMarksManual || marksManual;
+  if (board.scrollFrame !== null || board.topLevel === null) return;
+  const generation = board.scrollGeneration;
+  board.scrollFrame = requestAnimationFrame(() => {
+    board.scrollFrame = null;
+    if (
+      generation !== board.scrollGeneration ||
+      board.programmaticScroll ||
+      board.topLevel === null
+    ) return;
+
+    const latestScrollTop = board.deferredScrollTop ?? els.board.scrollTop;
+    const shouldMarkManual = board.deferredScrollMarksManual;
+    board.deferredScrollTop = null;
+    board.deferredScrollMarksManual = false;
+    if (!els.boardFix.checked) {
+      centerBoardOnCurrent();
+      return;
+    }
+    if (shouldMarkManual) board.manual = true;
+    const result = planBoardRebase({
+      scrollTop: latestScrollTop,
+      viewportHeight: els.board.clientHeight,
+      scrollHeight: els.board.scrollHeight,
+      rowHeight: boardRowHeight(),
+      topLevel: board.topLevel,
+      rowCount: board.rows.length,
+      edgeRows: BOARD_REBASE_EDGE_ROWS,
+      shiftRows: BOARD_REBASE_SHIFT_ROWS,
+    });
+    if (!result) return;
+
+    board.topLevel = result.topLevel;
+    updateBoard();
+    setBoardScrollTop(result.scrollTop);
+  });
+}
+
+function onBoardScroll() {
+  if (board.topLevel === null) return;
+  if (board.programmaticScroll) {
+    board.deferredScrollTop = els.board.scrollTop;
+    return;
+  }
+  if (board.programmaticScrollTarget !== null) {
+    const targetScrollTop = board.programmaticScrollTarget;
+    board.programmaticScrollTarget = null;
+    if (!hasProgrammaticScrollDrift(els.board.scrollTop, targetScrollTop)) return;
+  }
+  scheduleBoardScrollReconcile(els.board.scrollTop, true);
 }
 
 /** 約定した価格の行を光らせる（アニメーションを頭から流し直す）。 */
 function flashBoardLevel(level) {
   if (board.topLevel === null) return;
-  const index = board.topLevel - level;
-  if (index < 0 || index >= board.rows.length) return;
-  const li = board.rows[index].li;
+  const index = rowIndexForLevel(board.topLevel, level, board.rows.length);
+  if (index < 0) return;
+  const row = board.rows[index];
+  const li = row.li;
+  board.flashLevels.add(level);
+  row.flashLevel = level;
   li.classList.remove('flash');
   void li.offsetWidth; // reflow を挟まないと同じ行の連続約定でアニメが再生されない
   li.classList.add('flash');
@@ -1075,7 +1292,7 @@ function redrawAll() {
   tickSeries.setData(points);
 
   rebuildTape();
-  board.topLevel = null; // シークは不連続なので、板固定でも張り直す
+  resetBoardNavigation(); // シークは不連続なので、板固定でも張り直す
   updateBoard();
   // 系列を setData で差し替えたのでマーカーも張り直す。
   refreshMarkers();
@@ -1257,6 +1474,7 @@ async function loadSession(stem, date, direction) {
   const requestedIdentity = stem + '|pending|' + date + '|' + direction;
   const generation = minuteHistory.resetSession(requestedIdentity);
   setPlaying(false);
+  resetBoardNavigation();
   resetTrading(); // 別セッションの建玉・損益・マーカーは持ち越さない
   setStatus('読み込み中… ' + stem + ' ' + date, 'info');
   try {
@@ -1298,6 +1516,7 @@ async function loadSession(stem, date, direction) {
         volumeSeries.setData([]);
       });
       tickSeries.setData([]);
+      clearBoard();
       minuteHistory.markSessionReady(generation, sessionIdentity);
       els.dateInput.value = session.date;
       setStatus(session.date + ' は約定がありません', 'error');
@@ -1315,6 +1534,7 @@ async function loadSession(stem, date, direction) {
     els.dateInput.value = session.date;
 
     board.tick = state.price.length ? inferTickSize() : 1;
+    board.priceFormatter = createBoardPriceFormatter(board.tick);
     board.side = 'buy';
     board.spread = rollSpread();
     clearBoard();
@@ -1414,20 +1634,24 @@ els.scrubber.addEventListener('input', () => {
 minuteChart.timeScale().subscribeVisibleLogicalRangeChange(onMinuteLogicalRangeChange);
 
 els.boardFix.addEventListener('change', () => {
-  board.topLevel = null; // 固定を切り替えたら、その場で現在値を中央へ
-  updateBoard();
+  centerBoardOnCurrent();
 });
 
-els.boardCenter.addEventListener('click', () => {
-  board.topLevel = null;
-  updateBoard();
+els.boardCenter.addEventListener('click', centerBoardOnCurrent);
+
+els.board.addEventListener('scroll', onBoardScroll, { passive: true });
+els.board.addEventListener('dblclick', (event) => {
+  const priceCell = event.target.closest('.board-price');
+  if (!priceCell) return;
+  event.preventDefault();
+  centerBoardOnCurrent();
 });
 
 // 発注列は行数ぶん個別にリスナを張らず、板全体で 1 つに委譲する。
 els.board.addEventListener('click', (event) => {
   const cell = event.target.closest('.board-order');
   if (!cell || board.topLevel === null || state.last === null) return;
-  const level = board.topLevel - Number(cell.parentElement.dataset.index);
+  const level = levelAtRow(board.topLevel, Number(cell.parentElement.dataset.index));
   placeOrder(cell.classList.contains('order-sell') ? 'sell' : 'buy', level);
 });
 
@@ -1456,6 +1680,9 @@ document.addEventListener('keydown', (event) => {
 // ------------------------------------------------------------------ start
 
 buildBoardRows();
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => buildBoardRows()).observe(els.board);
+}
 updatePositionPanel();
 requestAnimationFrame(step);
 

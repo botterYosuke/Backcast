@@ -110,9 +110,20 @@ def list_stocks_trades() -> JSONResponse:
     return JSONResponse({"stems": sorted(stems)})
 
 
-# Whitelist: only allow known file patterns
+# Whitelist: only allow known file patterns.
+#
+# `stocks_minute` uses the same `\w+` stem pattern as `stocks_trades`, not a
+# digits-only one: a stem is a 4-5 character code that may contain letters
+# (`285A`, `130A`, ... — 343 of the 4630 stems this server currently lists),
+# and `stocks_minute` is keyed by the very same stem as `stocks_trades` (see
+# `src/tickreplay/minute_context.py`). A digits-only pattern here rejected
+# every letter-bearing stem's minute file at the regex, before ever touching
+# the disk, so those symbols' candlestick charts came up empty against a
+# remotely hosted server while working locally (where the cache dir is read
+# directly and no HTTP request is involved) — including the UI's default
+# symbol, `285A`.
 ALLOWED_PATHS = re.compile(
-    r"^jp/(stocks_daily/(?:\d+|mother)\.duckdb|stocks_board/\d+\.duckdb|stocks_trades/\w+\.duckdb|stocks_minute/\d+\.duckdb|listed_info\.duckdb)$"
+    r"^jp/(stocks_daily/(?:\d+|mother)\.duckdb|stocks_board/\d+\.duckdb|stocks_trades/\w+\.duckdb|stocks_minute/\w+\.duckdb|listed_info\.duckdb)$"
 )
 
 # A single, well-formed, in-bounds `bytes=` range (RFC 7233), case-
@@ -202,6 +213,56 @@ async def _stream_fd(fd: int, start: int, length: int) -> AsyncIterator[bytes]:
         os.close(fd)
 
 
+def _stem_case_variants(full_path: Path) -> list[Path]:
+    """`full_path` plus the same path with its stem lower-/upper-cased.
+
+    The on-disk dataset spells a letter-bearing stem inconsistently — the
+    very same symbol can be `stocks_trades/285A.duckdb` but
+    `stocks_minute/285a.duckdb` (as of this writing, 116 of the 343
+    letter-bearing stems this server lists have a lowercase-only minute
+    file). Clients normalize a stem to upper case before requesting it
+    (`tickreplay.repository.SYMBOL_STEM_RE` is upper-case-only, and the UI
+    upper-cases what the user types), so on a case-sensitive filesystem —
+    which the Linux container this is deployed in has, unlike the Windows
+    host the same tree is authored on — those requests 404 against a file
+    that is right there under a differently-cased name.
+
+    Only the stem's case varies; the directory, the suffix, and every other
+    character of the request are left exactly as they came in, so this
+    widens what resolves on disk without widening `ALLOWED_PATHS` (both
+    variants of a whitelisted path are themselves whitelisted, since the
+    stem patterns are case-insensitive character classes).
+    """
+    candidates = [full_path]
+    for stem in (full_path.stem.lower(), full_path.stem.upper()):
+        # Compared as strings, not as paths: `WindowsPath("285A.duckdb") ==
+        # WindowsPath("285a.duckdb")` is True (PurePath's equality folds case
+        # on Windows), which would collapse the very variant this is here to
+        # produce whenever the tests — or a developer — run on the authoring
+        # host rather than the deployment container.
+        if stem == full_path.stem:
+            continue
+        candidates.append(full_path.with_name(stem + full_path.suffix))
+    return candidates
+
+
+def _open_first_existing(full_path: Path, data_root: str) -> tuple[int, os.stat_result]:
+    """`_open_and_check` over `_stem_case_variants`, first one that opens.
+
+    Raises the original path's `OSError` if none of them do, so the caller's
+    404 mapping is unchanged for a genuinely absent file.
+    """
+    first_error: OSError | None = None
+    for candidate in _stem_case_variants(full_path):
+        try:
+            return _open_and_check(candidate, data_root)
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+    assert first_error is not None
+    raise first_error
+
+
 @app.api_route("/jp/{file_path:path}", methods=["GET", "HEAD"])
 async def download_file(file_path: str, request: Request) -> Response:
     # The route's literal "/jp/" prefix is not part of the captured
@@ -215,7 +276,9 @@ async def download_file(file_path: str, request: Request) -> Response:
 
     full_path = Path(DATA_DIR) / full_relative_path
     try:
-        fd, st = await anyio.to_thread.run_sync(_open_and_check, full_path, DATA_DIR)
+        fd, st = await anyio.to_thread.run_sync(
+            _open_first_existing, full_path, DATA_DIR
+        )
     except OSError:
         return PlainTextResponse("Not Found", status_code=404)
 
