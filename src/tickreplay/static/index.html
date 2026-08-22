@@ -113,7 +113,10 @@
 
   <aside class="card board-card">
     <div class="card-head">
-      <h2>板</h2>
+      <label class="toggle">
+        <input id="board-fix" type="checkbox" checked />
+        <span>板固定</span>
+      </label>
       <label class="order-qty-field">
         <span class="order-qty-label">注文数量</span>
         <input id="order-qty" type="number" min="100" step="100" value="100" inputmode="numeric" />
@@ -128,16 +131,11 @@
 
     <div class="board-order-foot">
       <button id="cancel-sell" type="button" title="売り注文をすべて取消">取消</button>
-      <span class="board-order-note">未約定の注文を取消</span>
+      <button id="board-center" class="board-order-note" type="button" title="現在値を板の中央へ">中央へ</button>
       <button id="cancel-buy" type="button" title="買い注文をすべて取消">取消</button>
     </div>
 
     <div class="board-foot">
-      <label class="toggle">
-        <input id="board-fix" type="checkbox" checked />
-        <span>板固定</span>
-      </label>
-      <button id="board-center" type="button" title="現在値を板の中央へ">中央へ</button>
       <span id="board-quote" class="board-quote">—</span>
     </div>
   </aside>
