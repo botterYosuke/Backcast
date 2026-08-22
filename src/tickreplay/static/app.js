@@ -1466,8 +1466,8 @@ requestAnimationFrame(step);
       setStatus('銘柄ファイルが見つかりません', 'error');
       return;
     }
-    // 既定は 7203。存在しない環境では一覧の先頭にフォールバックする。
-    let preferred = '7203';
+    // 既定は 285A。存在しない環境では一覧の先頭にフォールバックする。
+    let preferred = '285A';
     let info = await loadSymbolInfo(preferred).catch(() => null);
     if (!info) {
       preferred = data.symbols[0];

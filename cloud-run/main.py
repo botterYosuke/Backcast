@@ -425,13 +425,13 @@ def _stock_ranking_range(
     min_date_val = (from_dt - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
 
     # データが Code 順にクラスタリングされているため、全探索を防ぐ目的で
-    # 時価総額日本一(7203: トヨタ)の営業日カレンダーを利用して遡及日を高速抽出する
+    # 時価総額日本一(285A: キオクシア)の営業日カレンダーを利用して遡及日を高速抽出する
     # 内部で MIN() を取ると DuckDB オプティマイザがサブクエリを展開して
     # フルテーブルスキャンにフォールバックするため、結果を必ずリストで受け取る
     boundary_sql = f"""
             SELECT "Date"
             FROM stocks_daily
-            WHERE "Code" = '7203'
+            WHERE "Code" = '285A'
               AND "Date" >= '{min_date_val}' AND "Date" < '{safe_from_date}'
             ORDER BY "Date" DESC
             LIMIT {max_lag}

@@ -11,6 +11,26 @@
 <body>
 
 <header class="topbar">
+  <div class="picker">
+    <label class="field">
+      <span class="field-label">銘柄</span>
+      <input id="symbol-input" list="symbol-list" placeholder="285A" autocomplete="off" spellcheck="false" />
+      <datalist id="symbol-list"></datalist>
+    </label>
+
+    <label class="field">
+      <span class="field-label">日付</span>
+      <input id="date-input" type="date" />
+    </label>
+
+    <div class="day-nav">
+      <button id="prev-day" type="button" title="前の営業日">前日</button>
+      <button id="next-day" type="button" title="次の営業日">翌日</button>
+    </div>
+
+    <button id="load-button" class="primary" type="button">読み込む</button>
+  </div>
+
   <div class="position-panel">
     <div class="pos-item">
       <span class="pos-label">保有数</span>
@@ -28,26 +48,6 @@
       <span class="pos-label">合計損益</span>
       <span id="pos-total" class="pos-value">—</span>
     </div>
-  </div>
-
-  <div class="picker">
-    <label class="field">
-      <span class="field-label">銘柄</span>
-      <input id="symbol-input" list="symbol-list" placeholder="7203" autocomplete="off" spellcheck="false" />
-      <datalist id="symbol-list"></datalist>
-    </label>
-
-    <label class="field">
-      <span class="field-label">日付</span>
-      <input id="date-input" type="date" />
-    </label>
-
-    <div class="day-nav">
-      <button id="prev-day" type="button" title="前の営業日">前日</button>
-      <button id="next-day" type="button" title="次の営業日">翌日</button>
-    </div>
-
-    <button id="load-button" class="primary" type="button">読み込む</button>
   </div>
 </header>
 

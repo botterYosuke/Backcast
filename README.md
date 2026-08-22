@@ -21,6 +21,28 @@ uv sync && uv run python run.py
 
 詳細は [docs/tick-replay.md](./docs/tick-replay.md)。
 
+### Docker Hub へのデプロイ
+
+Docker が起動していることと、`backcast/cloud-run` へ push できる Docker Hub
+アカウントでログインできることを確認します。認証情報はコマンドに直接書かず、
+`docker login` のプロンプトで入力してください。
+
+リポジトリルートで PowerShell を開き、次を実行します。
+
+```powershell
+docker login
+docker build --file .\cloud-run\Dockerfile --tag backcast/cloud-run:latest .
+docker push backcast/cloud-run:latest
+docker buildx imagetools inspect backcast/cloud-run:latest
+```
+
+build コマンド末尾の `.` はリポジトリルートを build context にします。
+Dockerfile が `cloud-run/` と `src/` の両方を `COPY` するため必須です。
+最後のコマンドで、Docker Hub 上のイメージ名、digest、manifest を確認できます。
+
+`latest` を push すると、Docker Hub の `latest` タグは新しいイメージへ移動し、
+以前のイメージを指さなくなります。
+
 ## Quick Start
 
 Confirm that both AI CLIs are installed and authenticated first:
