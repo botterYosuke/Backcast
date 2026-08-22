@@ -263,6 +263,45 @@ def test_a_malformed_date_is_rejected(client):
     assert "invalid date" in response.json()["detail"]
 
 
+# ------------------------------------------------------- /api/minute-context
+
+
+def test_minute_context_returns_bars_before_the_cutoff(client, minute_db_factory):
+    minute_db_factory(
+        "1301",
+        [
+            ("2026-08-14", "09:00", "13010", 100.0, 101.0, 99.0, 100.5, 1000, 100500),
+            ("2026-08-14", "09:01", "13010", 100.5, 102.0, 100.0, 101.5, 2000, 203000),
+        ],
+    )
+
+    body = client.get(
+        "/api/minute-context",
+        params={
+            "stem": "1301",
+            "code": "13010",
+            "date": "2026-08-17",
+            "time": "09:00",
+            "limit": 5,
+        },
+    ).json()
+
+    assert [bar["close"] for bar in body["bars"]] == [100.5, 101.5]
+
+
+def test_minute_context_degrades_to_an_empty_list_when_no_minute_file_exists(client):
+    """No `minute_db_factory` call for this stem — the mock server 404s the
+    download — this must be a 200 with an empty list, never an error: a
+    session load must never fail just because this optional preload
+    couldn't be fetched."""
+    response = client.get(
+        "/api/minute-context",
+        params={"stem": "1301", "code": "13010", "date": "2026-08-17", "time": "09:00"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"bars": []}
+
+
 def test_index_and_static_assets_are_served(client):
     index = client.get("/")
     assert index.status_code == 200

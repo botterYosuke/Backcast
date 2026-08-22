@@ -39,6 +39,24 @@ CREATE TABLE stocks_board_metadata (
 )
 """
 
+# Shape verified against a real `jp/stocks_minute/<stem>.duckdb` file
+# (`stocks_minute`'s columns; `stocks_minute_metadata` is unused by
+# `minute_context.py` and so not modeled here).
+CREATE_MINUTE = """
+CREATE TABLE stocks_minute (
+    Date DATE,
+    "Time" VARCHAR,
+    Code VARCHAR,
+    Open DOUBLE,
+    High DOUBLE,
+    Low DOUBLE,
+    Close DOUBLE,
+    Volume BIGINT,
+    Value BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
 
 @pytest.fixture
 def cache_dir(tmp_path: Path) -> Path:
@@ -104,10 +122,59 @@ def tick_db_factory(remote_store: dict[str, bytes], tmp_path: Path):
     return make
 
 
-def _mock_handler(remote_store: dict[str, bytes]):
+@pytest.fixture
+def minute_remote_store() -> dict[str, bytes]:
+    """In-memory ``{stem: bytes}`` standing in for the file server's
+    ``jp/stocks_minute`` directory, served by `mock_transport`. Empty by
+    default (and thus a 404 for every stem) unless a test populates it via
+    `minute_db_factory`."""
+    return {}
+
+
+@pytest.fixture
+def minute_db_factory(minute_remote_store: dict[str, bytes], tmp_path: Path):
+    """Return ``make(stem, rows)``, registering one `stocks_minute` file's
+    bytes in ``minute_remote_store``. Each row is ``(date, time, code, open,
+    high, low, close, volume, value)`` — `date` and `time` as ISO strings
+    (e.g. ``"2024-04-01"``, ``"09:00"``)."""
+    import duckdb
+
+    call_counter = {"n": 0}
+
+    def make(stem: str, rows: list[tuple]) -> bytes:
+        call_counter["n"] += 1
+        path = tmp_path / f"_minute_source_{stem}_{call_counter['n']}.duckdb"
+        connection = duckdb.connect(str(path))
+        try:
+            connection.execute(CREATE_MINUTE)
+            for date, time, code, o, h, low, c, volume, value in rows:
+                connection.execute(
+                    'INSERT INTO stocks_minute (Date, "Time", Code, Open, High, '
+                    "Low, Close, Volume, Value) "
+                    "VALUES (CAST(? AS DATE), ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [date, time, code, o, h, low, c, volume, value],
+                )
+        finally:
+            connection.close()
+        data = path.read_bytes()
+        minute_remote_store[stem] = data
+        return data
+
+    return make
+
+
+def _mock_handler(remote_store: dict[str, bytes], minute_store: dict[str, bytes]):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/stocks-trades":
             return httpx.Response(200, json={"stems": sorted(remote_store)})
+        if request.url.path.startswith("/jp/stocks_minute/"):
+            stem = request.url.path.rsplit("/", 1)[-1]
+            if stem.endswith(".duckdb"):
+                stem = stem[: -len(".duckdb")]
+            body = minute_store.get(stem)
+            if body is None:
+                return httpx.Response(404)
+            return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
         assert request.url.path.startswith("/jp/stocks_trades/")
         stem = request.url.path.rsplit("/", 1)[-1]
         if stem.endswith(".duckdb"):
@@ -126,10 +193,13 @@ def _mock_handler(remote_store: dict[str, bytes]):
 
 
 @pytest.fixture
-def mock_transport(remote_store: dict[str, bytes]) -> httpx.MockTransport:
-    """Serves `/api/stocks-trades` and `/jp/stocks_trades/<stem>.duckdb`
-    (with real conditional-GET semantics) straight out of `remote_store`."""
-    return httpx.MockTransport(_mock_handler(remote_store))
+def mock_transport(
+    remote_store: dict[str, bytes], minute_remote_store: dict[str, bytes]
+) -> httpx.MockTransport:
+    """Serves `/api/stocks-trades`, `/jp/stocks_trades/<stem>.duckdb` (with
+    real conditional-GET semantics), and `/jp/stocks_minute/<stem>.duckdb`
+    straight out of `remote_store`/`minute_remote_store`."""
+    return httpx.MockTransport(_mock_handler(remote_store, minute_remote_store))
 
 
 @pytest.fixture

@@ -24,12 +24,14 @@ const DOWN_FILL = 'rgba(29, 95, 168, 0.35)';
 
 const MINUTE = 60;
 const TICK_WINDOW_SECONDS = 300;      // ティックチャートの表示幅
-const MINUTE_WINDOW_SECONDS = 90 * 60; // 分足チャートの表示幅
+const MINUTE_VISIBLE_BARS = 90;       // 分足チャートに表示するバー本数（論理インデックス基準）
+const MINUTE_RIGHT_PADDING_BARS = 5;  // 分足チャートの右側の余白（本数）
 const GAP_SKIP_SECONDS = 5;           // これ以上の無約定はスキップ対象
 const MAX_TAPE_ROWS = 200;
 const MAX_TAPE_INSERTS_PER_FRAME = 40;
 const MAX_TICK_UPDATES_PER_FRAME = 600;
 const MAX_TICK_POINTS_AFTER_SEEK = 20000;
+const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロードする直前の分足の本数
 
 const BOARD_ROWS = 41;            // 板の行数（奇数・固定）
 const BOARD_QTY_SPAN = 10;        // 現在値の上下この行数だけ数量を出す
@@ -54,12 +56,6 @@ const els = {
   scrubber: document.getElementById('scrubber'),
   clock: document.getElementById('clock'),
   tape: document.getElementById('tape'),
-  rdCode: document.getElementById('rd-code'),
-  rdPrice: document.getElementById('rd-price'),
-  rdChange: document.getElementById('rd-change'),
-  rdVwap: document.getElementById('rd-vwap'),
-  rdVolume: document.getElementById('rd-volume'),
-  rdTicks: document.getElementById('rd-ticks'),
   board: document.getElementById('board'),
   boardFix: document.getElementById('board-fix'),
   boardCenter: document.getElementById('board-center'),
@@ -227,13 +223,11 @@ const state = {
   cursor: 0,        // 次に流す約定の添字
   vt: 0,            // 仮想時刻 (epoch 秒)
   playing: false,
-  speed: 20,
+  speed: 1,
   bars: [],         // 集計済みの分足
+  contextBars: [],  // セッション開始前にプリロードした直前の分足（stocks_minute）
   tickPoints: [],   // ティックチャートに投入済みの点
-  open: null,
   last: null,
-  cumQty: 0,
-  cumValue: 0,
   lastFrame: 0,
   scrubbing: false,
 };
@@ -271,10 +265,7 @@ function applyTick(index, touched) {
   const price = state.price[index];
   const quantity = state.qty[index];
 
-  if (state.open === null) state.open = price;
   state.last = price;
-  state.cumQty += quantity;
-  state.cumValue += price * quantity;
 
   const minuteStart = Math.floor(time / MINUTE) * MINUTE;
   let bar = state.bars.length ? state.bars[state.bars.length - 1] : null;
@@ -553,40 +544,7 @@ function applyTradesToBoard(fromIndex, toIndex) {
   }
 }
 
-// ---------------------------------------------------------------- readouts
-
-function updateReadouts() {
-  if (!state.meta) return;
-  els.rdCode.textContent = state.meta.code + '  ' + state.meta.date;
-
-  if (state.last === null) {
-    els.rdPrice.textContent = '—';
-    els.rdPrice.className = 'readout-value price';
-    els.rdChange.textContent = '—';
-    els.rdChange.className = 'readout-value';
-    els.rdVwap.textContent = '—';
-    els.rdVolume.textContent = '0';
-    els.rdTicks.textContent = '0 / ' + intFormat.format(state.meta.count);
-    return;
-  }
-
-  const change = state.last - state.open;
-  const ratio = state.open ? (change / state.open) * 100 : 0;
-  const tone = change > 0 ? 'up' : change < 0 ? 'down' : '';
-  const sign = change > 0 ? '+' : '';
-
-  els.rdPrice.textContent = priceFormat.format(state.last);
-  els.rdPrice.className = 'readout-value price ' + tone;
-  els.rdChange.textContent =
-    sign + priceFormat.format(change) + ' (' + sign + ratio.toFixed(2) + '%)';
-  els.rdChange.className = 'readout-value ' + tone;
-  els.rdVwap.textContent = state.cumQty
-    ? priceFormat.format(state.cumValue / state.cumQty)
-    : '—';
-  els.rdVolume.textContent = intFormat.format(state.cumQty);
-  els.rdTicks.textContent =
-    intFormat.format(state.cursor) + ' / ' + intFormat.format(state.meta.count);
-}
+// ------------------------------------------------------------------ clock
 
 function updateClock() {
   if (!state.meta || !state.t.length) {
@@ -612,15 +570,24 @@ function followViews() {
   if (!state.t || !state.t.length) return;
   // データが 1 点も入っていないチャートに可視範囲を与えると
   // Lightweight Charts が "Value is null" を投げるため、先頭で弾く。
-  if (!state.bars.length || !state.tickPoints.length) return;
-  const tickFrom = Math.max(state.t[0] - 1, state.vt - TICK_WINDOW_SECONDS);
-  tickChart.timeScale().setVisibleRange({ from: tickFrom, to: state.vt + TICK_WINDOW_SECONDS * 0.06 });
+  if (state.tickPoints.length) {
+    const tickFrom = Math.max(state.t[0] - 1, state.vt - TICK_WINDOW_SECONDS);
+    tickChart.timeScale().setVisibleRange({ from: tickFrom, to: state.vt + TICK_WINDOW_SECONDS * 0.06 });
+  }
 
-  const minuteFrom = Math.max(
-    Math.floor(state.t[0] / MINUTE) * MINUTE - MINUTE,
-    state.vt - MINUTE_WINDOW_SECONDS
-  );
-  minuteChart.timeScale().setVisibleRange({ from: minuteFrom, to: state.vt + 5 * MINUTE });
+  if (!state.bars.length) return;
+
+  // 時刻ベースの可視範囲(setVisibleRange)は使わない: プリロードした前日の
+  // 分足と当日の分足の間に実バーの無い大きなギャップがあり、その境界を
+  // またぐ範囲を時刻で指定すると Lightweight Charts が「範囲内の実バー」
+  // をそのまま幅いっぱいに引き伸ばしてしまう（本数が少ないほど顕著）。
+  // 論理インデックス(バー本数)ベースの setVisibleLogicalRange なら、
+  // ギャップの実時間の長さに関係なく常に一定本数を均等に表示できる —
+  // 前日の足は再生が進むにつれて自然に左へスクロールアウトしていく。
+  const lastIndex = state.bars.length - 1;
+  const from = Math.max(0, lastIndex - (MINUTE_VISIBLE_BARS - 1));
+  const to = lastIndex + MINUTE_RIGHT_PADDING_BARS;
+  minuteChart.timeScale().setVisibleLogicalRange({ from, to });
 }
 
 // -------------------------------------------------------------- rendering
@@ -641,7 +608,6 @@ function redrawAll() {
   rebuildTape();
   board.topLevel = null; // シークは不連続なので、板固定でも張り直す
   updateBoard();
-  updateReadouts();
   updateClock();
   syncScrubber();
   followViews();
@@ -649,12 +615,9 @@ function redrawAll() {
 
 /** vt を targetVt に移し、そこまでの状態を作り直す（描画は最後に一度）。 */
 function seekTo(targetVt) {
-  state.bars = [];
+  state.bars = state.contextBars.slice();
   state.cursor = 0;
-  state.open = null;
   state.last = null;
-  state.cumQty = 0;
-  state.cumValue = 0;
   state.vt = targetVt;
 
   while (state.cursor < state.t.length && state.t[state.cursor] <= targetVt) {
@@ -701,7 +664,6 @@ function step(timestamp) {
     pushTickPoints(from, state.cursor);
     pushTapeRows(from, state.cursor);
     applyTradesToBoard(from, state.cursor);
-    updateReadouts();
   }
 
   followViews();
@@ -710,7 +672,7 @@ function step(timestamp) {
 
   if (state.cursor >= state.t.length && state.vt >= state.t[state.t.length - 1]) {
     setPlaying(false);
-    setStatus('再生が終了しました（' + state.meta.date + '）', 'info');
+    setStatus('');
   }
 }
 
@@ -768,6 +730,31 @@ async function loadSymbolInfo(stem) {
   return info;
 }
 
+/**
+ * セッション開始（最初の約定）より前の分足を stocks_minute から補助的に
+ * 取得する。あくまで「再生前チャートが空にならない」ための演出であり、
+ * 失敗しても（データが無い・サーバー未到達など）本編のセッション読み込み
+ * は止めず、単に空配列を返す。
+ */
+async function loadMinuteContextBars(session, firstTickSeconds) {
+  const anchor = new Date(firstTickSeconds * 1000);
+  const date =
+    anchor.getUTCFullYear() + '-' + pad2(anchor.getUTCMonth() + 1) + '-' + pad2(anchor.getUTCDate());
+  const time = pad2(anchor.getUTCHours()) + ':' + pad2(anchor.getUTCMinutes());
+  try {
+    const data = await getJson(
+      '/api/minute-context?stem=' + encodeURIComponent(session.stem) +
+      '&code=' + encodeURIComponent(session.code) +
+      '&date=' + encodeURIComponent(date) +
+      '&time=' + encodeURIComponent(time) +
+      '&limit=' + MINUTE_CONTEXT_BARS
+    );
+    return Array.isArray(data.bars) ? data.bars : [];
+  } catch (error) {
+    return [];
+  }
+}
+
 async function loadSession(stem, date, direction) {
   requests.cancel('symbol-info');
   setPlaying(false);
@@ -799,15 +786,16 @@ async function loadSession(stem, date, direction) {
       return;
     }
 
+    state.contextBars = await loadMinuteContextBars(session, state.t[0]);
     seekTo(state.t[0] - 0.001);
     minuteChart.timeScale().applyOptions({ rightOffset: 3 });
-    const summary = session.code + ' / ' + session.date + ' — 約定 ' +
-      intFormat.format(session.count) + ' 件 (' + formatClock(state.t[0], false) +
-      '–' + formatClock(state.t[state.t.length - 1], false) + ')';
     if (result.status?.state === 'stale-served') {
+      const summary = session.code + ' / ' + session.date + ' — 約定 ' +
+        intFormat.format(session.count) + ' 件 (' + formatClock(state.t[0], false) +
+        '–' + formatClock(state.t[state.t.length - 1], false) + ')';
       setStatus('⚠ 縮退運転（既存キャッシュ）: ' + summary, 'degraded');
     } else {
-      setStatus(summary, 'info');
+      setStatus('');
     }
   } catch (error) {
     if (isCancellationError(error)) return;

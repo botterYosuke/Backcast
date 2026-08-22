@@ -35,7 +35,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import cache, cache_commit
+from . import cache, cache_commit, minute_context
 from .config import build_http_client, resolve_cache_config
 from .repository import (
     SymbolAvailabilityUnknownError,
@@ -463,6 +463,32 @@ def read_session(
             detail=f"{symbol}: {date} 付近に約定データが見つかりません",
         )
     return {"pending": False, "operationId": None, **session.as_dict()}
+
+
+@app.get("/api/minute-context")
+def read_minute_context(
+    stem: str = Query(..., description="銘柄ファイル名 (例: 7203)"),
+    code: str = Query(..., description="canonical code (例: 72030)"),
+    date: str = Query(..., description="この日時より前を取得 YYYY-MM-DD"),
+    time: str = Query(..., description="この日時より前を取得 HH:MM"),
+    limit: int = Query(default=30, ge=1, le=500),
+) -> dict[str, object]:
+    """Supplementary, best-effort minute bars preceding a session's first
+    tick (see ``minute_context.py``) — never the async pending/operationId
+    path: every failure degrades to an empty list, so there is nothing here
+    for a client to poll or retry.
+    """
+    repository = get_repository()
+    bars = minute_context.bars_before(
+        repository.cache_dir,
+        repository.http_client,
+        stem=stem.upper(),
+        code=code,
+        before_date=date,
+        before_time=time,
+        limit=limit,
+    )
+    return {"bars": [bar.as_dict() for bar in bars]}
 
 
 @app.get("/")

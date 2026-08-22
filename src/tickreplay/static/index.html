@@ -13,7 +13,6 @@
 <header class="topbar">
   <div class="brand">
     <h1>歩み値リプレイ</h1>
-    <p>J-Quants ティックデータを、その日の時間の流れのまま再生する</p>
   </div>
 
   <div class="picker">
@@ -42,33 +41,6 @@
 <main class="layout">
 
   <div class="layout-main">
-
-    <section class="readout">
-      <div class="readout-item">
-        <span class="readout-label">銘柄</span>
-        <strong id="rd-code" class="readout-value">—</strong>
-      </div>
-      <div class="readout-item">
-        <span class="readout-label">現在値</span>
-        <strong id="rd-price" class="readout-value price">—</strong>
-      </div>
-      <div class="readout-item">
-        <span class="readout-label">始値比</span>
-        <strong id="rd-change" class="readout-value">—</strong>
-      </div>
-      <div class="readout-item">
-        <span class="readout-label">VWAP</span>
-        <strong id="rd-vwap" class="readout-value">—</strong>
-      </div>
-      <div class="readout-item">
-        <span class="readout-label">出来高</span>
-        <strong id="rd-volume" class="readout-value">—</strong>
-      </div>
-      <div class="readout-item">
-        <span class="readout-label">約定</span>
-        <strong id="rd-ticks" class="readout-value">—</strong>
-      </div>
-    </section>
 
     <section class="card chart-card minute-card">
       <div class="card-head">
@@ -106,15 +78,15 @@
       </div>
 
       <div id="speed-group" class="speed-group" role="group" aria-label="再生速度">
-        <button type="button" data-speed="1">x1</button>
+        <button type="button" data-speed="1" class="active">x1</button>
         <button type="button" data-speed="5">x5</button>
-        <button type="button" data-speed="20" class="active">x20</button>
+        <button type="button" data-speed="20">x20</button>
         <button type="button" data-speed="100">x100</button>
         <button type="button" data-speed="500">x500</button>
       </div>
 
       <label class="toggle">
-        <input id="skip-gaps" type="checkbox" checked />
+        <input id="skip-gaps" type="checkbox" />
         <span>空白時間をスキップ</span>
       </label>
 
