@@ -33,6 +33,8 @@
 | ID | Requirement | Priority | Notes |
 |----|-------------|----------|-------|
 | FR-1 | | | |
+| FR-TICKREPLAY-1 | Keep minute-chart pan and zoom usable while replay continues without overwriting the user-selected viewport. | High | Tick-chart following remains active; minute positioning is reset only for session load and explicit seek/reset. |
+| FR-TICKREPLAY-2 | Load older minute candles on demand when the user navigates near the oldest loaded candle. | High | Use the existing strict-before /api/minute-context endpoint with single-flight, stale-response rejection, deduplication, and viewport preservation. |
 
 ## 非機能要件 (Non-Functional Requirements)
 
@@ -57,13 +59,15 @@
 |-------|------|------------------|
 | | | |
 
+- Tickreplay minute history: `app.js` owns chart/lifecycle wiring, while `minute-history.mjs` owns DOM-free paging state and merge/range calculations. Both initial preload and older-page requests share one session generation/token and cancellable request kind. History is prepended to both `contextBars` and `bars`; the visible logical range is shifted by the unique prepend count without mutating replay or paper-trading state.
+
 ## 技術選定 (Tech Stack & Rationale)
 
 <!-- Chosen technologies and why. Record alternatives considered. -->
 
 | Area | Technology | Rationale | Alternatives Considered |
 |------|------------|-----------|-------------------------|
-| | | | |
+| Tick replay minute-chart viewport | Lightweight Charts logical-range APIs plus a native ES-module history controller | Logical ranges preserve manual navigation and allow exact +N viewport compensation after prepending older bars; pure controller logic remains testable with node:test. | Per-frame setVisibleRange/setVisibleLogicalRange; eager full-history loading; a new backend paging endpoint |
 
 ## 制約 (Constraints)
 
@@ -71,13 +75,16 @@
 
 - 
 
+- Tickreplay minute history remains best-effort: an empty response is session-local exhaustion, failures must not stop replay, and implementation is limited to `app.js`, `minute-history.mjs`, its Node test, and `docs/tick-replay.md`.
+
 ## Key Decisions
 
 <!-- Durable architectural/design decisions. Append-only log. -->
 
 | Decision | Rationale | Alternatives Considered | Date |
 |----------|-----------|------------------------|------|
-| | | | |
+| Reuse /api/minute-context for best-effort historical paging without changing the backend schema. | The existing endpoint already returns chronological bars strictly before an arbitrary cutoff and supports bounded limits up to 500. | Add a new pagination endpoint or extend the response with explicit exhaustion/error status | 2026-08-22 |
+| Separate replay progression from minute-chart viewport control and isolate history calculations/controller state in minute-history.mjs. | The current per-frame minute range write causes the interaction lock; a testable controller also centralizes generation, single-flight, retry, merge, and programmatic-range suppression invariants. | Keep all logic in the oversized app.js or disable chart interaction while replaying | 2026-08-22 |
 
 ## TODO / Open Questions
 

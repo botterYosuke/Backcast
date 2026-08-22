@@ -474,12 +474,6 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   font-size: 18px;
 }
 
-.pos-hint {
-  color: var(--ink-muted);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  white-space: nowrap;
-}
 
 /* --------------------------------------------------------- 注文数量の入力 */
 

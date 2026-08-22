@@ -7,6 +7,13 @@ import {
   totalPnl,
   unrealizedPnl,
 } from './paper-trading.mjs';
+import {
+  MinuteHistorySession,
+  applyMinuteHistoryPage,
+  cutoffFromEpochSeconds,
+  cutoffKey,
+  normalizeMinuteBars,
+} from './minute-history.mjs';
 
 /*
  * 歩み値リプレイ — tick / 分足のプレイバック
@@ -43,6 +50,7 @@ const MAX_TAPE_INSERTS_PER_FRAME = 40;
 const MAX_TICK_UPDATES_PER_FRAME = 600;
 const MAX_TICK_POINTS_AFTER_SEEK = 20000;
 const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロードする直前の分足の本数
+const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
 const BOARD_ROWS = 41;            // 板の行数（奇数・固定）
 const BOARD_QTY_SPAN = 10;        // 現在値の上下この行数だけ数量を出す
@@ -895,38 +903,168 @@ function syncScrubber() {
   els.scrubber.value = String(Math.max(0, Math.min(1000, Math.round(position))));
 }
 
+// -------------------------------------------------- 分足チャートの履歴読込
+
+/*
+ * 分足チャートは「一度ユーザーが触ったら、以降はユーザーのもの」にする。
+ * 再生ループは毎フレーム分足の可視レンジを書き戻さない（ティックだけ追従）。
+ * Lightweight Charts は可視範囲を「最後の足からの相対位置」で保持するので、
+ * 右端に居るあいだは新しい足へ自然に追従し、左へパンして履歴を見ている
+ * あいだは勝手に引き戻されない。
+ *
+ * 最古の足まで MINUTE_HISTORY_EDGE_BARS 本以内に近づいたら、既存の
+ * /api/minute-context を「その足より前」の cutoff で叩き、さらに古い足を
+ * 1 ページぶん前に足す。取得は常に 1 本だけ（単一飛行）で、セッションが
+ * 変わると世代が進み、飛んでいた古いレスポンスは破棄される。
+ */
+const minuteHistory = new MinuteHistorySession({
+  edgeThresholdBars: MINUTE_HISTORY_EDGE_BARS,
+});
+
+function minuteSessionIdentity(session) {
+  if (!session?.stem || !session?.code || !session?.date) return null;
+  return session.stem + '|' + session.code + '|' + session.date;
+}
+
+/** こちらから可視レンジを動かす区間。範囲変化コールバックの再入を止める。 */
+function withProgrammaticMinuteRange(apply) {
+  minuteHistory.beginProgrammatic();
+  try {
+    apply();
+  } finally {
+    // 可視レンジ変化の通知は同期とは限らないので、次のタスクまで伏せておく。
+    setTimeout(() => minuteHistory.endProgrammatic(), 0);
+  }
+}
+
+/** いま読み込んでいる分足のうち最も古い足の時刻（次の cutoff の基準）。 */
+function earliestMinuteBarTime() {
+  if (state.contextBars.length) return state.contextBars[0].time;
+  if (state.bars.length) return state.bars[0].time;
+  return null;
+}
+
+function minuteContextUrl(session, cutoff, limit) {
+  return '/api/minute-context?stem=' + encodeURIComponent(session.stem) +
+    '&code=' + encodeURIComponent(session.code) +
+    '&date=' + encodeURIComponent(cutoff.date) +
+    '&time=' + encodeURIComponent(cutoff.time) +
+    '&limit=' + limit;
+}
+
+/**
+ * 取得した古い足を contextBars と bars の両方へ、同じ集合だけ前置きする。
+ * contextBars にも入れるのは、シークや「先頭に戻す」で bars が contextBars
+ * から作り直されるため（そこに入れておかないと履歴が消える）。
+ *
+ * redrawAll() は使わない — あれは板・テープ・可視レンジまで作り直すので、
+ * 再生中の表示とユーザーのパン位置を壊す。ここでは分足の 2 系列と
+ * マーカーだけを張り直す。
+ */
+function prependMinuteHistory(older) {
+  const result = applyMinuteHistoryPage({
+    state,
+    olderBars: older,
+    candleSeries,
+    volumeSeries,
+    timeScale: minuteChart.timeScale(),
+    paintCandle: paintedBar,
+    paintVolume: paintedVolume,
+    runProgrammatic: withProgrammaticMinuteRange,
+    refreshMarkers,
+  });
+  return result.added;
+}
+
+/** 左端に着いたときに 1 ページぶん古い分足を足す。失敗しても再生は止めない。 */
+async function loadOlderMinuteBars() {
+  if (!state.meta) return;
+  const session = state.meta;
+  const sessionIdentity = minuteSessionIdentity(session);
+  if (!sessionIdentity || !minuteHistory.isReadySession(sessionIdentity)) return;
+  const boundary = earliestMinuteBarTime();
+  if (boundary === null) return;
+  const cutoff = cutoffFromEpochSeconds(boundary);
+  if (!cutoff) return;
+
+  // fetch より先に単一飛行の関門を通す（連続するレンジ変化で多重取得しない）。
+  const token = minuteHistory.admit(cutoffKey(cutoff), { sessionIdentity });
+  if (!token) return;
+
+  try {
+    const payload = await requests.fetchLatest(
+      'minute-history',
+      minuteContextUrl(session, cutoff, minuteHistory.pageSize),
+    );
+
+    // Check the generation immediately after the await and before any state mutation.
+    if (!minuteHistory.isCurrent(token) ||
+        !minuteHistory.isReadySession(sessionIdentity) ||
+        minuteSessionIdentity(state.meta) !== sessionIdentity) return;
+    const normalized = normalizeMinuteBars(payload?.bars, minuteHistory.pageSize);
+    if (!normalized.sourceIsArray ||
+        (normalized.receivedCount > 0 && normalized.bars.length === 0)) {
+      minuteHistory.completeFailure(token);
+      return;
+    }
+    const added = prependMinuteHistory(normalized.bars);
+    minuteHistory.completeSuccess(token, added);
+  } catch (error) {
+    if (isCancellationError(error)) minuteHistory.completeAbort(token);
+    else minuteHistory.completeFailure(token);
+  }
+}
+
+function onMinuteLogicalRangeChange(range) {
+  if (!range || !state.meta || !state.bars.length) return;
+  if (minuteHistory.isProgrammatic()) return;
+  const visible = candleSeries.barsInLogicalRange(range);
+  if (!visible || !minuteHistory.isNearLeftEdge(visible.barsBefore)) return;
+  loadOlderMinuteBars();
+}
+
 // ------------------------------------------------------------ view follow
 
-function followViews() {
+/** ティックチャートは常に仮想時刻を追う（再生中も毎フレーム）。 */
+function followTickView() {
   if (!state.t || !state.t.length) return;
   // データが 1 点も入っていないチャートに可視範囲を与えると
   // Lightweight Charts が "Value is null" を投げるため、先頭で弾く。
-  if (state.tickPoints.length) {
-    const tickFrom = Math.max(state.t[0] - 1, state.vt - TICK_WINDOW_SECONDS);
-    tickChart.timeScale().setVisibleRange({ from: tickFrom, to: state.vt + TICK_WINDOW_SECONDS * 0.06 });
-  }
+  if (!state.tickPoints.length) return;
+  const tickFrom = Math.max(state.t[0] - 1, state.vt - TICK_WINDOW_SECONDS);
+  tickChart.timeScale().setVisibleRange({ from: tickFrom, to: state.vt + TICK_WINDOW_SECONDS * 0.06 });
+}
 
+/*
+ * 分足の初期表示位置。セッション読み込み・シーク・先頭に戻す のときだけ
+ * 呼ぶ（再生中は呼ばない — 呼ぶとユーザーのパン・ズームを毎フレーム
+ * 上書きしてしまい、分足チャートを手で動かせなくなる）。
+ *
+ * 時刻ベースの可視範囲(setVisibleRange)は使わない: プリロードした前日の
+ * 分足と当日の分足の間に実バーの無い大きなギャップがあり、その境界を
+ * またぐ範囲を時刻で指定すると Lightweight Charts が「範囲内の実バー」
+ * をそのまま幅いっぱいに引き伸ばしてしまう（本数が少ないほど顕著）。
+ * 論理インデックス(バー本数)ベースの setVisibleLogicalRange なら、
+ * ギャップの実時間の長さに関係なく常に一定本数を均等に表示できる。
+ */
+function followMinuteView() {
   if (!state.bars.length) return;
-
-  // 時刻ベースの可視範囲(setVisibleRange)は使わない: プリロードした前日の
-  // 分足と当日の分足の間に実バーの無い大きなギャップがあり、その境界を
-  // またぐ範囲を時刻で指定すると Lightweight Charts が「範囲内の実バー」
-  // をそのまま幅いっぱいに引き伸ばしてしまう（本数が少ないほど顕著）。
-  // 論理インデックス(バー本数)ベースの setVisibleLogicalRange なら、
-  // ギャップの実時間の長さに関係なく常に一定本数を均等に表示できる —
-  // 前日の足は再生が進むにつれて自然に左へスクロールアウトしていく。
   const lastIndex = state.bars.length - 1;
   const from = Math.max(0, lastIndex - (MINUTE_VISIBLE_BARS - 1));
   const to = lastIndex + MINUTE_RIGHT_PADDING_BARS;
-  minuteChart.timeScale().setVisibleLogicalRange({ from, to });
+  withProgrammaticMinuteRange(() => {
+    minuteChart.timeScale().setVisibleLogicalRange({ from, to });
+  });
 }
 
 // -------------------------------------------------------------- rendering
 
 /** シーク後などに、現在の状態からチャート全体を張り直す。 */
 function redrawAll() {
-  candleSeries.setData(state.bars.map(paintedBar));
-  volumeSeries.setData(state.bars.map(paintedVolume));
+  withProgrammaticMinuteRange(() => {
+    candleSeries.setData(state.bars.map(paintedBar));
+    volumeSeries.setData(state.bars.map(paintedVolume));
+  });
 
   const start = Math.max(0, state.cursor - MAX_TICK_POINTS_AFTER_SEEK);
   const points = [];
@@ -944,7 +1082,8 @@ function redrawAll() {
   updatePositionPanel();
   updateClock();
   syncScrubber();
-  followViews();
+  followTickView();
+  followMinuteView(); // シーク・読み込み直後だけ分足の表示位置を作り直す
 }
 
 /** vt を targetVt に移し、そこまでの状態を作り直す（描画は最後に一度）。 */
@@ -1004,7 +1143,9 @@ function step(timestamp) {
     updatePositionPanel(); // 評価損益は現在値が動くたびに更新する
   }
 
-  followViews();
+  // 分足の可視レンジはここでは触らない。右端に居れば Lightweight Charts が
+  // 新しい足に自動で追従し、左へパンしていればその位置が保たれる。
+  followTickView();
   updateClock();
   syncScrubber();
 
@@ -1073,28 +1214,48 @@ async function loadSymbolInfo(stem) {
  * 取得する。あくまで「再生前チャートが空にならない」ための演出であり、
  * 失敗しても（データが無い・サーバー未到達など）本編のセッション読み込み
  * は止めず、単に空配列を返す。
+ *
+ * 遅延読み込み（loadOlderMinuteBars）と同じ 'minute-history' kind と
+ * 世代トークンで走らせる。こうしておくと、読み込み中に別の日付へ
+ * 切り替えられたときにこの取得もまとめて取り消され、遅れて返ってきた
+ * レスポンスが新しいセッションに混ざらない。空応答なら「これ以上
+ * さかのぼれない」として、以降のページングも打ち切る。
  */
-async function loadMinuteContextBars(session, firstTickSeconds) {
-  const anchor = new Date(firstTickSeconds * 1000);
-  const date =
-    anchor.getUTCFullYear() + '-' + pad2(anchor.getUTCMonth() + 1) + '-' + pad2(anchor.getUTCDate());
-  const time = pad2(anchor.getUTCHours()) + ':' + pad2(anchor.getUTCMinutes());
+async function loadMinuteContextBars(session, firstTickSeconds, sessionIdentity) {
+  const cutoff = cutoffFromEpochSeconds(firstTickSeconds);
+  if (!cutoff) return [];
+  // 初回プリロードだけはユーザー操作を待たずに通す。
+  const token = minuteHistory.admitInitial(cutoffKey(cutoff), sessionIdentity);
+  if (!token) return [];
+
   try {
-    const data = await getJson(
-      '/api/minute-context?stem=' + encodeURIComponent(session.stem) +
-      '&code=' + encodeURIComponent(session.code) +
-      '&date=' + encodeURIComponent(date) +
-      '&time=' + encodeURIComponent(time) +
-      '&limit=' + MINUTE_CONTEXT_BARS
+    const payload = await requests.fetchLatest(
+      'minute-history',
+      minuteContextUrl(session, cutoff, MINUTE_CONTEXT_BARS),
     );
-    return Array.isArray(data.bars) ? data.bars : [];
+    if (!minuteHistory.isCurrent(token)) return [];
+    const normalized = normalizeMinuteBars(payload?.bars, MINUTE_CONTEXT_BARS);
+    if (!normalized.sourceIsArray ||
+        (normalized.receivedCount > 0 && normalized.bars.length === 0)) {
+      minuteHistory.completeFailure(token);
+      return [];
+    }
+    minuteHistory.completeSuccess(token, normalized.bars.length);
+    return normalized.bars;
   } catch (error) {
+    if (isCancellationError(error)) minuteHistory.completeAbort(token);
+    else minuteHistory.completeFailure(token);
     return [];
   }
 }
 
 async function loadSession(stem, date, direction) {
   requests.cancel('symbol-info');
+  // 最初の await より前に、飛んでいる分足履歴の取得を取り消して世代を進める。
+  // これ以降、古い世代のレスポンスは isCurrent() / isGeneration() で弾かれる。
+  requests.cancel('minute-history');
+  const requestedIdentity = stem + '|pending|' + date + '|' + direction;
+  const generation = minuteHistory.resetSession(requestedIdentity);
   setPlaying(false);
   resetTrading(); // 別セッションの建玉・損益・マーカーは持ち越さない
   setStatus('読み込み中… ' + stem + ' ' + date, 'info');
@@ -1107,12 +1268,50 @@ async function loadSession(stem, date, direction) {
       { stem, onStatus: (status) => showCacheStatus(stem, status) },
     );
     const session = result.data;
+    const sessionIdentity = minuteSessionIdentity(session);
+    if (!sessionIdentity || !minuteHistory.setLoadingSession(generation, sessionIdentity)) return;
+    const nextMeta = {
+      stem: session.stem,
+      code: session.code,
+      date: session.date,
+      count: session.count,
+    };
+    const nextT = Float64Array.from(session.us, (value) => value / 1e6);
+    const nextPrice = Float64Array.from(session.price);
+    const nextQty = Float64Array.from(session.qty);
+    const nextType = session.type;
 
-    state.meta = { stem: session.stem, code: session.code, date: session.date, count: session.count };
-    state.t = Float64Array.from(session.us, (value) => value / 1e6);
-    state.price = Float64Array.from(session.price);
-    state.qty = Float64Array.from(session.qty);
-    state.type = session.type;
+    if (!nextT.length) {
+      state.meta = nextMeta;
+      state.t = nextT;
+      state.price = nextPrice;
+      state.qty = nextQty;
+      state.type = nextType;
+      state.contextBars = [];
+      state.bars = [];
+      state.tickPoints = [];
+      state.cursor = 0;
+      state.last = null;
+      state.vt = 0;
+      withProgrammaticMinuteRange(() => {
+        candleSeries.setData([]);
+        volumeSeries.setData([]);
+      });
+      tickSeries.setData([]);
+      minuteHistory.markSessionReady(generation, sessionIdentity);
+      els.dateInput.value = session.date;
+      setStatus(session.date + ' は約定がありません', 'error');
+      return;
+    }
+
+    const contextBars = await loadMinuteContextBars(session, nextT[0], sessionIdentity);
+    if (!minuteHistory.isLoadingSession(generation, sessionIdentity)) return;
+    state.meta = nextMeta;
+    state.t = nextT;
+    state.price = nextPrice;
+    state.qty = nextQty;
+    state.type = nextType;
+    state.contextBars = contextBars;
     els.dateInput.value = session.date;
 
     board.tick = state.price.length ? inferTickSize() : 1;
@@ -1120,14 +1319,9 @@ async function loadSession(stem, date, direction) {
     board.spread = rollSpread();
     clearBoard();
 
-    if (!state.t.length) {
-      setStatus(session.date + ' は約定がありません', 'error');
-      return;
-    }
-
-    state.contextBars = await loadMinuteContextBars(session, state.t[0]);
     seekTo(state.t[0] - 0.001);
     minuteChart.timeScale().applyOptions({ rightOffset: 3 });
+    minuteHistory.markSessionReady(generation, sessionIdentity);
     if (result.status?.state === 'stale-served') {
       const summary = session.code + ' / ' + session.date + ' — 約定 ' +
         intFormat.format(session.count) + ' 件 (' + formatClock(state.t[0], false) +
@@ -1210,6 +1404,14 @@ els.scrubber.addEventListener('input', () => {
   const target = first + ((last - first) * Number(els.scrubber.value)) / 1000;
   seekTo(target);
 });
+
+// 分足チャートは触られた瞬間から「ユーザーのもの」。以降、最古の足の近くまで
+// スクロールされたら古い足を取りにいく（触られるまでは取りにいかない）。
+['wheel', 'pointerdown', 'touchstart'].forEach((type) => {
+  document.getElementById('minute-chart')
+    .addEventListener(type, () => minuteHistory.arm(minuteSessionIdentity(state.meta)), { passive: true });
+});
+minuteChart.timeScale().subscribeVisibleLogicalRangeChange(onMinuteLogicalRangeChange);
 
 els.boardFix.addEventListener('change', () => {
   board.topLevel = null; // 固定を切り替えたら、その場で現在値を中央へ
