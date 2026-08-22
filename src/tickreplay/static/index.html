@@ -11,8 +11,24 @@
 <body>
 
 <header class="topbar">
-  <div class="brand">
-    <h1>歩み値リプレイ</h1>
+  <div class="position-panel">
+    <div class="pos-item">
+      <span class="pos-label">保有数</span>
+      <span id="pos-qty" class="pos-value">—</span>
+    </div>
+    <div class="pos-item">
+      <span class="pos-label">平均単価</span>
+      <span id="pos-avg" class="pos-value">—</span>
+    </div>
+    <div class="pos-item">
+      <span class="pos-label">評価損益</span>
+      <span id="pos-pnl" class="pos-value">—</span>
+    </div>
+    <div class="pos-item pos-total-item">
+      <span class="pos-label">合計損益</span>
+      <span id="pos-total" class="pos-value">—</span>
+      <span class="pos-hint">[ESC] で明細</span>
+    </div>
   </div>
 
   <div class="picker">
@@ -99,13 +115,23 @@
   <aside class="card board-card">
     <div class="card-head">
       <h2>板</h2>
-      <p class="card-note">板固定</p>
+      <label class="order-qty-field">
+        <span class="order-qty-label">注文数量</span>
+        <input id="order-qty" type="number" min="100" step="100" value="100" inputmode="numeric" />
+        <span class="order-qty-unit">株</span>
+      </label>
     </div>
 
     <div class="board-head">
-      <span>売数量</span><span>価格</span><span>買数量</span>
+      <span>売</span><span>売数量</span><span>価格</span><span>買数量</span><span>買</span>
     </div>
     <ol id="board" class="board"></ol>
+
+    <div class="board-order-foot">
+      <button id="cancel-sell" type="button" title="売り注文をすべて取消">取消</button>
+      <span class="board-order-note">未約定の注文を取消</span>
+      <button id="cancel-buy" type="button" title="買い注文をすべて取消">取消</button>
+    </div>
 
     <div class="board-foot">
       <label class="toggle">
@@ -118,6 +144,22 @@
   </aside>
 
 </main>
+
+<div id="pnl-modal" class="modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="pnl-modal-title">
+    <h2 id="pnl-modal-title">合計損益</h2>
+    <dl class="pnl-list">
+      <dt>実現損益</dt><dd id="pnl-realized">—</dd>
+      <dt>評価損益</dt><dd id="pnl-unrealized">—</dd>
+      <dt>合計損益</dt><dd id="pnl-total" class="pnl-total">—</dd>
+      <dt>保有数</dt><dd id="pnl-position">—</dd>
+      <dt>約定回数</dt><dd id="pnl-fills">—</dd>
+    </dl>
+    <p class="pnl-note">⏮（先頭に戻す）または「読み込む」でリセットされます</p>
+    <button id="pnl-close" class="primary" type="button" data-close>閉じる（ESC）</button>
+  </div>
+</div>
 
 <script type="module" src="/static/app.js"></script>
 </body>

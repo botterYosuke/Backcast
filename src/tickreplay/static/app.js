@@ -1,4 +1,12 @@
 import { RequestCoordinator, isCancellationError } from './request-coordinator.mjs';
+import {
+  applyFill,
+  classifyClick,
+  createPortfolio,
+  isFilled,
+  totalPnl,
+  unrealizedPnl,
+} from './paper-trading.mjs';
 
 /*
  * 歩み値リプレイ — tick / 分足のプレイバック
@@ -12,6 +20,9 @@ import { RequestCoordinator, isCancellationError } from './request-coordinator.m
  * - 時刻は DB の naive timestamp を UTC とみなして epoch 化している。
  *   Lightweight Charts は UTC で描画するため、保存された壁時計時刻が
  *   そのまま軸に出る。タイムゾーンの読み替えは一切していない。
+ * - 仮想発注は板の両脇の列を 1 クリックする方式。建玉と損益の計算そのものは
+ *   paper-trading.mjs（DOM 非依存・node:test で検証済み）に置き、この
+ *   ファイルは「板のどこを押したか」を呼値レベルに翻訳して渡すだけにする。
  */
 
 'use strict';
@@ -41,6 +52,8 @@ const BOARD_MAX_UNITS = 4;        // 1 行に並べる記号の最大個数
 // 呼値の候補。実データの価格差から一番近いものを選ぶ。
 const TICK_CANDIDATES = [0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000];
 
+const DEFAULT_ORDER_QTY = 100;    // 注文数量の既定値（単元株）
+
 const els = {
   symbolInput: document.getElementById('symbol-input'),
   symbolList: document.getElementById('symbol-list'),
@@ -60,6 +73,19 @@ const els = {
   boardFix: document.getElementById('board-fix'),
   boardCenter: document.getElementById('board-center'),
   boardQuote: document.getElementById('board-quote'),
+  orderQty: document.getElementById('order-qty'),
+  cancelSell: document.getElementById('cancel-sell'),
+  cancelBuy: document.getElementById('cancel-buy'),
+  posQty: document.getElementById('pos-qty'),
+  posAvg: document.getElementById('pos-avg'),
+  posPnl: document.getElementById('pos-pnl'),
+  posTotal: document.getElementById('pos-total'),
+  pnlModal: document.getElementById('pnl-modal'),
+  pnlRealized: document.getElementById('pnl-realized'),
+  pnlUnrealized: document.getElementById('pnl-unrealized'),
+  pnlTotal: document.getElementById('pnl-total'),
+  pnlPosition: document.getElementById('pnl-position'),
+  pnlFills: document.getElementById('pnl-fills'),
 };
 
 // --------------------------------------------------------------- utilities
@@ -84,6 +110,19 @@ function formatClock(seconds, withMillis) {
 function formatHm(seconds) {
   const date = new Date(seconds * 1000);
   return pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+}
+
+/** 損益の表示。円未満は丸め、必ず符号を付ける。 */
+function signedYen(value) {
+  const rounded = Math.round(value);
+  const sign = rounded > 0 ? '+' : rounded < 0 ? '-' : '±';
+  return sign + intFormat.format(Math.abs(rounded));
+}
+
+function pnlTone(value) {
+  if (value > 0) return 'up';
+  if (value < 0) return 'down';
+  return '';
 }
 
 function setStatus(message, tone) {
@@ -416,19 +455,32 @@ function buildBoardRows() {
   const fragment = document.createDocumentFragment();
   for (let index = 0; index < BOARD_ROWS; index += 1) {
     const li = document.createElement('li');
+    li.dataset.index = String(index); // クリック位置 → 呼値レベルの逆算に使う
+    const sellOrder = document.createElement('span');
     const ask = document.createElement('span');
     const price = document.createElement('span');
     const bid = document.createElement('span');
+    const buyOrder = document.createElement('span');
+    sellOrder.className = 'board-order order-sell';
+    sellOrder.title = '売り注文（現在値より上は指値・以下は成行）';
     ask.className = 'board-ask';
     price.className = 'board-price';
     bid.className = 'board-bid';
+    buyOrder.className = 'board-order order-buy';
+    buyOrder.title = '買い注文（現在値より下は指値・以上は成行）';
+    li.appendChild(sellOrder);
     li.appendChild(ask);
     li.appendChild(price);
     li.appendChild(bid);
+    li.appendChild(buyOrder);
     // 光り終わったらクラスを外す。付けっぱなしにすると売買の色が戻らない。
     li.addEventListener('animationend', () => li.classList.remove('flash'));
     fragment.appendChild(li);
-    board.rows.push({ li, ask, price, bid, askText: '', bidText: '', className: '' });
+    board.rows.push({
+      li, ask, price, bid, sellOrder, buyOrder,
+      askText: '', bidText: '', className: '',
+      sellOrderText: '', buyOrderText: '',
+    });
   }
   els.board.appendChild(fragment);
 }
@@ -453,9 +505,15 @@ function clearBoard() {
     row.price.textContent = '';
     row.ask.textContent = '';
     row.bid.textContent = '';
+    row.sellOrder.textContent = '';
+    row.buyOrder.textContent = '';
+    row.sellOrder.className = 'board-order order-sell';
+    row.buyOrder.className = 'board-order order-buy';
     row.li.className = '';
     row.askText = '';
     row.bidText = '';
+    row.sellOrderText = '';
+    row.buyOrderText = '';
     row.className = '';
   });
   els.boardQuote.textContent = '—';
@@ -476,6 +534,16 @@ function setRowText(row, ask, bid, className) {
     row.li.className = flashing ? (className + ' flash').trim() : className;
     row.className = className;
   }
+}
+
+/** 発注列のセル 1 つ。未約定の注文があれば数量を出す。 */
+function setOrderCell(row, key, quantity) {
+  const text = quantity ? intFormat.format(quantity) : '';
+  if (row[key + 'Text'] === text) return;
+  row[key + 'Text'] = text;
+  const cell = row[key];
+  cell.textContent = text;
+  cell.classList.toggle('has-order', text !== '');
 }
 
 function updateBoard() {
@@ -499,6 +567,9 @@ function updateBoard() {
   const askLevel = board.side === 'buy' ? lastLevel : lastLevel + board.spread + 1;
   const bidLevel = board.side === 'buy' ? lastLevel - board.spread - 1 : lastLevel;
 
+  const pendingSell = pendingByLevel('sell');
+  const pendingBuy = pendingByLevel('buy');
+
   board.rows.forEach((row, index) => {
     const level = board.topLevel - index;
     const near = Math.abs(level - lastLevel) <= BOARD_QTY_SPAN;
@@ -507,6 +578,8 @@ function updateBoard() {
     const side = isAsk ? 'ask-side' : isBid ? 'bid-side' : '';
     const className = level === lastLevel ? (side + ' last').trim() : side;
     setRowText(row, isAsk ? quantityAt(level) : '', isBid ? quantityAt(level) : '', className);
+    setOrderCell(row, 'sellOrder', pendingSell.get(level));
+    setOrderCell(row, 'buyOrder', pendingBuy.get(level));
   });
 
   els.boardQuote.textContent =
@@ -542,6 +615,264 @@ function applyTradesToBoard(fromIndex, toIndex) {
   for (let index = start; index < toIndex; index += 1) {
     flashBoardLevel(levelOf(state.price[index]));
   }
+}
+
+// ------------------------------------------------------------- 仮想発注
+
+/*
+ * 板の両脇の発注列を 1 クリックすると注文が出る。
+ *   - 売り列: 現在値より上 = 指値（板がそこまで来たら約定）／現在値以下 = 成行
+ *   - 買い列: 現在値より下 = 指値／現在値以上 = 成行
+ * 未約定の指値は板の同じ行に数量として残り、最下段の「取消」で消える。
+ *
+ * 建玉は一日信用・両建て禁止のネット 1 本だけ。反対売買は返済になり、
+ * 返済しきった後は同じ日に何度でも建て直せる。
+ */
+
+const trading = {
+  portfolio: createPortfolio(),
+  orders: [],       // 未約定の指値 {id, side, level, price, qty}
+  fills: [],        // 約定した注文（時系列）。建玉はここから導出する
+  events: [],       // 約定イベント（チャートのマーカーの元ネタ）
+  nextOrderId: 1,
+};
+
+/** 注文数量。単元株未満や未入力は既定値に丸める。 */
+function orderQuantity() {
+  const value = Math.floor(Number(els.orderQty.value));
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_ORDER_QTY;
+  return value;
+}
+
+/** 未約定の指値を呼値レベルごとに合算する（板の描画用）。 */
+function pendingByLevel(side) {
+  const totals = new Map();
+  trading.orders.forEach((order) => {
+    if (order.side !== side) return;
+    totals.set(order.level, (totals.get(order.level) || 0) + order.qty);
+  });
+  return totals;
+}
+
+/** 約定 1 件を建玉に反映して、パネルとチャートのマーカーを更新する。 */
+function executeFill(side, quantity, price, time) {
+  const fill = { side, qty: quantity, price, time };
+  trading.fills.push(fill);
+  applyFill(trading.portfolio, fill).forEach((event) => trading.events.push(event));
+  refreshMarkers();
+  updatePositionPanel();
+}
+
+/** 約定の並びから建玉とイベントを作り直す（シークで履歴を切ったあと）。 */
+function rebuildPortfolio() {
+  trading.portfolio = createPortfolio();
+  trading.events = [];
+  trading.fills.forEach((fill) => {
+    applyFill(trading.portfolio, fill).forEach((event) => trading.events.push(event));
+  });
+}
+
+/*
+ * シーク先より後の取引をなかったことにする。途中から再生をやり直したとき、
+ * その先で出した注文と約定が残っていると、同じ値動きで二重に成績が乗る。
+ * 未約定の注文もシーク先には持ち越さない（出した時刻より前へも飛べるため）。
+ */
+function truncateTradingAt(targetVt) {
+  const kept = trading.fills.filter((fill) => fill.time <= targetVt);
+  const dropped = kept.length !== trading.fills.length;
+  trading.fills = kept;
+  trading.orders = [];
+  if (dropped) rebuildPortfolio();
+}
+
+/** 発注列のクリック 1 回ぶんの処理。 */
+function placeOrder(side, level) {
+  if (state.last === null) return;
+  const quantity = orderQuantity();
+
+  if (classifyClick(side, level, levelOf(state.last)) === 'market') {
+    executeFill(side, quantity, state.last, currentTradeTime());
+    updateBoard();
+    return;
+  }
+
+  // 同じ行を続けて押したときは数量を積み増す（注文の本数は増やさない）。
+  const price = priceOfLevel(level);
+  const existing = trading.orders.find((order) => order.side === side && order.level === level);
+  if (existing) existing.qty += quantity;
+  else trading.orders.push({ id: trading.nextOrderId++, side, level, price, qty: quantity });
+  updateBoard();
+}
+
+function cancelOrders(side) {
+  const before = trading.orders.length;
+  trading.orders = trading.orders.filter((order) => order.side !== side);
+  if (trading.orders.length !== before) updateBoard();
+}
+
+/**
+ * このフレームで流れた約定を未約定の指値に突き合わせる。
+ * 指値を抜けて約定した場合も約定値は指値どおり（不利な滑りは入れない）。
+ */
+function matchOrders(fromIndex, toIndex) {
+  if (!trading.orders.length) return;
+  for (let index = fromIndex; index < toIndex; index += 1) {
+    if (!trading.orders.length) break;
+    const price = state.price[index];
+    const filled = trading.orders.filter((order) => isFilled(order, price));
+    if (!filled.length) continue;
+    trading.orders = trading.orders.filter((order) => !isFilled(order, price));
+    filled.forEach((order) => executeFill(order.side, order.qty, order.price, state.t[index]));
+  }
+}
+
+/** 直近に流れた約定の時刻。まだ 1 件も流れていなければ仮想時刻。 */
+function currentTradeTime() {
+  if (state.t && state.cursor > 0) return state.t[state.cursor - 1];
+  return state.vt;
+}
+
+// -------------------------------------------------------- チャートのマーカー
+
+/*
+ * ティックチャートは高速再生で間引かれ、シークでも先頭が切り落とされる。
+ * マーカーの時刻が系列に無いと描かれないので、一番近い実データ点に寄せる。
+ * 系列の範囲外なら null を返し、そのマーカーは出さない。
+ */
+function snapTickTime(time) {
+  const points = state.tickPoints;
+  if (!points.length) return null;
+  if (time < points[0].time || time > points[points.length - 1].time) return null;
+
+  let low = 0;
+  let high = points.length - 1;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (points[mid].time < time) low = mid + 1;
+    else high = mid;
+  }
+  if (low > 0 && Math.abs(points[low - 1].time - time) < Math.abs(points[low].time - time)) {
+    return points[low - 1].time;
+  }
+  return points[low].time;
+}
+
+function markerStyle(event) {
+  if (event.kind === 'entry') {
+    const isBuy = event.side === 'buy';
+    return {
+      position: isBuy ? 'belowBar' : 'aboveBar',
+      color: isBuy ? UP : DOWN,
+      shape: isBuy ? 'arrowUp' : 'arrowDown',
+      text: (isBuy ? '買' : '売') + intFormat.format(event.qty),
+    };
+  }
+  return {
+    position: event.side === 'buy' ? 'belowBar' : 'aboveBar',
+    color: event.pnl >= 0 ? UP : DOWN,
+    shape: 'circle',
+    text: '返済 ' + signedYen(event.pnl),
+  };
+}
+
+/*
+ * 約定イベントから両チャートのマーカーを作り直す。setMarkers は全差し替え
+ * なので、シーク後の再描画でもこれを一度呼べば表示が整合する。
+ */
+function refreshMarkers() {
+  const firstBar = state.bars.length ? state.bars[0].time : null;
+  const lastBar = state.bars.length ? state.bars[state.bars.length - 1].time : null;
+  const minuteMarkers = [];
+  const tickMarkers = [];
+
+  trading.events.forEach((event) => {
+    const style = markerStyle(event);
+    const barTime = Math.floor(event.time / MINUTE) * MINUTE;
+    if (firstBar !== null && barTime >= firstBar && barTime <= lastBar) {
+      minuteMarkers.push({ ...style, time: barTime });
+    }
+    const tickTime = snapTickTime(event.time);
+    if (tickTime !== null) tickMarkers.push({ ...style, time: tickTime });
+  });
+
+  candleSeries.setMarkers(minuteMarkers);
+  tickSeries.setMarkers(tickMarkers);
+}
+
+// -------------------------------------------------------------- 建玉パネル
+
+function updatePositionPanel() {
+  const portfolio = trading.portfolio;
+  const held = Math.abs(portfolio.qty);
+
+  if (held === 0) {
+    els.posQty.textContent = '—';
+    els.posQty.dataset.tone = '';
+    els.posAvg.textContent = '—';
+  } else {
+    els.posQty.textContent = (portfolio.qty > 0 ? '買 ' : '売 ') + intFormat.format(held) + ' 株';
+    els.posQty.dataset.tone = portfolio.qty > 0 ? 'up' : 'down';
+    els.posAvg.textContent = priceFormat.format(portfolio.avgPrice);
+  }
+
+  const lastPrice = state.last === null ? NaN : state.last;
+  const unrealized = unrealizedPnl(portfolio, lastPrice);
+  els.posPnl.textContent = held === 0 ? '—' : signedYen(unrealized);
+  els.posPnl.dataset.tone = held === 0 ? '' : pnlTone(unrealized);
+
+  // 合計損益は建玉が無くても（実現ぶんだけでも）出す。
+  const traded = trading.fills.length > 0;
+  const total = totalPnl(portfolio, lastPrice);
+  els.posTotal.textContent = traded ? signedYen(total) : '—';
+  els.posTotal.dataset.tone = traded ? pnlTone(total) : '';
+
+  if (!els.pnlModal.hidden) updatePnlModal();
+}
+
+/** 建玉・注文・約定履歴をすべて捨てる（先頭に戻す / 読み込み直し）。 */
+function resetTrading() {
+  trading.portfolio = createPortfolio();
+  trading.orders = [];
+  trading.fills = [];
+  trading.events = [];
+  closePnlModal();
+  refreshMarkers();
+  updatePositionPanel();
+  updateBoard();
+}
+
+// --------------------------------------------------------- 合計損益モーダル
+
+function updatePnlModal() {
+  const portfolio = trading.portfolio;
+  const lastPrice = state.last === null ? NaN : state.last;
+  const unrealized = unrealizedPnl(portfolio, lastPrice);
+  const total = totalPnl(portfolio, lastPrice);
+  const held = Math.abs(portfolio.qty);
+
+  els.pnlRealized.textContent = signedYen(portfolio.realized);
+  els.pnlRealized.dataset.tone = pnlTone(portfolio.realized);
+  els.pnlUnrealized.textContent = held === 0 ? '—' : signedYen(unrealized);
+  els.pnlUnrealized.dataset.tone = held === 0 ? '' : pnlTone(unrealized);
+  els.pnlTotal.textContent = signedYen(total);
+  els.pnlTotal.dataset.tone = pnlTone(total);
+  els.pnlPosition.textContent =
+    held === 0
+      ? 'なし'
+      : (portfolio.qty > 0 ? '買 ' : '売 ') + intFormat.format(held) + ' 株 @ ' +
+        priceFormat.format(portfolio.avgPrice);
+  els.pnlFills.textContent =
+    '新規 ' + intFormat.format(portfolio.entryCount) +
+    ' / 返済 ' + intFormat.format(portfolio.exitCount);
+}
+
+function openPnlModal() {
+  updatePnlModal();
+  els.pnlModal.hidden = false;
+}
+
+function closePnlModal() {
+  els.pnlModal.hidden = true;
 }
 
 // ------------------------------------------------------------------ clock
@@ -608,6 +939,9 @@ function redrawAll() {
   rebuildTape();
   board.topLevel = null; // シークは不連続なので、板固定でも張り直す
   updateBoard();
+  // 系列を setData で差し替えたのでマーカーも張り直す。
+  refreshMarkers();
+  updatePositionPanel();
   updateClock();
   syncScrubber();
   followViews();
@@ -624,6 +958,7 @@ function seekTo(targetVt) {
     applyTick(state.cursor, null);
     state.cursor += 1;
   }
+  truncateTradingAt(targetVt);
   redrawAll();
 }
 
@@ -663,7 +998,10 @@ function step(timestamp) {
     }
     pushTickPoints(from, state.cursor);
     pushTapeRows(from, state.cursor);
+    // 板の再描画より先に約定させる（約定ぶんの注文を板から消すため）。
+    matchOrders(from, state.cursor);
     applyTradesToBoard(from, state.cursor);
+    updatePositionPanel(); // 評価損益は現在値が動くたびに更新する
   }
 
   followViews();
@@ -758,6 +1096,7 @@ async function loadMinuteContextBars(session, firstTickSeconds) {
 async function loadSession(stem, date, direction) {
   requests.cancel('symbol-info');
   setPlaying(false);
+  resetTrading(); // 別セッションの建玉・損益・マーカーは持ち越さない
   setStatus('読み込み中… ' + stem + ' ' + date, 'info');
   try {
     const result = await requests.fetchUntilReady(
@@ -850,6 +1189,7 @@ els.playButton.addEventListener('click', () => {
 els.resetButton.addEventListener('click', () => {
   if (!state.meta || !state.t.length) return;
   setPlaying(false);
+  resetTrading();
   seekTo(state.t[0] - 0.001);
 });
 
@@ -881,7 +1221,29 @@ els.boardCenter.addEventListener('click', () => {
   updateBoard();
 });
 
+// 発注列は行数ぶん個別にリスナを張らず、板全体で 1 つに委譲する。
+els.board.addEventListener('click', (event) => {
+  const cell = event.target.closest('.board-order');
+  if (!cell || board.topLevel === null || state.last === null) return;
+  const level = board.topLevel - Number(cell.parentElement.dataset.index);
+  placeOrder(cell.classList.contains('order-sell') ? 'sell' : 'buy', level);
+});
+
+els.cancelSell.addEventListener('click', () => cancelOrders('sell'));
+els.cancelBuy.addEventListener('click', () => cancelOrders('buy'));
+
+els.pnlModal.addEventListener('click', (event) => {
+  if (event.target.closest('[data-close]')) closePnlModal();
+});
+
 document.addEventListener('keydown', (event) => {
+  // ESC は入力欄にフォーカスがあっても効かせる（成績をすぐ見たいので）。
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    if (els.pnlModal.hidden) openPnlModal();
+    else closePnlModal();
+    return;
+  }
   if (event.target instanceof HTMLInputElement) return;
   if (event.code === 'Space') {
     event.preventDefault();
@@ -892,6 +1254,7 @@ document.addEventListener('keydown', (event) => {
 // ------------------------------------------------------------------ start
 
 buildBoardRows();
+updatePositionPanel();
 requestAnimationFrame(step);
 
 (async function bootstrap() {

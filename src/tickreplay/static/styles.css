@@ -56,15 +56,6 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
-.brand h1 {
-  margin: 0;
-  font-family: var(--serif);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  color: var(--ink-muted);
-}
-
 .picker {
   display: flex;
   align-items: flex-end;
@@ -325,15 +316,16 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 /* ------------------------------------------------------------------ 板 */
 
 .board-card {
-  width: 244px;
+  width: 300px;
   flex: none;
 }
 
 .board-head,
 .board li {
   display: grid;
-  grid-template-columns: 1fr 62px 1fr;
-  gap: 6px;
+  /* 両端の 2 列が 1 クリック発注の列 */
+  grid-template-columns: 38px 1fr 58px 1fr 38px;
+  gap: 4px;
   align-items: center;
   padding: 0 10px;
   font-family: var(--mono);
@@ -367,6 +359,13 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   border-bottom: 1px solid #f6f3ec;
 }
 
+/* 発注列は行の背景色（気配の帯）を敷かない — 押せる列だと分かるように */
+.board li.ask-side,
+.board li.bid-side { background: none; }
+
+.board li.ask-side .board-ask { background: var(--down-soft); }
+.board li.bid-side .board-bid { background: var(--up-soft); }
+
 .board-ask,
 .board-bid {
   overflow: hidden;
@@ -388,8 +387,6 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 /* 売気配は青、買気配は赤（国内証券の板の慣行） */
 .board li.ask-side .board-price { color: var(--down); }
 .board li.bid-side .board-price { color: var(--up); }
-.board li.ask-side { background: var(--down-soft); }
-.board li.bid-side { background: var(--up-soft); }
 
 .board li.last .board-price {
   background: var(--accent);
@@ -431,6 +428,235 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   font-variant-numeric: tabular-nums;
 }
 
+/* ------------------------------------------------------- 建玉パネル（左上） */
+
+.position-panel {
+  display: flex;
+  align-items: baseline;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+
+.pos-item {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.pos-label {
+  color: var(--ink-muted);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  white-space: nowrap;
+}
+
+.pos-value {
+  min-width: 62px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pos-value[data-tone="up"] { color: var(--up); }
+.pos-value[data-tone="down"] { color: var(--down); }
+
+/* 合計損益はこのパネルの主役なので、他より一段大きく出す */
+.pos-total-item {
+  padding-left: 22px;
+  border-left: 1px solid var(--line);
+}
+
+.pos-total-item .pos-value {
+  min-width: 74px;
+  font-size: 18px;
+}
+
+.pos-hint {
+  color: var(--ink-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------- 注文数量の入力 */
+
+.order-qty-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  cursor: pointer;
+}
+
+.order-qty-label {
+  color: var(--ink-muted);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
+.order-qty-field input {
+  width: 72px;
+  padding: 3px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.order-qty-unit {
+  color: var(--ink-muted);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------- 発注列（板） */
+
+.board-order {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  color: var(--ink-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s ease;
+}
+
+.board-order::before {
+  content: "＋";
+  opacity: 0;
+  font-size: 10px;
+}
+
+.board-order:hover::before { opacity: 0.55; }
+.board-order.has-order::before { content: none; }
+
+.board-order.order-sell:hover { background: var(--down-soft); }
+.board-order.order-buy:hover { background: var(--up-soft); }
+
+/* 未約定の注文が乗っている行は、数量を出して常時見えるようにする */
+.board-order.has-order {
+  font-weight: 600;
+  color: #f7f4ee;
+}
+
+.board-order.order-sell.has-order { background: var(--down); }
+.board-order.order-buy.has-order { background: var(--up); }
+
+.board-order-foot {
+  display: grid;
+  grid-template-columns: 38px 1fr 58px 1fr 38px;
+  gap: 4px;
+  align-items: center;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.board-order-foot button {
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+.board-order-note {
+  grid-column: 2 / 5;
+  color: var(--ink-muted);
+  font-size: 10.5px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------- 合計損益モーダル */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal[hidden] { display: none; }
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(35, 32, 27, 0.42);
+}
+
+.modal-panel {
+  position: relative;
+  width: min(380px, calc(100vw - 32px));
+  padding: 22px 26px 20px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 44px rgba(35, 32, 27, 0.22);
+}
+
+.modal-panel h2 {
+  margin: 0 0 14px;
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
+.pnl-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 7px 16px;
+  margin: 0 0 14px;
+}
+
+.pnl-list dt {
+  color: var(--ink-muted);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.pnl-list dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.pnl-list dd[data-tone="up"] { color: var(--up); }
+.pnl-list dd[data-tone="down"] { color: var(--down); }
+
+.pnl-list dd.pnl-total {
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.pnl-list dt:has(+ .pnl-total) {
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+}
+
+.pnl-note {
+  margin: 0 0 14px;
+  color: var(--ink-muted);
+  font-size: 11px;
+}
+
+.modal-panel button { width: 100%; }
+
 /* ------------------------------------------------------------ responsive */
 
 @media (max-width: 1180px) {
@@ -439,4 +665,5 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .topbar { padding: 8px 18px; }
   .layout { flex-direction: column; padding: 12px 18px 14px; }
   .board-card { width: auto; min-height: 320px; }
+  .position-panel { gap: 14px; }
 }
