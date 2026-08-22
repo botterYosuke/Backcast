@@ -13,6 +13,7 @@ lifespan entirely and any tickreplay route would then 500.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -564,3 +565,103 @@ def test_dockerfile_pins_a_single_asgi_worker():
 
     assert "--workers 1" in dockerfile
     assert "uvicorn.workers.UvicornWorker" in dockerfile
+
+
+# ------------------------------------------ merged tickreplay cache defaults
+
+
+@pytest.fixture
+def isolated_cache_env(monkeypatch):
+    """Pin the tickreplay cache vars so this repo's own ``.env`` (loaded by
+    ``load_dotenv()`` at main.py import) cannot decide the outcome."""
+
+    def apply(cache_dir, server_url):
+        monkeypatch.setenv("BACKCAST_DUCKDB_CACHE_DIR", str(cache_dir))
+        monkeypatch.setenv("BACKCAST_DUCKDB_SERVER_URL", server_url)
+        # setenv-then-delenv, so monkeypatch has recorded the variable and
+        # will remove it at teardown even though the *module import* is what
+        # sets it (via `os.environ.setdefault`, which monkeypatch cannot see).
+        monkeypatch.setenv("BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE", "")
+        monkeypatch.delenv("BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE")
+
+    return apply
+
+
+def _clear_cache_env(monkeypatch):
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
+    for name in (
+        "BACKCAST_DUCKDB_CACHE_DIR",
+        "BACKCAST_DUCKDB_SERVER_URL",
+        "BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE",
+    ):
+        # Record each variable with monkeypatch before removing it, because
+        # importing main.py populates all three via `os.environ.setdefault`.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def _import_main(monkeypatch):
+    monkeypatch.syspath_prepend(str(CLOUD_RUN_DIR))
+    sys.modules.pop("main", None)
+    import main as module
+
+    return module
+
+
+def test_merged_defaults_explicitly_enable_local_authoritative(data_dir, monkeypatch):
+    _clear_cache_env(monkeypatch)
+    try:
+        _import_main(monkeypatch)
+
+        assert os.environ["BACKCAST_DUCKDB_SERVER_URL"] == "http://127.0.0.1:8080"
+        assert os.environ["BACKCAST_DUCKDB_CACHE_DIR"] == str(data_dir / "jp")
+        assert os.environ["BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE"] == "true"
+    finally:
+        sys.modules.pop("main", None)
+
+
+def test_explicit_server_and_cache_values_do_not_imply_authority(
+    data_dir, isolated_cache_env, monkeypatch
+):
+    # Even values equal to this module's defaults are operator overrides.
+    # The third flag must be explicit; path/URL contents are never inferred.
+    isolated_cache_env(data_dir / "jp", "http://127.0.0.1:8080")
+    try:
+        _import_main(monkeypatch)
+
+        assert os.environ["BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE"] == "false"
+    finally:
+        sys.modules.pop("main", None)
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_explicit_local_authoritative_value_is_preserved(
+    data_dir, isolated_cache_env, monkeypatch, value
+):
+    isolated_cache_env(data_dir / "jp", "http://backcast.i234.me:8080")
+    monkeypatch.setenv("BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE", value)
+    try:
+        _import_main(monkeypatch)
+
+        assert os.environ["BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE"] == value
+    finally:
+        sys.modules.pop("main", None)
+
+
+def test_the_mounted_repository_actually_receives_the_mode(data_dir, monkeypatch):
+    """The flag is worthless unless it survives config resolution and
+    reaches the repository the mounted app really uses."""
+    _clear_cache_env(monkeypatch)
+    module = _import_main(monkeypatch)
+    try:
+        import tickreplay.server
+
+        with TestClient(module.app):
+            assert tickreplay.server.get_repository().local_authoritative is True
+    finally:
+        sys.modules.pop("main", None)
+        import tickreplay.server
+
+        tickreplay.server.reset_for_tests()

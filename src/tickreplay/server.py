@@ -204,6 +204,7 @@ def _acquire_repository_for_lifespan() -> TickRepository:
                 cache_dir=config.cache_dir,
                 server_url=config.server_url,
                 http_client=build_http_client(config),
+                local_authoritative=config.local_authoritative,
             )
             try:
                 cache.discard_orphaned_part_files(repository.cache_dir)

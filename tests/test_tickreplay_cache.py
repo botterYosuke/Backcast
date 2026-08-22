@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import errno
-import threading
-import time
 from pathlib import Path
 
 import duckdb
@@ -297,92 +295,6 @@ def test_disk_full_mid_stream_raises_disk_full_and_removes_part_file(
         cache.stage_download("7203", cache_dir=cache_dir, client=_client(handler))
 
     assert not part_path.exists()
-
-
-# ------------------------------------------------------------- coalescing
-
-
-def test_concurrent_requests_for_the_same_stem_share_one_download(tmp_path):
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    body = _valid_duckdb_bytes(tmp_path)
-    calls = {"n": 0}
-    release = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        release.wait(timeout=5)
-        return httpx.Response(
-            200, headers={"Content-Length": str(len(body))}, content=body
-        )
-
-    client = _client(handler)
-    results: list[cache.StagingResult] = []
-    errors: list[BaseException] = []
-
-    def worker():
-        try:
-            results.append(
-                cache.stage_download(
-                    "7203",
-                    cache_dir=cache_dir,
-                    client=client,
-                )
-            )
-        except BaseException as error:  # noqa: BLE001 - surfaced via `errors`
-            errors.append(error)
-
-    threads = [threading.Thread(target=worker) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    time.sleep(0.1)  # let every thread reach coalescer.run before releasing
-    release.set()
-    for thread in threads:
-        thread.join(timeout=5)
-
-    assert not errors
-    assert calls["n"] == 1
-    assert len(results) == 5
-    assert {result.sha256 for result in results} == {results[0].sha256}
-
-
-def test_concurrent_requests_share_the_same_download_failure(tmp_path, monkeypatch):
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    monkeypatch.setattr(cache, "RETRY_BACKOFF_BASE_SECONDS", 0.0)
-    calls = {"n": 0}
-    first_attempt_started = threading.Event()
-    release = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        first_attempt_started.set()
-        release.wait(timeout=5)
-        return httpx.Response(503)
-
-    client = _client(handler)
-    errors: list[BaseException] = []
-
-    def worker():
-        try:
-            cache.stage_download("7203", cache_dir=cache_dir, client=client)
-        except BaseException as error:  # noqa: BLE001 - surfaced via `errors`
-            errors.append(error)
-
-    leader = threading.Thread(target=worker)
-    leader.start()
-    assert first_attempt_started.wait(timeout=5)
-    followers = [threading.Thread(target=worker) for _ in range(4)]
-    for follower in followers:
-        follower.start()
-    time.sleep(0.1)  # let every follower join the in-flight operation
-    release.set()
-    for thread in [leader, *followers]:
-        thread.join(timeout=5)
-
-    assert len(errors) == 5
-    assert all(isinstance(error, cache.ServerUnreachableError) for error in errors)
-    assert calls["n"] == cache.MAX_DOWNLOAD_ATTEMPTS
 
 
 # ------------------------------------------------------------------ startup

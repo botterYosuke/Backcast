@@ -21,7 +21,11 @@ import httpx
 
 SERVER_URL_ENV_VAR = "BACKCAST_DUCKDB_SERVER_URL"
 CACHE_DIR_ENV_VAR = "BACKCAST_DUCKDB_CACHE_DIR"
+LOCAL_AUTHORITATIVE_ENV_VAR = "BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE"
 DEFAULT_SERVER_URL = "http://backcast.i234.me:8080"
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,12 +63,40 @@ def _normalize_server_url(raw: str) -> str:
     return value
 
 
+def _parse_bool_env(name: str, raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise CacheConfigError(
+        f"{name} must be one of {sorted(_TRUE_VALUES | _FALSE_VALUES)}, got {raw!r}"
+    )
+
+
 @dataclass(frozen=True)
 class CacheConfig:
     """Resolved location of the local cache dir and the source file server."""
 
     server_url: str
     cache_dir: Path
+    local_authoritative: bool = False
+    """The cache dir *is* the data the server serves, not a copy of it.
+
+    Set by the merged `cloud-run/main.py` deployment, where
+    ``BACKCAST_DUCKDB_CACHE_DIR`` defaults to ``STOCKDATA_CACHE_DIR/jp`` —
+    the very tree that process serves over loopback. Revalidating a file
+    there compares it against itself, so there is nothing HTTP can discover
+    and the freshness question does not exist. Worse than useless, in fact:
+    committing the resulting download rewrites the served file's mtime,
+    which is what that server derives its ETag from, so the sidecar written
+    from the pre-commit ETag could never match again and every process
+    start redownloaded multi-GB files onto themselves, forever.
+
+    Only revalidation of an *existing* file is skipped. A stem with no local
+    file, and the forced redownload that a failed DuckDB-open check
+    triggers, both still go over HTTP exactly as before.
+    """
 
 
 def resolve_cache_config(
@@ -114,7 +146,22 @@ def resolve_cache_config(
             f"{CACHE_DIR_ENV_VAR}={cache_dir} could not be created: {error}"
         ) from error
 
-    return CacheConfig(server_url=server_url, cache_dir=cache_dir)
+    if LOCAL_AUTHORITATIVE_ENV_VAR in environ:
+        local_authoritative = _parse_bool_env(
+            LOCAL_AUTHORITATIVE_ENV_VAR, environ[LOCAL_AUTHORITATIVE_ENV_VAR]
+        )
+    elif LOCAL_AUTHORITATIVE_ENV_VAR in file_values:
+        local_authoritative = _parse_bool_env(
+            LOCAL_AUTHORITATIVE_ENV_VAR, file_values[LOCAL_AUTHORITATIVE_ENV_VAR]
+        )
+    else:
+        local_authoritative = False
+
+    return CacheConfig(
+        server_url=server_url,
+        cache_dir=cache_dir,
+        local_authoritative=local_authoritative,
+    )
 
 
 # --------------------------------------------------------------------------

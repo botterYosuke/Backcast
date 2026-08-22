@@ -8,6 +8,7 @@ import pytest
 from tickreplay.config import (
     CACHE_DIR_ENV_VAR,
     DEFAULT_SERVER_URL,
+    LOCAL_AUTHORITATIVE_ENV_VAR,
     SERVER_URL_ENV_VAR,
     CacheConfig,
     CacheConfigError,
@@ -138,6 +139,64 @@ def test_cache_config_environment_wins_over_the_env_file(tmp_path):
     )
 
     assert config.cache_dir == from_env
+
+
+def test_local_authoritative_is_off_unless_explicitly_enabled(tmp_path):
+    config = resolve_cache_config(
+        env={CACHE_DIR_ENV_VAR: str(tmp_path / "cache")}, env_file=tmp_path / ".env"
+    )
+
+    assert config.local_authoritative is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_local_authoritative_accepts_the_documented_true_values(tmp_path, value):
+    config = resolve_cache_config(
+        env={
+            CACHE_DIR_ENV_VAR: str(tmp_path / "cache"),
+            LOCAL_AUTHORITATIVE_ENV_VAR: value,
+        },
+        env_file=tmp_path / ".env",
+    )
+
+    assert config.local_authoritative is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
+def test_local_authoritative_accepts_the_documented_false_values(tmp_path, value):
+    config = resolve_cache_config(
+        env={
+            CACHE_DIR_ENV_VAR: str(tmp_path / "cache"),
+            LOCAL_AUTHORITATIVE_ENV_VAR: value,
+        },
+        env_file=tmp_path / ".env",
+    )
+
+    assert config.local_authoritative is False
+
+
+@pytest.mark.parametrize("value", ["", "  ", "maybe", "2", "truthy"])
+def test_local_authoritative_rejects_invalid_values(tmp_path, value):
+    with pytest.raises(CacheConfigError, match=LOCAL_AUTHORITATIVE_ENV_VAR):
+        resolve_cache_config(
+            env={
+                CACHE_DIR_ENV_VAR: str(tmp_path / "cache"),
+                LOCAL_AUTHORITATIVE_ENV_VAR: value,
+            },
+            env_file=tmp_path / ".env",
+        )
+
+
+def test_local_authoritative_can_come_from_the_env_file(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        f"{CACHE_DIR_ENV_VAR}={tmp_path / 'cache'}\n{LOCAL_AUTHORITATIVE_ENV_VAR}=1\n",
+        encoding="utf-8",
+    )
+
+    config = resolve_cache_config(env={}, env_file=env_path)
+
+    assert config.local_authoritative is True
 
 
 # --------------------------------------------------------------------------

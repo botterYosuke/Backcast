@@ -50,8 +50,16 @@ PORT = int(os.environ.get("PORT", 8080))
 #    present under `jp/stocks_trades/` are recognized as cached rather than
 #    downloaded a second time (see docs/tick-replay.md's cache-dir note and
 #    `src/tickreplay/repository.py`'s module docstring)
+#  - mark that all-default arrangement authoritative so those files are never
+#    revalidated against themselves
+server_was_default = "BACKCAST_DUCKDB_SERVER_URL" not in os.environ
+cache_was_default = "BACKCAST_DUCKDB_CACHE_DIR" not in os.environ
 os.environ.setdefault("BACKCAST_DUCKDB_SERVER_URL", f"http://127.0.0.1:{PORT}")
 os.environ.setdefault("BACKCAST_DUCKDB_CACHE_DIR", os.path.join(DATA_DIR, "jp"))
+os.environ.setdefault(
+    "BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE",
+    "true" if server_was_default and cache_was_default else "false",
+)
 
 # `src/tickreplay` must be importable. `Path(__file__).resolve().parent.parent`
 # is the repository root in a checkout (cloud-run/main.py -> repo root) and

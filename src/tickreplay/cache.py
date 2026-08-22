@@ -3,8 +3,8 @@
 This module's only job: given a stem, produce a verified, complete file at a
 staging path (``<stem>.duckdb.part``), or raise. It never touches
 ``TickRepository``'s connection pool or ``_info_cache`` — swapping a staged
-file into place is ``cache_commit.py``'s job (Step 5), under the per-symbol
-lock defined there.
+file into place is ``cache_commit.py``'s job (Step 5), while the process-wide
+destination lock in ``repository.py`` remains held.
 
 No resumable downloads in v1: every download always starts at offset 0. A
 ``.part`` file left behind by a crash or a prior run is always discarded,
@@ -17,10 +17,8 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
-import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -399,55 +397,6 @@ def _discard(part_path: Path) -> None:
         pass
 
 
-# --------------------------------------------------------------------------
-# Per-symbol download coalescing
-# --------------------------------------------------------------------------
-
-
-class DownloadCoalescer:
-    """Ensures concurrent callers for the same stem share one download.
-
-    The first caller for a stem becomes the "leader" and actually runs the
-    download; any caller that arrives while it is in flight blocks on the
-    same `Future` and receives the same result (or the same exception).
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._inflight: dict[str, Future[StagingResult]] = {}
-
-    def run(self, stem: str, fn: Callable[[], StagingResult]) -> StagingResult:
-        with self._lock:
-            future = self._inflight.get(stem)
-            is_leader = future is None
-            if is_leader:
-                future = Future()
-                self._inflight[stem] = future
-
-        if not is_leader:
-            assert future is not None
-            return future.result()
-
-        assert future is not None
-        try:
-            result = fn()
-        except BaseException as error:  # propagate to every follower too
-            future.set_exception(error)
-            self._release(stem, future)
-            raise
-        future.set_result(result)
-        self._release(stem, future)
-        return result
-
-    def _release(self, stem: str, future: Future[StagingResult]) -> None:
-        with self._lock:
-            if self._inflight.get(stem) is future:
-                del self._inflight[stem]
-
-
-_DOWNLOAD_COALESCER = DownloadCoalescer()
-
-
 def stage_download(
     stem: str,
     *,
@@ -456,25 +405,25 @@ def stage_download(
     conditional: bool = False,
     progress_cb: ProgressCallback | None = None,
 ) -> StagingResult:
-    """Stage one download, sharing the in-flight result for the same stem.
+    """Stage one verified download for one destination-owning caller.
 
-    Coalescing lives at this public production boundary so every caller — not
-    only tests or one repository path — is protected from concurrent writes
-    to the same ``.part`` file. Followers receive the leader's exact result or
-    exception. Any active ``observe_download`` scope records that shared
-    outcome in the follower's own execution context.
+    A successful result owns a move-only ``part_path`` which must not be
+    shared. Production callers therefore serialize the whole stage/commit/use
+    lifecycle by resolved cache destination; ``TickRepository.symbol_lock``
+    provides that boundary. This function remains a single-caller staging
+    primitive and never coalesces results itself.
+
+    Any active ``observe_download`` scope records the caller's outcome in its
+    own execution context.
     """
 
     try:
-        result = _DOWNLOAD_COALESCER.run(
+        result = _stage_download(
             stem,
-            lambda: _stage_download(
-                stem,
-                cache_dir=cache_dir,
-                client=client,
-                conditional=conditional,
-                progress_cb=progress_cb,
-            ),
+            cache_dir=cache_dir,
+            client=client,
+            conditional=conditional,
+            progress_cb=progress_cb,
         )
     except DownloadError as error:
         observation = _download_observation.get()

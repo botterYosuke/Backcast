@@ -37,9 +37,11 @@ uv run python run.py
   を `http://127.0.0.1:$PORT`（自分自身へのループバック）に、
   `BACKCAST_DUCKDB_CACHE_DIR` を `$STOCKDATA_CACHE_DIR/jp`
   （ファイルサーバー自身が配信している `jp/stocks_trades/...` と同じ場所）
-  に、`cloud-run/main.py` がそれぞれ既定値として設定する（実環境変数で
-  上書き可能）。後者は下の「既存の `jp` データルートを直接指定した場合」の
-  挙動を利用しており、二重ダウンロード・二重保存を避けている。
+  に、`cloud-run/main.py` がそれぞれ既定値として設定する。両方とも既定値が
+  採用された場合だけ `BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE=true` も設定し、
+  既存ファイルを配信元そのものとして扱う。URL または cache dir を運用者が
+  明示した場合、このフラグの既定値は安全側の `false` になる。同じ自己参照
+  構成を明示する場合は、3 変数目も `true` と明示する。
 
 ### デプロイ
 
@@ -65,8 +67,8 @@ docker push backcast/cloud-run:latest
 キャッシュディレクトリの `stocks_trades/` サブディレクトリに保存して読む
 （DB は常に read-only で開く）。サーバー側と同じ `stocks_trades/` の階層に
 するのは、`BACKCAST_DUCKDB_CACHE_DIR` に既存の `jp` データルート（例:
-`S:\jp`）を直接指定したとき、すでにある `jp\stocks_trades\<銘柄>.duckdb` を
-キャッシュ済みと認識してダウンロードをスキップできるようにするため。
+`S:\jp`）を直接指定できるようにするため。そのデータルートが配信元そのもの
+なら `BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE=true` も設定する。
 
 環境変数は環境変数 → リポジトリ直下 `.env` の順で解決する
 （`.env.example` を `.env` にコピーして使う。手元でファイルが作れない場合は
@@ -76,9 +78,11 @@ docker push backcast/cloud-run:latest
 | --- | --- | --- | --- |
 | `BACKCAST_DUCKDB_CACHE_DIR` | ○ | なし | アプリが所有・管理するローカルキャッシュディレクトリ。存在しなければ自動作成する |
 | `BACKCAST_DUCKDB_SERVER_URL` | — | `http://backcast.i234.me:8080` | ダウンロード元のファイルサーバー |
+| `BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE` | — | `false` | `true` のとき既存ローカルファイルを配信元そのものとして扱い、HTTP 再検証を省略する。`1/true/yes/on` と `0/false/no/off` のみ有効 |
 
 未設定または不正な設定（`BACKCAST_DUCKDB_CACHE_DIR` が未設定、
 `BACKCAST_DUCKDB_SERVER_URL` が `http://`/`https://` で始まらない、
+`BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE` が上記以外の値、
 キャッシュディレクトリの場所がディレクトリ以外で塞がっている等）は
 **起動時に即座に失敗する**（fail-fast）。旧バージョンのように「起動はするが
 銘柄一覧が空」にはならない。
@@ -91,6 +95,10 @@ docker push backcast/cloud-run:latest
   **一度だけ** conditional GET（`If-None-Match` / `If-Modified-Since`）で
   再検証する。304 なら何もしない。以降そのプロセスでは再検証しない
   （プロセスを再起動すれば再び一度だけ検証される）。
+- **配信元そのものを読むモード**: `BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE=true`
+  では、既存 `.duckdb` に per-file HTTP リクエストを送らず、sidecar も
+  作らない。ファイルが無ければ従来どおり無条件ダウンロードし、DuckDB として
+  開けなければ従来どおり `conditional=false` で一度だけ強制再取得する。
 - **オフライン時の縮退運転**: 再検証がネットワーク到達不能で失敗しても、
   既存のローカルファイルがあればそれをそのまま使う（`stale-served` 状態、
   画面に警告を出す）。ディスク容量不足やダウンロード内容の破損など
@@ -423,6 +431,10 @@ BACKCAST_DUCKDB_CACHE_DIR=S:/jp
 # Optional. The file server the cache downloads from. Defaults to the
 # production server (http://backcast.i234.me:8080) if unset.
 # BACKCAST_DUCKDB_SERVER_URL=http://backcast.i234.me:8080
+
+# Optional. Set true only when CACHE_DIR is the authoritative tree served by
+# SERVER_URL itself. Existing files then skip HTTP revalidation. Defaults false.
+# BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE=false
 
 # Removed (pre-cutover) — no longer read by any code path. Safe to delete;
 # kept here only so an old .env is easy to diff against this one.

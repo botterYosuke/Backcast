@@ -9,7 +9,11 @@ Layout (verified against the live data set):
   ``stocks_trades`` subdirectory mirrors the server's own layout so that
   pointing ``BACKCAST_DUCKDB_CACHE_DIR`` at an existing ``jp``-style data
   root recognizes files already present under ``jp/stocks_trades`` as
-  cached, rather than redownloading them.
+  cached, rather than redownloading them. When that root is the very tree
+  the configured server serves (the merged ``cloud-run/main.py``
+  deployment), ``BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE`` additionally stops
+  those files from being *revalidated* over HTTP — see
+  ``config.CacheConfig.local_authoritative``.
 * ``stocks_board``: ``Price DOUBLE, Qty BIGINT, Type VARCHAR, source VARCHAR,
   Code VARCHAR, Timestamp VARCHAR`` with a primary key on ``(Code, Timestamp)``.
   That primary key is what makes a single-session range scan fast even on the
@@ -32,7 +36,9 @@ no longer exists as a separate lock at all, since the whole
 query-then-cache-write span already runs under the symbol lock (this is what
 fixes the read-after-invalidate race a plain "invalidate on commit" would
 leave open). A stem's blocking download work (Step 4) always happens before
-the pool is ever touched.
+the pool is ever touched. Repository instances resolving to the same cache
+root share these locks, the pool, and generation-dependent metadata, so one
+commit evicts every in-process handle to the file it replaces.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as Date
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -198,6 +204,33 @@ class _ConnectionPool:
             self._connections.clear()
 
 
+@dataclass
+class _SharedCacheState:
+    """Mutable file state shared by every repository for one cache root."""
+
+    symbol_locks: dict[str, threading.Lock] = field(default_factory=dict)
+    pool: _ConnectionPool = field(default_factory=_ConnectionPool)
+    info_cache: dict[str, SymbolInfo] = field(default_factory=dict)
+    generations: dict[str, int] = field(default_factory=dict)
+    unavailable: dict[str, str] = field(default_factory=dict)
+    active_repositories: int = 0
+
+
+_SHARED_CACHE_STATES_GUARD = threading.Lock()
+_SHARED_CACHE_STATES: dict[Path, _SharedCacheState] = {}
+
+
+def _acquire_shared_cache_state(cache_dir: Path) -> tuple[Path, _SharedCacheState]:
+    resolved = cache_dir.expanduser().resolve(strict=False)
+    with _SHARED_CACHE_STATES_GUARD:
+        state = _SHARED_CACHE_STATES.get(resolved)
+        if state is None:
+            state = _SharedCacheState()
+            _SHARED_CACHE_STATES[resolved] = state
+        state.active_repositories += 1
+    return resolved, state
+
+
 def _listing_cache_path(cache_dir: Path) -> Path:
     return cache_dir / LISTING_CACHE_FILENAME
 
@@ -233,24 +266,33 @@ class TickRepository:
     """Server-cache-backed, read-only façade over ``stocks_trades``."""
 
     def __init__(
-        self, *, cache_dir: Path, server_url: str, http_client: httpx.Client
+        self,
+        *,
+        cache_dir: Path,
+        server_url: str,
+        http_client: httpx.Client,
+        local_authoritative: bool = False,
     ) -> None:
-        self.cache_dir = cache_dir
+        resolved_cache_dir, shared_state = _acquire_shared_cache_state(cache_dir)
+        self.cache_dir = resolved_cache_dir
         self.server_url = server_url
+        self.local_authoritative = local_authoritative
         self._client = http_client
-        self._pool = _ConnectionPool()
-        self._info_cache: dict[str, SymbolInfo] = {}
-
-        self._symbol_locks_guard = threading.Lock()
-        self._symbol_locks: dict[str, threading.Lock] = {}
-        self._generations: dict[str, int] = {}
-        self._unavailable: dict[str, str] = {}
+        self._shared_state = shared_state
+        self._pool = shared_state.pool
+        self._info_cache = shared_state.info_cache
+        self._generations = shared_state.generations
+        self._unavailable = shared_state.unavailable
+        self._closed = False
         # Step 1's freshness policy: revalidate (conditional GET) at most
         # once per symbol per process lifetime, on that symbol's first
-        # access this process.
+        # access this process. Under `local_authoritative` there is no
+        # freshness question to ask at all — see `CacheConfig`.
         self._revalidated: set[str] = set()
 
-        self._coordinator = CommitCoordinator(cache_dir=cache_dir, repository=self)
+        self._coordinator = CommitCoordinator(
+            cache_dir=resolved_cache_dir, repository=self
+        )
 
     @property
     def http_client(self) -> httpx.Client:
@@ -262,19 +304,18 @@ class TickRepository:
     # -- commit-coordinator support (Step 5) ------------------------------
 
     def symbol_lock(self, stem: str) -> threading.Lock:
-        """Return the one lock that gates the pool, info cache, and
-        generation counter for ``stem``, creating it on first use.
+        """Return the process-wide operation lock for this destination.
 
-        Every generation-dependent operation for a stem — a commit
-        (``cache_commit.py``) and every read below — must hold this same
-        lock for its entire query-then-act span, not just around
-        individual steps.
+        The immutable key is ``(resolved cache_dir, stem)``. Repository
+        instances targeting the same file therefore serialize the complete
+        confirm/revalidate/stage/commit/query lifecycle, while different cache
+        roots and stems remain independent.
         """
-        with self._symbol_locks_guard:
-            lock = self._symbol_locks.get(stem)
+        with _SHARED_CACHE_STATES_GUARD:
+            lock = self._shared_state.symbol_locks.get(stem)
             if lock is None:
                 lock = threading.Lock()
-                self._symbol_locks[stem] = lock
+                self._shared_state.symbol_locks[stem] = lock
             return lock
 
     def generation(self, stem: str) -> int:
@@ -391,6 +432,11 @@ class TickRepository:
         if self.is_unavailable(stem) is not None:
             return False  # let the synchronous path raise promptly instead
         path = cache.live_file_path(self.cache_dir, stem)
+        if self.local_authoritative:
+            # Nothing to revalidate: only a genuinely absent file needs the
+            # network, so an existing one opens without the async
+            # pending/`operationId` detour at all.
+            return not path.is_file()
         return not path.is_file() or stem not in self._revalidated
 
     def ensure_fresh(
@@ -421,6 +467,12 @@ class TickRepository:
         known (or raises), ensures the local file has been revalidated at
         least once this process lifetime, and returns ``(path, generation)``
         for the caller to use for every subsequent query in this same span.
+
+        Under ``local_authoritative`` the revalidation is skipped: the local
+        file is the server's own data, so a conditional GET could only ever
+        compare it against itself (`CacheConfig.local_authoritative`). A
+        *missing* file still downloads — which, in that deployment, means it
+        is missing from the served tree too and 404s honestly.
         """
         reason = self.is_unavailable(stem)
         if reason is not None:
@@ -431,7 +483,7 @@ class TickRepository:
 
         if not path.is_file():
             self._download_and_commit(stem, conditional=False, progress_cb=progress_cb)
-        elif stem not in self._revalidated:
+        elif stem not in self._revalidated and not self.local_authoritative:
             self._download_and_commit(stem, conditional=True, progress_cb=progress_cb)
         self._revalidated.add(stem)
 
@@ -523,9 +575,14 @@ class TickRepository:
             raise SymbolNotFoundError(f"invalid symbol identifier: {stem!r}")
         with self.symbol_lock(stem):
             cached = self._info_cache.get(stem)
-            if cached is not None:
+            if cached is not None and (
+                self.local_authoritative or stem in self._revalidated
+            ):
                 return cached
             path, _generation = self._ensure_fresh_locked(stem)
+            cached = self._info_cache.get(stem)
+            if cached is not None:
+                return cached
             info = self._read_symbol_info_locked(stem, path)
             self._info_cache[stem] = info
             return info
@@ -650,10 +707,22 @@ class TickRepository:
         )
 
     def close(self) -> None:
-        """Close pooled DuckDB connections.
+        """Release this repository's reference to its shared cache state.
 
         Does not close the injected ``http_client`` — that client is owned
         by whoever constructed it (a test fixture, or Step 7's lifespan
         hook in production), which is responsible for closing it.
         """
-        self._pool.close()
+        with _SHARED_CACHE_STATES_GUARD:
+            if self._closed:
+                return
+            self._closed = True
+            state = self._shared_state
+            state.active_repositories -= 1
+            if state.active_repositories > 0:
+                return
+
+            state.pool.close()
+            state.info_cache.clear()
+            state.generations.clear()
+            state.unavailable.clear()
