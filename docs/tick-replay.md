@@ -22,6 +22,41 @@ uv run python run.py
 | `--no-browser` | off | ブラウザを自動で開かない |
 | `--reload` | off | 開発用オートリロード |
 
+## リモートホスティング（cloud-run）
+
+`http://backcast.i234.me:8080/` は上と同じ歩み値リプレイの UI をそのまま
+公開している。`cloud-run/main.py`（従来は `.duckdb` 配信専用の Flask
+ファイルサーバー）を FastAPI に書き換え、`src/tickreplay/server.py` の
+アプリを同一プロセス・同一ポートに `/` としてマウントする形で統合した。
+
+- **認証なし**: 個人利用・非公開データではない前提で、UI・API とも認証を
+  付けていない（意図的な選択）。
+- **ヘルスチェック**: `/` はもう health check ではない（UI に置き換わった）。
+  ヘルスチェックは `GET /healthz` に移動した。
+- **ダウンロード元の自己参照**: このホストでは `BACKCAST_DUCKDB_SERVER_URL`
+  を `http://127.0.0.1:$PORT`（自分自身へのループバック）に、
+  `BACKCAST_DUCKDB_CACHE_DIR` を `$STOCKDATA_CACHE_DIR/jp`
+  （ファイルサーバー自身が配信している `jp/stocks_trades/...` と同じ場所）
+  に、`cloud-run/main.py` がそれぞれ既定値として設定する（実環境変数で
+  上書き可能）。後者は下の「既存の `jp` データルートを直接指定した場合」の
+  挙動を利用しており、二重ダウンロード・二重保存を避けている。
+
+### デプロイ
+
+イメージは Docker Hub に `backcast/cloud-run` として push し、ホーム
+サーバー側で `docker pull` して再起動する運用（この手順自体はリポジトリの
+外側・手動）。`main.py` が `src/tickreplay` を import するため、**ビルド
+コンテキストがリポジトリ直下に変わった**点に注意（以前は `cloud-run/`
+だけをコンテキストにしていた場合、コマンドの変更が必要）:
+
+```bash
+docker build -f cloud-run/Dockerfile -t backcast/cloud-run:latest .
+docker push backcast/cloud-run:latest
+```
+
+その後、ホームサーバー側で `docker pull backcast/cloud-run:latest` して
+コンテナを再起動する（この repo の外の作業）。
+
 ## データ（DuckDB サーバーキャッシュ）
 
 `.duckdb` はもうローカルに同期済みのディレクトリを直接読まない。自宅サーバー
@@ -264,7 +299,7 @@ node --test src/tickreplay/static/*.test.mjs
 # Required. A local directory the app owns and manages as its download
 # cache — created automatically if missing. Safe to delete entirely between
 # runs; the app just redownloads what it needs.
-BACKCAST_DUCKDB_CACHE_DIR=C:/duckdb-cache
+BACKCAST_DUCKDB_CACHE_DIR=S:/jp
 
 # Optional. The file server the cache downloads from. Defaults to the
 # production server (http://backcast.i234.me:8080) if unset.

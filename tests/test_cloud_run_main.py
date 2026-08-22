@@ -1,8 +1,14 @@
-"""Tests for cloud-run/main.py (the home-hosted DuckDB file server).
+"""Tests for cloud-run/main.py (the home-hosted DuckDB file server, now
+merged with the 歩み値リプレイ (tickreplay) FastAPI app it also mounts).
 
 ``cloud-run/main.py`` reads ``STOCKDATA_CACHE_DIR`` once, at import time, so
 every test imports it fresh (via the ``cloud_run_main`` fixture) after
-pointing that env var at a per-test fixture directory.
+pointing that env var at a per-test fixture directory. Every route now runs
+under an ASGI ``lifespan`` (main.py composes its own lifespan with
+tickreplay's, so tickreplay's repository gets constructed) — the ``client``
+fixture enters ``TestClient`` as a context manager, which is what actually
+triggers ASGI startup/shutdown; a bare (non-context-manager) call would skip
+lifespan entirely and any tickreplay route would then 500.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 CLOUD_RUN_DIR = Path(__file__).resolve().parents[1] / "cloud-run"
 
@@ -29,7 +36,10 @@ def cloud_run_main(data_dir, monkeypatch):
 
     The module name ("main") is generic on purpose — it is inserted into and
     removed from ``sys.path``/``sys.modules`` around the import so it never
-    leaks into other test files.
+    leaks into other test files. ``tickreplay.server`` is *not* re-imported
+    per test (only "main" is) — it keeps its own module-level repository/
+    tracker singleton, reset via ``reset_for_tests()`` once this fixture's
+    ``client`` (below) has fully torn down its lifespan for the test.
     """
     monkeypatch.syspath_prepend(str(CLOUD_RUN_DIR))
     sys.modules.pop("main", None)
@@ -39,6 +49,19 @@ def cloud_run_main(data_dir, monkeypatch):
         yield module
     finally:
         sys.modules.pop("main", None)
+        import tickreplay.server
+
+        tickreplay.server.reset_for_tests()
+
+
+@pytest.fixture
+def client(cloud_run_main):
+    """A ``TestClient`` entered as a context manager, so ASGI lifespan
+    (main.py's own, composed with tickreplay's) actually runs for the whole
+    test — required for any tickreplay route (``/``, ``/api/status``, ...)
+    to work at all, and matches how a real ASGI server behaves."""
+    with TestClient(cloud_run_main.app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
@@ -56,63 +79,65 @@ def sample_files(data_dir):
     return {"dir": trades_dir, "target": target, "board_target": board_target}
 
 
+# ------------------------------------------------------------------- healthz
+
+
+def test_healthz_returns_ok(client):
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.text == "OK"
+
+
 # --------------------------------------------------------- /api/stocks-trades
 
 
-def test_list_stocks_trades_returns_sorted_deduped_stems(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
-    body = client.get("/api/stocks-trades").get_json()
+def test_list_stocks_trades_returns_sorted_deduped_stems(client, sample_files):
+    body = client.get("/api/stocks-trades").json()
 
     assert body == {"stems": ["1301", "7203"]}
 
 
-def test_list_stocks_trades_ignores_non_duckdb_files(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
-    body = client.get("/api/stocks-trades").get_json()
+def test_list_stocks_trades_ignores_non_duckdb_files(client, sample_files):
+    body = client.get("/api/stocks-trades").json()
 
     assert "not-a-duckdb" not in body["stems"]
 
 
 def test_list_stocks_trades_is_empty_when_directory_exists_and_is_empty(
-    cloud_run_main, data_dir
+    client, data_dir
 ):
     (data_dir / "jp" / "stocks_trades").mkdir(parents=True)
-    client = cloud_run_main.app.test_client()
 
     response = client.get("/api/stocks-trades")
 
     assert response.status_code == 200
-    assert response.get_json() == {"stems": []}
+    assert response.json() == {"stems": []}
 
 
-def test_list_stocks_trades_returns_503_when_directory_is_absent(cloud_run_main):
-    client = cloud_run_main.app.test_client()
-
+def test_list_stocks_trades_returns_503_when_directory_is_absent(client):
     response = client.get("/api/stocks-trades")
 
     assert response.status_code == 503
-    assert response.get_json() == {"error": "stocks_trades listing unavailable"}
+    assert response.json() == {"error": "stocks_trades listing unavailable"}
 
 
 def test_list_stocks_trades_returns_503_when_directory_read_fails(
-    cloud_run_main, sample_files, monkeypatch
+    cloud_run_main, client, sample_files, monkeypatch
 ):
     def raise_permission_error(_directory):
         raise PermissionError("fixture directory is unreadable")
 
     monkeypatch.setattr(cloud_run_main.os, "scandir", raise_permission_error)
-    client = cloud_run_main.app.test_client()
 
     response = client.get("/api/stocks-trades")
 
     assert response.status_code == 503
-    assert response.get_json() == {"error": "stocks_trades listing unavailable"}
+    assert response.json() == {"error": "stocks_trades listing unavailable"}
 
 
 def test_list_stocks_trades_returns_503_when_entry_stat_fails(
-    cloud_run_main, sample_files, monkeypatch
+    cloud_run_main, client, sample_files, monkeypatch
 ):
     class UnreadableEntry:
         name = "7203.duckdb"
@@ -128,22 +153,17 @@ def test_list_stocks_trades_returns_503_when_entry_stat_fails(
             return False
 
     monkeypatch.setattr(cloud_run_main.os, "scandir", lambda _directory: StubScandir())
-    client = cloud_run_main.app.test_client()
 
     response = client.get("/api/stocks-trades")
 
     assert response.status_code == 503
-    assert response.get_json() == {"error": "stocks_trades listing unavailable"}
+    assert response.json() == {"error": "stocks_trades listing unavailable"}
 
 
 # --------------------------------------------------------------- existing GET
 
 
-def test_download_known_file_returns_200_with_range_headers(
-    cloud_run_main, sample_files
-):
-    client = cloud_run_main.app.test_client()
-
+def test_download_known_file_returns_200_with_range_headers(client, sample_files):
     response = client.get("/jp/stocks_trades/7203.duckdb")
 
     assert response.status_code == 200
@@ -152,38 +172,29 @@ def test_download_known_file_returns_200_with_range_headers(
     assert response.headers.get("Accept-Ranges") == "bytes"
 
 
-def test_download_unknown_path_is_404(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_download_unknown_path_is_404(client, sample_files):
     assert client.get("/jp/unknown/1.duckdb").status_code == 404
 
 
-def test_download_unknown_symbol_is_404(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_download_unknown_symbol_is_404(client, sample_files):
     assert client.get("/jp/stocks_trades/9999.duckdb").status_code == 404
 
 
-def test_download_disallowed_extension_is_404(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_download_disallowed_extension_is_404(client, sample_files):
     assert client.get("/jp/stocks_trades/7203.txt").status_code == 404
 
 
-def test_download_stocks_board_file_remains_allowed(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_download_stocks_board_file_remains_allowed(client, sample_files):
     response = client.get("/jp/stocks_board/7203.duckdb")
 
     assert response.status_code == 200
-    assert response.data == b"board-data"
+    assert response.content == b"board-data"
 
 
 # --------------------------------------------------------------- conditional
 
 
-def test_conditional_get_returns_304_for_matching_etag(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
+def test_conditional_get_returns_304_for_matching_etag(client, sample_files):
     first = client.get("/jp/stocks_trades/7203.duckdb")
     etag = first.headers["ETag"]
 
@@ -194,10 +205,7 @@ def test_conditional_get_returns_304_for_matching_etag(cloud_run_main, sample_fi
     assert second.status_code == 304
 
 
-def test_conditional_get_returns_304_for_if_modified_since(
-    cloud_run_main, sample_files
-):
-    client = cloud_run_main.app.test_client()
+def test_conditional_get_returns_304_for_if_modified_since(client, sample_files):
     first = client.get("/jp/stocks_trades/7203.duckdb")
     last_modified = first.headers["Last-Modified"]
 
@@ -209,9 +217,7 @@ def test_conditional_get_returns_304_for_if_modified_since(
     assert second.status_code == 304
 
 
-def test_stale_if_none_match_still_returns_200(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_stale_if_none_match_still_returns_200(client, sample_files):
     response = client.get(
         "/jp/stocks_trades/7203.duckdb", headers={"If-None-Match": '"stale-etag"'}
     )
@@ -222,22 +228,17 @@ def test_stale_if_none_match_still_returns_200(cloud_run_main, sample_files):
 # -------------------------------------------------------------------- range
 
 
-def test_range_request_returns_206_partial_content(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_range_request_returns_206_partial_content(client, sample_files):
     response = client.get(
         "/jp/stocks_trades/7203.duckdb", headers={"Range": "bytes=0-9"}
     )
 
     assert response.status_code == 206
-    assert response.data == b"0123456789"
+    assert response.content == b"0123456789"
     assert response.headers["Content-Range"] == "bytes 0-9/100"
 
 
-def test_if_range_matching_etag_returns_206_partial_content(
-    cloud_run_main, sample_files
-):
-    client = cloud_run_main.app.test_client()
+def test_if_range_matching_etag_returns_206_partial_content(client, sample_files):
     first = client.get("/jp/stocks_trades/7203.duckdb")
 
     response = client.get(
@@ -246,31 +247,222 @@ def test_if_range_matching_etag_returns_206_partial_content(
     )
 
     assert response.status_code == 206
-    assert response.data == b"0123456789"
+    assert response.content == b"0123456789"
     assert response.headers["Content-Range"] == "bytes 10-19/100"
 
 
-def test_if_range_mismatching_etag_returns_full_200(cloud_run_main, sample_files):
-    client = cloud_run_main.app.test_client()
-
+def test_if_range_mismatching_etag_returns_full_200(client, sample_files):
     response = client.get(
         "/jp/stocks_trades/7203.duckdb",
         headers={"Range": "bytes=10-19", "If-Range": '"stale-etag"'},
     )
 
     assert response.status_code == 200
-    assert response.data == b"0123456789" * 10
+    assert response.content == b"0123456789" * 10
     assert "Content-Range" not in response.headers
 
 
-@pytest.mark.parametrize("range_header", ["bytes=10000-10010", "bytes=abc-def"])
+@pytest.mark.parametrize(
+    "range_header",
+    ["bytes=10000-10010", "bytes=abc-def", "bytes=10-1", "bytes=0-1,5-6"],
+)
 def test_range_request_invalid_or_unsatisfiable_returns_416(
-    cloud_run_main, sample_files, range_header
+    client, sample_files, range_header
 ):
-    client = cloud_run_main.app.test_client()
-
+    """Covers out-of-bounds, non-numeric, reversed (`bytes=10-1`), and
+    multiple (`bytes=0-1,5-6`) ranges — the legacy Flask/Werkzeug route
+    returned 416 for every one of these, never a 400 or a 206."""
     response = client.get(
         "/jp/stocks_trades/7203.duckdb", headers={"Range": range_header}
     )
 
     assert response.status_code == 416
+    assert response.headers["Content-Range"] == "bytes */100"
+
+
+def test_range_unit_is_case_insensitive(client, sample_files):
+    response = client.get(
+        "/jp/stocks_trades/7203.duckdb", headers={"Range": "Bytes=0-9"}
+    )
+
+    assert response.status_code == 206
+    assert response.content == b"0123456789"
+
+
+# ---------------------------------------------------------------------- HEAD
+
+
+def test_head_known_file_returns_200_with_no_body(client, sample_files):
+    response = client.head("/jp/stocks_trades/7203.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers.get("ETag")
+    assert response.headers.get("Last-Modified")
+    assert response.headers["Content-Length"] == "100"
+
+
+def test_head_unknown_symbol_is_404(client, sample_files):
+    assert client.head("/jp/stocks_trades/9999.duckdb").status_code == 404
+
+
+# ------------------------------------------------------- wildcard preconditions
+
+
+def test_if_none_match_wildcard_returns_304(client, sample_files):
+    response = client.get(
+        "/jp/stocks_trades/7203.duckdb", headers={"If-None-Match": "*"}
+    )
+
+    assert response.status_code == 304
+
+
+def test_stale_if_match_returns_412(client, sample_files):
+    response = client.get(
+        "/jp/stocks_trades/7203.duckdb", headers={"If-Match": '"stale-etag"'}
+    )
+
+    assert response.status_code == 412
+
+
+def test_matching_if_match_returns_200(client, sample_files):
+    first = client.get("/jp/stocks_trades/7203.duckdb")
+
+    response = client.get(
+        "/jp/stocks_trades/7203.duckdb",
+        headers={"If-Match": first.headers["ETag"]},
+    )
+
+    assert response.status_code == 200
+
+
+# ----------------------------------------------------------------- non-regular
+
+
+def test_directory_sharing_an_allowed_name_is_404_not_empty_200(client, sample_files):
+    """A directory can never legitimately live at an allowed `.duckdb`
+    path, but `Path.stat()` alone can't tell it apart from a regular file —
+    this must be rejected as 404, not served as a `200` with an empty
+    body."""
+    (sample_files["dir"] / "9999.duckdb").mkdir()
+
+    response = client.get("/jp/stocks_trades/9999.duckdb")
+
+    assert response.status_code == 404
+    assert response.content != b""
+
+
+def test_symlink_escaping_the_data_root_is_404(
+    client, data_dir, sample_files, tmp_path
+):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret.txt"
+    secret.write_bytes(b"should never be servable")
+    link = sample_files["dir"] / "9999.duckdb"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlink creation is not permitted on this machine")
+
+    response = client.get("/jp/stocks_trades/9999.duckdb")
+
+    assert response.status_code == 404
+
+
+# ------------------------------------------------------------ tickreplay mount
+
+
+def test_root_falls_through_to_tickreplay_index(client, sample_files):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "歩み値リプレイ" in response.text
+
+
+def test_tickreplay_symbols_endpoint_reachable_through_lifespan(client, sample_files):
+    """Proves main.py's composed lifespan actually runs tickreplay's own
+    lifespan. `/api/symbols` calls `get_repository()` (unlike `/api/status`,
+    which only reads the tracker and would pass even without a repository)
+    — without the composed lifespan, this 500s with "repository is
+    unavailable outside the app lifespan" instead of answering normally."""
+    response = client.get("/api/symbols")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "symbols" in body
+
+
+# --------------------------------------------------------------------- graphql
+
+
+def test_graphql_ranking_query_returns_ranked_rows(client, data_dir):
+    import duckdb
+
+    daily_dir = data_dir / "jp" / "stocks_daily"
+    daily_dir.mkdir(parents=True)
+    con = duckdb.connect(str(daily_dir / "mother.duckdb"))
+    con.execute(
+        "CREATE TABLE stocks_daily "
+        "(Code VARCHAR, Date VARCHAR, Open DOUBLE, High DOUBLE, "
+        "Low DOUBLE, Close DOUBLE, Volume DOUBLE)"
+    )
+    con.execute(
+        "INSERT INTO stocks_daily VALUES ('7203', '2024-01-05', 102, 108, 101, 107, 1200)"
+    )
+    con.close()
+
+    response = client.post(
+        "/graphql",
+        json={
+            "query": (
+                'query { stockRankingRange(fromDate: "2024-01-05", '
+                'toDate: "2024-01-05") { code close rank } }'
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "errors" not in body
+    assert body["data"]["stockRankingRange"] == [
+        {"code": "7203", "close": 107.0, "rank": 1}
+    ]
+
+
+def test_graphql_internal_error_does_not_leak_server_path(client, data_dir):
+    """`mother.duckdb` is absent, so DuckDB's open failure embeds the
+    server's absolute cache path in its exception message — that raw
+    message must never reach an unauthenticated GraphQL client."""
+    (data_dir / "jp" / "stocks_trades").mkdir(parents=True)
+
+    response = client.post(
+        "/graphql",
+        json={
+            "query": (
+                'query { stockRankingRange(fromDate: "2024-01-01", '
+                'toDate: "2024-01-31") { code } }'
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    message = body["errors"][0]["message"]
+    assert str(data_dir) not in message
+    assert message == "stock_ranking_range: internal error"
+
+
+# -------------------------------------------------------------- docker/runtime
+
+
+def test_dockerfile_pins_a_single_asgi_worker():
+    """`tickreplay.server` and this file's own `OperationTracker`/repository
+    state are process-local module globals — a second worker process would
+    silently split that state instead of failing loudly. Guards the
+    Dockerfile's `CMD` against a future edit that raises `--workers`."""
+    dockerfile = (CLOUD_RUN_DIR / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "--workers 1" in dockerfile
+    assert "uvicorn.workers.UvicornWorker" in dockerfile
