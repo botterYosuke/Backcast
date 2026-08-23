@@ -99,6 +99,8 @@ const els = {
   orderQty: document.getElementById('order-qty'),
   cancelSell: document.getElementById('cancel-sell'),
   cancelBuy: document.getElementById('cancel-buy'),
+  mobileBuyButton: document.getElementById('mobile-buy-button'),
+  mobileSellButton: document.getElementById('mobile-sell-button'),
   posQty: document.getElementById('pos-qty'),
   posAvg: document.getElementById('pos-avg'),
   posPnl: document.getElementById('pos-pnl'),
@@ -929,6 +931,22 @@ function placeOrder(side, level) {
   updateBoard();
 }
 
+/*
+ * スマホ幅では板を出さず、代わりに買う/売るの大きいボタンを出す。板が無いので
+ * 指値は選べず、常に成行注文（placeOrder の成行分岐と同じ処理）にする。
+ */
+function placeMobileMarketOrder(side) {
+  if (state.last === null) return;
+  executeFill(side, orderQuantity(), state.last, currentTradeTime());
+  updateBoard();
+}
+
+function syncMobileTradeButtons() {
+  const disabled = state.last === null;
+  els.mobileBuyButton.disabled = disabled;
+  els.mobileSellButton.disabled = disabled;
+}
+
 function cancelOrders(side) {
   const before = trading.orders.length;
   trading.orders = trading.orders.filter((order) => order.side !== side);
@@ -1050,6 +1068,8 @@ function updatePositionPanel() {
   const total = totalPnl(portfolio, lastPrice);
   els.posTotal.textContent = traded ? signedYen(total) : '—';
   els.posTotal.dataset.tone = traded ? pnlTone(total) : '';
+
+  syncMobileTradeButtons();
 
   if (!els.pnlModal.hidden) updatePnlModal();
 }
@@ -1657,6 +1677,20 @@ els.board.addEventListener('click', (event) => {
 
 els.cancelSell.addEventListener('click', () => cancelOrders('sell'));
 els.cancelBuy.addEventListener('click', () => cancelOrders('buy'));
+
+els.mobileBuyButton.addEventListener('click', () => placeMobileMarketOrder('buy'));
+els.mobileSellButton.addEventListener('click', () => placeMobileMarketOrder('sell'));
+
+// 分足/ティック/歩み値の開閉トグル（スマホ幅だけで表示）。開閉状態は保存しない。
+document.querySelectorAll('.section-toggle').forEach((button) => {
+  button.addEventListener('click', () => {
+    const card = button.closest('.card');
+    if (!card) return;
+    const collapsed = card.classList.toggle('is-collapsed');
+    button.setAttribute('aria-expanded', String(!collapsed));
+    button.textContent = collapsed ? '＋' : '－';
+  });
+});
 
 els.pnlModal.addEventListener('click', (event) => {
   if (event.target.closest('[data-close]')) closePnlModal();

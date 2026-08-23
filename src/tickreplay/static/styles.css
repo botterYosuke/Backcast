@@ -188,6 +188,18 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   font-size: 11.5px;
 }
 
+/* スマホ幅だけで出す、セクション（分足/ティック/歩み値）の開閉ボタン */
+.section-toggle {
+  display: none;
+  margin-left: auto;
+  padding: 1px 10px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  flex: none;
+}
+
+
 .chart { flex: 1; min-height: 0; }
 
 .minute-card { flex: 1.5; }
@@ -653,6 +665,43 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 
 .modal-panel button { width: 100%; }
 
+/* --------------------------------------------------- モバイル注文ボタン */
+
+/*
+ * 板の代わりにスマホ幅でだけ出す、大きい買う/売るボタン（松井証券アプリ等の
+ * スマホ証券アプリを参考にしたUI）。スマホには板が無いので常に成行注文。
+ * PC幅では板をそのまま使うため常に非表示。
+ */
+.mobile-trade-bar {
+  display: none;
+}
+
+.mobile-trade-btn {
+  flex: 1;
+  padding: 15px 0;
+  border-radius: var(--radius);
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.mobile-trade-sell {
+  background: var(--down-soft);
+  border-color: var(--down);
+  color: var(--down);
+}
+
+.mobile-trade-sell:hover:not(:disabled) { background: var(--down); color: #fff; }
+
+.mobile-trade-buy {
+  background: var(--up-soft);
+  border-color: var(--up);
+  color: var(--up);
+}
+
+.mobile-trade-buy:hover:not(:disabled) { background: var(--up); color: #fff; }
+
 /* ------------------------------------------------------------ responsive */
 
 @media (max-width: 1180px) {
@@ -662,4 +711,79 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .layout { flex-direction: column; padding: 12px 18px 14px; }
   .board-card { width: auto; min-height: 320px; }
   .position-panel { gap: 14px; }
+}
+
+/*
+ * スマホ幅。板の代わりに買う/売るボタンを出し、分足/ティック/歩み値/footer を
+ * 縦積みにする。1画面に収めるのではなく、ページ全体をスクロールさせる方針
+ * （板や歩み値の内部スクロールに寄せると狭すぎるため）。
+ */
+@media (max-width: 768px) {
+  body { overflow-y: auto; }
+
+  .topbar { gap: 10px; padding: 10px 14px; }
+  .picker { gap: 8px; }
+  .field input { width: 108px; }
+  .day-nav { display: none; }
+  .position-panel { gap: 10px; }
+  .pos-total-item { padding-left: 12px; }
+
+  .mobile-trade-bar {
+    display: flex;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .layout { padding: 12px 14px 18px; }
+  .layout-main { flex: 1 0 auto; min-height: auto; gap: 14px; }
+
+  /*
+   * 板本体（一覧・発注列・板固定）はスマホでは使わないので隠すが、注文数量
+   * （#order-qty）だけは唯一のDOM要素のまま残す（複製すると買う/売るボタンの
+   * 成行注文が読む orderQuantity() との値同期が要るため、複製はしない）。
+   * .board-card ごと order で買う/売るボタンのすぐ下（分足の上）へ動かし、
+   * card-head だけ見せて中身（板一覧・発注列・板固定トグル）を隠す。
+   */
+  .board-card {
+    display: flex;
+    order: -1;
+    width: auto;
+    flex: none;
+    min-height: 0;
+  }
+
+  .board-card .toggle { display: none; }
+
+  .board-head,
+  .board,
+  .board-order-foot,
+  .board-foot { display: none; }
+
+  .board-card .card-head {
+    justify-content: center;
+    border-bottom: none;
+  }
+
+  .order-qty-field { margin-left: 0; }
+
+  .minute-card,
+  .tick-card,
+  .tape-card { flex: none; width: auto; min-height: 0; }
+
+  .chart { flex: none; height: 220px; }
+
+  .split { flex-direction: column; gap: 14px; }
+
+  .tape { flex: none; max-height: 240px; }
+
+  .card-head { flex-wrap: wrap; }
+
+  .section-toggle { display: inline-flex; align-items: center; justify-content: center; }
+
+  /* 折りたたみはこの幅でだけ効かせる。PC幅へ戻ったときに畳んだままにならないように。 */
+  .card.is-collapsed > *:not(.card-head) { display: none; }
+
+  .transport { flex-wrap: wrap; }
 }

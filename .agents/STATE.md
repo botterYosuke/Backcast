@@ -100,3 +100,38 @@ Rolling progress summary (latest 5 checkpoints): [PROGRESS.md](../PROGRESS.md)
 - Browser QA passed repeated large wheel gestures in both directions with a constant 53-row pool, pending sell-order off-screen/back restoration at the same price and side, identical button/double-click centering, and uniform `.0`/`.5` display for cached 7203 half-yen data.
 - Security review found no Critical or High issue. Non-blocking hardening remains for malformed session numeric validation and an explicit retention cap on synthetic `board.qty`.
 - Repository-wide gates remain affected by pre-existing Windows/orchestration baseline failures; the shared bash verifier cannot start because this host lacks WSL `/bin/bash`.
+
+---
+
+## Current Bug Fix: local-authoritative-cache-download
+<!-- orchestra:block-id: local-authoritative-cache-download -->
+
+### Context
+
+- Incident: a fresh app process selected 285A, entered pending/status polling, and the user observed a DuckDB transfer despite an existing-cache claim.
+- Root cause of operation entry: normal-cache policy (`local_authoritative=false` or unset) intentionally revalidates each stem once per fresh repository/process.
+- Full-transfer cause: not uniquely recoverable after replacement; missing/unusable/validator-less sidecar is leading, with exact-path absence/mismatch and changed remote validator viable.
+- Affected files: src/tickreplay/config.py, cache.py, repository.py, server.py, static/app.js, and request-coordinator.mjs.
+
+### Fix Approach
+
+- Preserve freshness semantics and add observability that distinguishes checking/304 from 200 body transfer, stale fallback, and corruption repair.
+- Isolate focused tests from the ignored root .env.
+- Defer strong-digest sidecar bootstrap as a protocol design; reject trusting every ordinary cache forever.
+
+### Codex Validation
+
+- One initial read-only Codex consultation completed and agreed with the two-stage conclusion.
+- Later mandatory plan/risk/fix consultations hung past their bounds or received an incomplete Windows prompt and were interrupted; they are unverified and contribute no evidence.
+
+### Regression Risks
+
+- Reusing local_authoritative=true for a remote copy can permanently hide remote market-data updates.
+- Status schema changes must preserve serverEpoch/operationId/revision stale-response guards and avoid exposing absolute paths, validators, or headers.
+- During investigation .env changed concurrently from no key/default false to true; no diagnosis agent changed it. Tests must not inherit this developer setting.
+
+### Decisions
+
+- Treat operation entry as intended behavior, not a cache-miss defect.
+- Treat the indistinguishable revalidation/download presentation as the safest fix target.
+- Do not overwrite the concurrent .env=true change; the owner must confirm whether C:\cache is the authoritative served tree or only a remote copy.

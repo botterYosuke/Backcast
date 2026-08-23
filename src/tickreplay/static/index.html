@@ -51,6 +51,11 @@
   </div>
 </header>
 
+<div id="mobile-trade-bar" class="mobile-trade-bar">
+  <button id="mobile-sell-button" class="mobile-trade-btn mobile-trade-sell" type="button">売る</button>
+  <button id="mobile-buy-button" class="mobile-trade-btn mobile-trade-buy" type="button">買う</button>
+</div>
+
 <div id="status-bar" class="status-bar" role="status" aria-live="polite" hidden></div>
 
 <main class="layout">
@@ -61,6 +66,7 @@
       <div class="card-head">
         <h2>分足</h2>
         <p class="card-note">形成中の足は歩み値の進行に合わせて伸縮します（陽線＝赤／陰線＝青）</p>
+        <button class="section-toggle" type="button" aria-expanded="true" title="分足の開閉">－</button>
       </div>
       <div id="minute-chart" class="chart"></div>
     </section>
@@ -70,6 +76,7 @@
         <div class="card-head">
           <h2>ティック</h2>
           <p class="card-note">約定ごとの価格推移</p>
+          <button class="section-toggle" type="button" aria-expanded="true" title="ティックの開閉">－</button>
         </div>
         <div id="tick-chart" class="chart"></div>
       </section>
@@ -78,6 +85,7 @@
         <div class="card-head">
           <h2>歩み値</h2>
           <p class="card-note">新しい約定が上</p>
+          <button class="section-toggle" type="button" aria-expanded="true" title="歩み値の開閉">－</button>
         </div>
         <div class="tape-head">
           <span>時刻</span><span>価格</span><span>数量</span><span>区分</span>
