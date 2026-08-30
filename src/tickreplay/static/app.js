@@ -25,6 +25,27 @@ import {
   planBoardRebase,
   rowIndexForLevel,
 } from './board-ladder.mjs';
+import {
+  applyDailyHistoryPage,
+  ChartViewportState,
+  DailyChartSession,
+  ReplayLivenessPresenter,
+  commitDailySession,
+  commitMarkerWrites,
+  commitReplayFrame,
+  dailyContextUrl,
+  dailyInitialLogicalRange,
+  dailySessionIdentity,
+  flushDeferredMinuteChart,
+  loadDailyRequest,
+  normalizeDailyPayload,
+  paintedLinePoint,
+  renderDailySnapshot,
+  runReplayFrame,
+  selectMinuteHistoryTarget,
+  shiftDailyLogicalRange,
+  updateChartViewport,
+} from './daily-chart.mjs';
 
 /*
  * 歩み値リプレイ — tick / 分足のプレイバック
@@ -50,6 +71,8 @@ const DOWN = '#1d5fa8';  // 陰線・下降
 const FLAT = '#9a9489';
 const UP_FILL = 'rgba(192, 57, 43, 0.35)';
 const DOWN_FILL = 'rgba(29, 95, 168, 0.35)';
+const SMA25 = '#d97706';
+const SMA200 = '#7c3aed';
 
 const MINUTE = 60;
 const TICK_WINDOW_SECONDS = 300;      // ティックチャートの表示幅
@@ -111,6 +134,18 @@ const els = {
   pnlTotal: document.getElementById('pnl-total'),
   pnlPosition: document.getElementById('pnl-position'),
   pnlFills: document.getElementById('pnl-fills'),
+  chartStage: document.getElementById('price-chart-stage'),
+  minuteChart: document.getElementById('minute-chart'),
+  dailyChart: document.getElementById('daily-chart'),
+  chartInterval: document.getElementById('chart-interval'),
+  minuteTab: document.getElementById('minute-tab'),
+  dailyTab: document.getElementById('daily-tab'),
+  dailyStatus: document.getElementById('daily-status'),
+  dailyLegend: document.getElementById('daily-legend'),
+  dailyReplayLiveness: document.getElementById('daily-replay-liveness'),
+  dailyReplayState: document.getElementById('daily-replay-state'),
+  dailyReplayTime: document.getElementById('daily-replay-time'),
+  dailyReplayProgress: document.getElementById('daily-replay-progress'),
 };
 
 // --------------------------------------------------------------- utilities
@@ -226,8 +261,18 @@ const chartTheme = {
   crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
 };
 
-const minuteChart = LightweightCharts.createChart(document.getElementById('minute-chart'), {
+function chartStageSize() {
+  const bounds = els.chartStage.getBoundingClientRect();
+  return {
+    width: Math.max(1, Math.floor(bounds.width)),
+    height: Math.max(1, Math.floor(bounds.height)),
+  };
+}
+
+const minuteChart = LightweightCharts.createChart(els.minuteChart, {
   ...chartTheme,
+  autoSize: false,
+  ...chartStageSize(),
   timeScale: {
     ...chartTheme.timeScale,
     timeVisible: true,
@@ -255,6 +300,16 @@ const volumeSeries = minuteChart.addHistogramSeries({
   lastValueVisible: false,
 });
 volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+
+let chartMode = 'minute';
+const minuteViewport = new ChartViewportState();
+const dailyViewport = new ChartViewportState();
+let minuteChartDeferred = false;
+let dailyChart = null;
+let dailyCandleSeries = null;
+let dailyVolumeSeries = null;
+let dailySma25Series = null;
+let dailySma200Series = null;
 
 const tickChart = LightweightCharts.createChart(document.getElementById('tick-chart'), {
   ...chartTheme,
@@ -294,7 +349,341 @@ const state = {
   last: null,
   lastFrame: 0,
   scrubbing: false,
+  daily: new DailyChartSession(),
 };
+
+const replayLiveness = new ReplayLivenessPresenter((view) => {
+  els.dailyReplayLiveness.hidden = view.hidden;
+  els.dailyReplayState.textContent = view.stateLabel;
+  els.dailyReplayTime.textContent = view.timeLabel;
+  els.dailyReplayProgress.value = view.progressPercent;
+});
+
+function updateDailyReplayLiveness() {
+  const hasTimeline = Boolean(state.t?.length);
+  replayLiveness.present({
+    mode: chartMode,
+    playing: state.playing,
+    virtualTime: hasTimeline ? state.vt : Number.NaN,
+    startTime: hasTimeline ? state.t[0] : Number.NaN,
+    endTime: hasTimeline ? state.t[state.t.length - 1] : Number.NaN,
+  });
+}
+
+function setDailyStatus(message, tone = 'info') {
+  els.dailyStatus.hidden = !message;
+  els.dailyStatus.textContent = message || '';
+  els.dailyStatus.dataset.tone = tone;
+}
+
+function applyChartStageSize() {
+  const { width, height } = chartStageSize();
+  minuteChart.resize(width, height);
+  if (dailyChart) dailyChart.resize(width, height);
+}
+
+function ensureDailyChart() {
+  if (dailyChart) return dailyChart;
+  dailyChart = LightweightCharts.createChart(els.dailyChart, {
+    ...chartTheme,
+    autoSize: false,
+    ...chartStageSize(),
+    timeScale: { ...chartTheme.timeScale, timeVisible: false, secondsVisible: false },
+  });
+  dailyCandleSeries = dailyChart.addCandlestickSeries({
+    upColor: UP,
+    downColor: DOWN,
+    borderUpColor: UP,
+    borderDownColor: DOWN,
+    wickUpColor: UP,
+    wickDownColor: DOWN,
+    priceLineVisible: false,
+  });
+  dailyCandleSeries.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.28 } });
+  dailyVolumeSeries = dailyChart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  dailyVolumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+  dailySma25Series = dailyChart.addLineSeries({
+    color: SMA25,
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  dailySma200Series = dailyChart.addLineSeries({
+    color: SMA200,
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  dailyChart.timeScale().subscribeVisibleLogicalRangeChange(onDailyLogicalRangeChange);
+  return dailyChart;
+}
+
+function renderMinuteChart({ restoreRange = false } = {}) {
+  withProgrammaticMinuteRange(() => {
+    updateChartViewport({
+      viewport: minuteViewport,
+      writeData: () => {
+        candleSeries.setData(state.bars.map(paintedBar));
+        volumeSeries.setData(state.bars.map(paintedVolume));
+      },
+      timeScale: minuteChart.timeScale(),
+      restore: restoreRange,
+    });
+  });
+  minuteChartDeferred = false;
+}
+
+function renderDailyChart({ restoreRange = false } = {}) {
+  if (chartMode !== 'daily' || !state.daily.identity) return;
+  ensureDailyChart();
+  const snapshot = state.daily.snapshot();
+  updateChartViewport({
+    viewport: dailyViewport,
+    writeData: () => renderDailySnapshot(snapshot, {
+      candle: dailyCandleSeries,
+      volume: dailyVolumeSeries,
+      sma25: dailySma25Series,
+      sma200: dailySma200Series,
+    }, { paintCandle: paintedBar, paintVolume: paintedVolume }),
+    timeScale: dailyChart.timeScale(),
+  });
+  applyDailyViewport(snapshot.bars.length, { restoreRange });
+}
+
+function applyDailyViewport(observationCount, { restoreRange = false } = {}) {
+  if (!dailyChart) return false;
+  const resolvedObservationCount = Number.isInteger(observationCount)
+    ? observationCount
+    : observationCount?.bars?.length;
+  const savedRange = restoreRange && dailyViewport.savedRange
+    ? { ...dailyViewport.savedRange }
+    : null;
+  const canInitialize = ['ready', 'empty'].includes(state.daily.phase);
+  const initialRange = !savedRange && !state.daily.hasInitialViewport && canInitialize
+    ? dailyInitialLogicalRange(resolvedObservationCount)
+    : null;
+  const targetRange = savedRange || initialRange;
+  if (!targetRange) return false;
+
+  try {
+    dailyViewport.runProgrammatic(() => {
+      dailyChart.timeScale().setVisibleLogicalRange(targetRange);
+    });
+  } catch (error) {
+    console.warn('Daily chart viewport update failed', error);
+    return false;
+  }
+  if (initialRange) return state.daily.markInitialViewport();
+  return true;
+}
+
+function updateDailyPartialChart() {
+  if (chartMode !== 'daily' || !dailyChart || !state.daily.identity || !state.daily.partialBar) return;
+  const partial = state.daily.partialBar;
+  dailyCandleSeries.update(paintedBar(partial));
+  dailyVolumeSeries.update(paintedVolume(partial));
+  if (state.daily.terminalSma25) dailySma25Series.update(paintedLinePoint(state.daily.terminalSma25));
+  if (state.daily.terminalSma200) dailySma200Series.update(paintedLinePoint(state.daily.terminalSma200));
+  if (!state.daily.hasInitialViewport) {
+    applyDailyViewport(state.daily.historyBars.length + 1);
+  }
+}
+
+function clearDailyDisplay() {
+  setDailyStatus(chartMode === 'daily' ? '日足セッションを読み込み中…' : '');
+  if (!dailyChart) return;
+  dailyViewport.runProgrammatic(() => {
+    dailyCandleSeries.setData([]);
+    dailyVolumeSeries.setData([]);
+    dailySma25Series.setData([]);
+    dailySma200Series.setData([]);
+  });
+}
+
+function refreshDailyStatus() {
+  if (chartMode !== 'daily') {
+    setDailyStatus('');
+    return;
+  }
+  const messages = {
+    idle: ['日足を準備しています…', 'info'],
+    loading: ['日足履歴を読み込み中…', 'info'],
+    ready: ['', 'info'],
+    empty: ['この日より前の利用可能な日足はありません', 'info'],
+    unavailable: ['日足履歴を利用できません。分足の再生は継続します', 'error'],
+    error: ['日足履歴を読み込めませんでした。日足を選び直すと再試行します', 'error'],
+  };
+  const [message, tone] = messages[state.daily.phase] || messages.idle;
+  setDailyStatus(message, tone);
+}
+
+async function loadDailyContext() {
+  return loadDailyRequest({
+    session: state.daily,
+    fetchPayload: ({ identity, url }) => {
+      const [stem] = identity.split('|');
+      return requests.fetchLatest('daily-context', url, { stem });
+    },
+    getMode: () => chartMode,
+    commitChart: () => renderDailyChart(),
+    onStatus: () => refreshDailyStatus(),
+    isCancellation: isCancellationError,
+  });
+}
+
+function commitInactiveDailyHistoryPage(plan) {
+  const previousRange = dailyViewport.savedRange
+    ? { ...dailyViewport.savedRange }
+    : null;
+  const shiftedRange = shiftDailyLogicalRange(previousRange, plan.added);
+  dailyViewport.replace(shiftedRange);
+  try {
+    const committed = state.daily.commitOlderPage(plan);
+    if (!committed?.accepted) throw new Error('Daily history page commit was rejected');
+    return committed;
+  } catch (error) {
+    dailyViewport.replace(previousRange);
+    throw error;
+  }
+}
+
+async function loadOlderDailyBars() {
+  const identity = dailySessionIdentity(state.meta);
+  if (!identity || identity !== state.daily.identity || !state.daily.historyBars.length) {
+    return { kind: 'stale' };
+  }
+  const cutoff = state.daily.historyBars[0].time;
+  const token = state.daily.admitOlderPage(cutoff, { identity });
+  if (!token) return { kind: 'not-admitted' };
+  const url = dailyContextUrl(identity, {
+    beforeDate: cutoff,
+    limit: state.daily.historyPageSize,
+  });
+  if (!url) {
+    state.daily.failOlderPage(token);
+    return { kind: 'failure' };
+  }
+
+  try {
+    const [stem] = identity.split('|');
+    const payload = await requests.fetchLatest('daily-context', url, { stem });
+    if (!state.daily.isCurrentOlderPage(token) ||
+        state.daily.identity !== identity ||
+        dailySessionIdentity(state.meta) !== identity) {
+      return { kind: 'stale' };
+    }
+
+    const normalized = normalizeDailyPayload(payload, state.daily.historyPageSize);
+    const plan = state.daily.prepareOlderPage(token, normalized);
+    if (plan.kind === 'stale') return plan;
+    if (plan.kind === 'failure') {
+      state.daily.failOlderPage(token);
+      return plan;
+    }
+    if (plan.kind === 'exhausted') {
+      state.daily.completeOlderExhausted(token);
+      return plan;
+    }
+
+    if (chartMode === 'daily' && dailyChart) {
+      applyDailyHistoryPage({
+        session: state.daily,
+        plan,
+        viewport: dailyViewport,
+        ports: {
+          candle: dailyCandleSeries,
+          volume: dailyVolumeSeries,
+          sma25: dailySma25Series,
+          sma200: dailySma200Series,
+          paintCandle: paintedBar,
+          paintVolume: paintedVolume,
+        },
+        timeScale: dailyChart.timeScale(),
+      });
+      return plan;
+    }
+
+    commitInactiveDailyHistoryPage(plan);
+    return plan;
+  } catch (error) {
+    if (isCancellationError(error)) {
+      state.daily.abortOlderPage(token);
+      return { kind: 'cancelled' };
+    }
+    state.daily.failOlderPage(token);
+    return { kind: 'failure', error };
+  }
+}
+
+function onDailyLogicalRangeChange(range) {
+  if (chartMode === 'daily') dailyViewport.capture(range);
+  if (chartMode !== 'daily' || !range || !dailyCandleSeries) return;
+  const identity = dailySessionIdentity(state.meta);
+  if (!identity || identity !== state.daily.identity) return;
+  const programmatic = dailyViewport.programmaticDepth > 0;
+  if (programmatic) return;
+  const visible = dailyCandleSeries.barsInLogicalRange(range);
+  if (!visible || !state.daily.canLoadOlder({
+    identity,
+    barsBefore: visible.barsBefore,
+    programmatic,
+  })) return;
+  void loadOlderDailyBars();
+}
+
+function setChartMode(mode) {
+  if (mode !== 'minute' && mode !== 'daily') return;
+  if (chartMode === 'minute') {
+    const range = minuteChart.timeScale().getVisibleLogicalRange();
+    minuteViewport.capture(range);
+  } else if (dailyChart) {
+    const range = dailyChart.timeScale().getVisibleLogicalRange();
+    dailyViewport.capture(range);
+  }
+
+  chartMode = mode;
+  const dailyActive = mode === 'daily';
+  els.minuteChart.classList.toggle('is-active', !dailyActive);
+  els.dailyChart.classList.toggle('is-active', dailyActive);
+  els.minuteChart.setAttribute('aria-hidden', String(dailyActive));
+  els.dailyChart.setAttribute('aria-hidden', String(!dailyActive));
+  els.minuteTab.classList.toggle('is-selected', !dailyActive);
+  els.dailyTab.classList.toggle('is-selected', dailyActive);
+  els.minuteTab.setAttribute('aria-selected', String(!dailyActive));
+  els.dailyTab.setAttribute('aria-selected', String(dailyActive));
+  els.minuteTab.tabIndex = dailyActive ? -1 : 0;
+  els.dailyTab.tabIndex = dailyActive ? 0 : -1;
+  els.dailyLegend.hidden = !dailyActive;
+  updateDailyReplayLiveness();
+
+  if (dailyActive) {
+    ensureDailyChart();
+    applyChartStageSize();
+    renderDailyChart({ restoreRange: true });
+    void loadDailyContext();
+  } else {
+    applyChartStageSize();
+    const flushResult = flushDeferredMinuteChart({
+      mode,
+      deferred: minuteChartDeferred,
+      flush: () => {
+        renderMinuteChart({ restoreRange: true });
+        refreshMarkers();
+      },
+    });
+    minuteChartDeferred = flushResult.deferred;
+    if (!flushResult.flushed) {
+      renderMinuteChart({ restoreRange: true });
+      refreshMarkers();
+    }
+    setDailyStatus('');
+  }
+}
 
 function candleColor(bar) {
   // 始値 <= 終値(最新値) なら陽線(赤)、始値 > 終値なら陰線(青)。
@@ -341,6 +730,10 @@ function applyTick(index, touched) {
   if (price < bar.low) bar.low = price;
   bar.close = price;
   bar.volume += quantity;
+
+  if (state.meta && state.daily.canAppendTick(minuteSessionIdentity(state.meta))) {
+    state.daily.appendTick(state.meta.date, price, quantity);
+  }
 
   if (touched && touched.indexOf(bar) === -1) touched.push(bar);
   return bar;
@@ -1038,8 +1431,16 @@ function refreshMarkers() {
     if (tickTime !== null) tickMarkers.push({ ...style, time: tickTime });
   });
 
-  candleSeries.setMarkers(minuteMarkers);
-  tickSeries.setMarkers(tickMarkers);
+  commitMarkerWrites({
+    mode: chartMode,
+    minuteMarkers,
+    tickMarkers,
+    ports: {
+      minute: (markers) => candleSeries.setMarkers(markers),
+      deferMinute: () => { minuteChartDeferred = true; },
+      tick: (markers) => tickSeries.setMarkers(markers),
+    },
+  });
 }
 
 // -------------------------------------------------------------- 建玉パネル
@@ -1167,7 +1568,7 @@ function minuteSessionIdentity(session) {
 function withProgrammaticMinuteRange(apply) {
   minuteHistory.beginProgrammatic();
   try {
-    apply();
+    return minuteViewport.runProgrammatic(apply);
   } finally {
     // 可視レンジ変化の通知は同期とは限らないので、次のタスクまで伏せておく。
     setTimeout(() => minuteHistory.endProgrammatic(), 0);
@@ -1189,6 +1590,30 @@ function minuteContextUrl(session, cutoff, limit) {
     '&limit=' + limit;
 }
 
+function minuteHistoryChartTarget() {
+  const realTarget = {
+    candleSeries,
+    volumeSeries,
+    timeScale: minuteChart.timeScale(),
+    refreshMarkers,
+  };
+  if (chartMode === 'minute') {
+    return selectMinuteHistoryTarget({
+      mode: chartMode,
+      realTarget,
+      viewport: minuteViewport,
+    });
+  }
+  minuteChartDeferred = true;
+  return selectMinuteHistoryTarget({
+    mode: chartMode,
+    realTarget,
+    viewport: minuteViewport,
+    deferMinute: () => { minuteChartDeferred = true; },
+    refreshMarkers,
+  });
+}
+
 /**
  * 取得した古い足を contextBars と bars の両方へ、同じ集合だけ前置きする。
  * contextBars にも入れるのは、シークや「先頭に戻す」で bars が contextBars
@@ -1199,16 +1624,17 @@ function minuteContextUrl(session, cutoff, limit) {
  * マーカーだけを張り直す。
  */
 function prependMinuteHistory(older) {
+  const target = minuteHistoryChartTarget();
   const result = applyMinuteHistoryPage({
     state,
     olderBars: older,
-    candleSeries,
-    volumeSeries,
-    timeScale: minuteChart.timeScale(),
+    candleSeries: target.candleSeries,
+    volumeSeries: target.volumeSeries,
+    timeScale: target.timeScale,
     paintCandle: paintedBar,
     paintVolume: paintedVolume,
     runProgrammatic: withProgrammaticMinuteRange,
-    refreshMarkers,
+    refreshMarkers: target.refreshMarkers,
   });
   return result.added;
 }
@@ -1253,6 +1679,8 @@ async function loadOlderMinuteBars() {
 }
 
 function onMinuteLogicalRangeChange(range) {
+  if (chartMode === 'minute') minuteViewport.capture(range);
+  if (chartMode !== 'minute') return;
   if (!range || !state.meta || !state.bars.length) return;
   if (minuteHistory.isProgrammatic()) return;
   const visible = candleSeries.barsInLogicalRange(range);
@@ -1285,12 +1713,18 @@ function followTickView() {
  * ギャップの実時間の長さに関係なく常に一定本数を均等に表示できる。
  */
 function followMinuteView() {
+  if (chartMode !== 'minute') {
+    minuteChartDeferred = true;
+    return;
+  }
   if (!state.bars.length) return;
   const lastIndex = state.bars.length - 1;
   const from = Math.max(0, lastIndex - (MINUTE_VISIBLE_BARS - 1));
   const to = lastIndex + MINUTE_RIGHT_PADDING_BARS;
   withProgrammaticMinuteRange(() => {
-    minuteChart.timeScale().setVisibleLogicalRange({ from, to });
+    minuteViewport.runProgrammatic(() => {
+      minuteChart.timeScale().setVisibleLogicalRange({ from, to });
+    });
   });
 }
 
@@ -1298,10 +1732,12 @@ function followMinuteView() {
 
 /** シーク後などに、現在の状態からチャート全体を張り直す。 */
 function redrawAll() {
-  withProgrammaticMinuteRange(() => {
-    candleSeries.setData(state.bars.map(paintedBar));
-    volumeSeries.setData(state.bars.map(paintedVolume));
-  });
+  if (chartMode === 'minute') {
+    withProgrammaticMinuteRange(() => renderMinuteChart());
+  } else {
+    minuteChartDeferred = true;
+  }
+  if (chartMode === 'daily') renderDailyChart();
 
   const start = Math.max(0, state.cursor - MAX_TICK_POINTS_AFTER_SEEK);
   const points = [];
@@ -1318,6 +1754,7 @@ function redrawAll() {
   refreshMarkers();
   updatePositionPanel();
   updateClock();
+  updateDailyReplayLiveness();
   syncScrubber();
   followTickView();
   followMinuteView(); // シーク・読み込み直後だけ分足の表示位置を作り直す
@@ -1329,10 +1766,14 @@ function seekTo(targetVt) {
   state.cursor = 0;
   state.last = null;
   state.vt = targetVt;
+  state.daily.clearPartial();
 
   while (state.cursor < state.t.length && state.t[state.cursor] <= targetVt) {
     applyTick(state.cursor, null);
     state.cursor += 1;
+  }
+  if (state.daily.canAppendTick(minuteSessionIdentity(state.meta))) {
+    state.daily.deriveTerminal();
   }
   truncateTradingAt(targetVt);
   redrawAll();
@@ -1367,25 +1808,44 @@ function step(timestamp) {
     state.cursor += 1;
   }
 
-  if (state.cursor > from) {
-    for (let index = 0; index < touched.length; index += 1) {
-      candleSeries.update(paintedBar(touched[index]));
-      volumeSeries.update(paintedVolume(touched[index]));
-    }
-    pushTickPoints(from, state.cursor);
-    pushTapeRows(from, state.cursor);
-    // 板の再描画より先に約定させる（約定ぶんの注文を板から消すため）。
-    matchOrders(from, state.cursor);
-    applyTradesToBoard(from, state.cursor);
-    updatePositionPanel(); // 評価損益は現在値が動くたびに更新する
-  }
-
-  // 分足の可視レンジはここでは触らない。右端に居れば Lightweight Charts が
-  // 新しい足に自動で追従し、左へパンしていればその位置が保たれる。
-  followTickView();
-  updateClock();
-  syncScrubber();
-
+  const framePorts = {
+    updateMinute: (bar) => {
+      candleSeries.update(paintedBar(bar));
+      volumeSeries.update(paintedVolume(bar));
+    },
+    deferMinute: () => { minuteChartDeferred = true; },
+    deriveDaily: () => {
+      if (state.daily.canAppendTick(minuteSessionIdentity(state.meta))) {
+        state.daily.deriveTerminal();
+      }
+    },
+    updateDaily: updateDailyPartialChart,
+    pushTicks: pushTickPoints,
+    pushTape: pushTapeRows,
+    matchOrders,
+    updateBoard: applyTradesToBoard,
+    updatePosition: updatePositionPanel,
+  };
+  runReplayFrame({
+    mode: chartMode,
+    touchedBars: touched,
+    from,
+    to: state.cursor,
+    ports: {
+      ...framePorts,
+      commitFrame: ({ mode, touchedBars, from, to }) => commitReplayFrame({
+        mode,
+        touchedBars,
+        from,
+        to,
+        ports: framePorts,
+      }),
+      followTick: () => followTickView(),
+      updateClock: () => updateClock(),
+      syncScrubber: () => syncScrubber(),
+      updateLiveness: () => updateDailyReplayLiveness(),
+    },
+  });
   if (state.cursor >= state.t.length && state.vt >= state.t[state.t.length - 1]) {
     setPlaying(false);
     setStatus('');
@@ -1413,6 +1873,7 @@ function setPlaying(playing) {
   state.playing = playing;
   state.lastFrame = 0;
   els.playButton.textContent = playing ? '⏸' : '▶';
+  updateDailyReplayLiveness();
 }
 
 // ------------------------------------------------------------ data loading
@@ -1491,8 +1952,12 @@ async function loadSession(stem, date, direction) {
   // 最初の await より前に、飛んでいる分足履歴の取得を取り消して世代を進める。
   // これ以降、古い世代のレスポンスは isCurrent() / isGeneration() で弾かれる。
   requests.cancel('minute-history');
+  requests.cancel('daily-context');
   const requestedIdentity = stem + '|pending|' + date + '|' + direction;
   const generation = minuteHistory.resetSession(requestedIdentity);
+  const dailyGeneration = state.daily.resetSession();
+  dailyViewport.replace(null);
+  clearDailyDisplay();
   setPlaying(false);
   resetBoardNavigation();
   resetTrading(); // 別セッションの建玉・損益・マーカーは持ち越さない
@@ -1514,6 +1979,8 @@ async function loadSession(stem, date, direction) {
       date: session.date,
       count: session.count,
     };
+    if (!state.daily.stageActualSession(dailyGeneration, nextMeta)) return;
+    if (chartMode === 'daily') void loadDailyContext();
     const nextT = Float64Array.from(session.us, (value) => value / 1e6);
     const nextPrice = Float64Array.from(session.price);
     const nextQty = Float64Array.from(session.qty);
@@ -1531,10 +1998,19 @@ async function loadSession(stem, date, direction) {
       state.cursor = 0;
       state.last = null;
       state.vt = 0;
-      withProgrammaticMinuteRange(() => {
-        candleSeries.setData([]);
-        volumeSeries.setData([]);
-      });
+      if (!commitDailySession({
+        session: state.daily,
+        generation: dailyGeneration,
+        meta: nextMeta,
+        commit: () => state.daily.commitSession(dailyGeneration, nextMeta),
+        publishStatus: refreshDailyStatus,
+      })) return;
+      state.daily.clearPartial();
+      if (chartMode === 'minute') renderMinuteChart();
+      else {
+        minuteChartDeferred = true;
+        renderDailyChart();
+      }
       tickSeries.setData([]);
       clearBoard();
       minuteHistory.markSessionReady(generation, sessionIdentity);
@@ -1551,6 +2027,13 @@ async function loadSession(stem, date, direction) {
     state.qty = nextQty;
     state.type = nextType;
     state.contextBars = contextBars;
+    if (!commitDailySession({
+      session: state.daily,
+      generation: dailyGeneration,
+      meta: nextMeta,
+      commit: () => state.daily.commitSession(dailyGeneration, nextMeta),
+      publishStatus: refreshDailyStatus,
+    })) return;
     els.dateInput.value = session.date;
 
     board.tick = state.price.length ? inferTickSize() : 1;
@@ -1572,6 +2055,9 @@ async function loadSession(stem, date, direction) {
     }
   } catch (error) {
     if (isCancellationError(error)) return;
+    requests.cancel('daily-context');
+    state.daily.failSession(dailyGeneration);
+    refreshDailyStatus();
     setStatus('読み込みに失敗しました: ' + error.message, 'error');
   }
 }
@@ -1645,11 +2131,36 @@ els.scrubber.addEventListener('input', () => {
   seekTo(target);
 });
 
+els.chartInterval.addEventListener('click', (event) => {
+  const tab = event.target.closest('[data-chart-mode]');
+  if (!tab) return;
+  setChartMode(tab.dataset.chartMode);
+});
+
+els.chartInterval.addEventListener('keydown', (event) => {
+  const tab = event.target.closest('[data-chart-mode]');
+  if (!tab) return;
+  const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+  if (!keys.includes(event.key)) return;
+  event.preventDefault();
+  const mode = event.key === 'ArrowLeft' || event.key === 'Home' ? 'minute' : 'daily';
+  setChartMode(mode);
+  (mode === 'daily' ? els.dailyTab : els.minuteTab).focus();
+});
+
 // 分足チャートは触られた瞬間から「ユーザーのもの」。以降、最古の足の近くまで
 // スクロールされたら古い足を取りにいく（触られるまでは取りにいかない）。
 ['wheel', 'pointerdown', 'touchstart'].forEach((type) => {
-  document.getElementById('minute-chart')
-    .addEventListener(type, () => minuteHistory.arm(minuteSessionIdentity(state.meta)), { passive: true });
+  els.minuteChart.addEventListener(
+    type,
+    () => minuteHistory.arm(minuteSessionIdentity(state.meta)),
+    { passive: true },
+  );
+  els.dailyChart.addEventListener(
+    type,
+    () => state.daily.armHistory(dailySessionIdentity(state.meta)),
+    { passive: true, capture: true },
+  );
 });
 minuteChart.timeScale().subscribeVisibleLogicalRangeChange(onMinuteLogicalRangeChange);
 
@@ -1716,6 +2227,9 @@ document.addEventListener('keydown', (event) => {
 buildBoardRows();
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(() => buildBoardRows()).observe(els.board);
+  new ResizeObserver(() => applyChartStageSize()).observe(els.chartStage);
+} else {
+  window.addEventListener('resize', applyChartStageSize);
 }
 updatePositionPanel();
 requestAnimationFrame(step);

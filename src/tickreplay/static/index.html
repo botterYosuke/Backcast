@@ -63,12 +63,33 @@
   <div class="layout-main">
 
     <section class="card chart-card minute-card">
-      <div class="card-head">
-        <h2>分足</h2>
-        <p class="card-note">形成中の足は歩み値の進行に合わせて伸縮します（陽線＝赤／陰線＝青）</p>
-        <button class="section-toggle" type="button" aria-expanded="true" title="分足の開閉">－</button>
+      <div class="card-head price-chart-head">
+        <h2>価格</h2>
+        <div id="chart-interval" class="chart-interval" role="tablist" aria-label="価格チャートの時間軸">
+          <button id="minute-tab" class="chart-interval-tab is-selected" type="button" role="tab"
+                  aria-selected="true" aria-controls="minute-chart" tabindex="0" data-chart-mode="minute">分足</button>
+          <button id="daily-tab" class="chart-interval-tab" type="button" role="tab"
+                  aria-selected="false" aria-controls="daily-chart" tabindex="-1" data-chart-mode="daily">日足</button>
+        </div>
+        <p class="card-note price-chart-note">選択中の時間軸は、再生・発注・板・歩み値に影響しません</p>
+        <div id="daily-legend" class="daily-legend" aria-label="日足の移動平均凡例" hidden>
+          <span><i class="legend-swatch sma25"></i>SMA25</span>
+          <span><i class="legend-swatch sma200"></i>SMA200</span>
+        </div>
+        <div id="daily-replay-liveness" class="daily-replay-liveness" hidden>
+          <span id="daily-replay-state"></span>
+          <time id="daily-replay-time">--:--:--</time>
+          <progress id="daily-replay-progress" max="100" value="0" aria-label="再生進捗"></progress>
+        </div>
+        <button class="section-toggle" type="button" aria-expanded="true" title="価格チャートの開閉">－</button>
       </div>
-      <div id="minute-chart" class="chart"></div>
+      <div id="daily-status" class="daily-status" role="status" aria-live="polite" hidden></div>
+      <div id="price-chart-stage" class="price-chart-stage">
+        <div id="minute-chart" class="chart chart-pane is-active" role="tabpanel"
+             aria-labelledby="minute-tab" aria-hidden="false"></div>
+        <div id="daily-chart" class="chart chart-pane" role="tabpanel"
+             aria-labelledby="daily-tab" aria-hidden="true"></div>
+      </div>
     </section>
 
     <div class="split">

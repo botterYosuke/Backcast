@@ -3,21 +3,33 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import threading
 import time
 
+import anyio
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from tickreplay import server
-from tickreplay.config import CACHE_DIR_ENV_VAR, CacheConfigError
+from tickreplay.config import (
+    CACHE_DIR_ENV_VAR,
+    LOCAL_AUTHORITATIVE_ENV_VAR,
+    CacheConfigError,
+)
 
 ROWS = [
     ("2026-08-14 09:00:00.100000", 100.0, 100, "1", "13010"),
     ("2026-08-17 09:00:00.000000", 102.0, 300, "1", "13010"),
     ("2026-08-17 09:00:30.500000", 103.0, 400, "2", "13010"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def isolate_local_authoritative_setting(monkeypatch):
+    """Server tests must not inherit a developer's ignored root ``.env``."""
+    monkeypatch.setenv(LOCAL_AUTHORITATIVE_ENV_VAR, "false")
 
 
 @pytest.fixture
@@ -302,6 +314,286 @@ def test_minute_context_degrades_to_an_empty_list_when_no_minute_file_exists(cli
     assert response.json() == {"bars": []}
 
 
+# -------------------------------------------------------- /api/daily-context
+
+
+def test_daily_context_returns_raw_strict_before_bars(client, daily_db_factory):
+    daily_db_factory(
+        "1301",
+        [
+            (
+                "13010",
+                "2026-08-14",
+                100.0,
+                102.0,
+                99.0,
+                101.0,
+                1000.0,
+                1100.0,
+                1102.0,
+                1099.0,
+                1101.0,
+                2000.0,
+            ),
+            (
+                "1301",
+                "2026-08-17",
+                900.0,
+                999.0,
+                800.0,
+                950.0,
+                9999.0,
+                1900.0,
+                1999.0,
+                1800.0,
+                1950.0,
+                10999.0,
+            ),
+        ],
+    )
+
+    response = client.get(
+        "/api/daily-context",
+        params={"stem": "1301", "date": "2026-08-17", "limit": 5},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": True,
+        "bars": [
+            {
+                "time": "2026-08-14",
+                "open": 100.0,
+                "high": 102.0,
+                "low": 99.0,
+                "close": 101.0,
+                "volume": 1000.0,
+            }
+        ],
+    }
+
+
+def test_daily_context_accepts_a_lowercase_letter_bearing_stem(
+    client, daily_db_factory
+):
+    daily_db_factory(
+        "285A",
+        [
+            (
+                "285A",
+                "2026-08-14",
+                10.0,
+                12.0,
+                9.0,
+                11.0,
+                100.0,
+                1010.0,
+                1012.0,
+                1009.0,
+                1011.0,
+                1100.0,
+            )
+        ],
+    )
+
+    response = client.get(
+        "/api/daily-context", params={"stem": "285a", "date": "2026-08-17"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+    assert response.json()["bars"][0]["close"] == 11.0
+
+
+def test_daily_context_distinguishes_valid_empty_from_unavailable(
+    client, daily_db_factory
+):
+    daily_db_factory(
+        "1301",
+        [
+            (
+                "1301",
+                "2026-08-17",
+                10.0,
+                12.0,
+                9.0,
+                11.0,
+                100.0,
+                1010.0,
+                1012.0,
+                1009.0,
+                1011.0,
+                1100.0,
+            )
+        ],
+    )
+
+    available = client.get(
+        "/api/daily-context", params={"stem": "1301", "date": "2026-08-17"}
+    )
+    unavailable = client.get(
+        "/api/daily-context", params={"stem": "9999", "date": "2026-08-17"}
+    )
+
+    assert available.json() == {"bars": [], "available": True}
+    assert unavailable.json() == {"bars": [], "available": False}
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"stem": "../A", "date": "2026-08-17"},
+        {"stem": "1301", "date": "17/08/2026"},
+        {"stem": "1301", "date": "2026-08-17", "limit": 0},
+        {"stem": "1301", "date": "2026-08-17", "limit": 501},
+    ],
+)
+def test_daily_context_malformed_input_remains_a_client_error(client, params):
+    response = client.get("/api/daily-context", params=params)
+
+    assert 400 <= response.status_code < 500
+
+
+def test_daily_context_blocking_io_uses_a_dedicated_bounded_limiter(
+    repository, monkeypatch
+):
+    active = 0
+    calls = 0
+    maximum_active = 0
+    state_lock = threading.Lock()
+    all_slots_started = threading.Event()
+    release = threading.Event()
+
+    def blocking_load(
+        *args: object, **kwargs: object
+    ) -> server.daily_context.DailyContextResult:
+        nonlocal active, calls, maximum_active
+        with state_lock:
+            active += 1
+            calls += 1
+            maximum_active = max(maximum_active, active)
+            if active == server.DAILY_CONTEXT_IO_CONCURRENCY:
+                all_slots_started.set()
+        release.wait(timeout=5)
+        with state_lock:
+            active -= 1
+        return server.daily_context.DailyContextResult(bars=(), available=True)
+
+    monkeypatch.setattr(server.daily_context, "load_daily_context", blocking_load)
+
+    async def exercise() -> None:
+        default_limiter = anyio.to_thread.current_default_thread_limiter()
+        original_tokens = default_limiter.total_tokens
+        default_limiter.total_tokens = 1
+
+        async def invoke() -> None:
+            await server._run_daily_context(
+                repository, stem="1301", before_date="2026-08-17", limit=5
+            )
+
+        try:
+            async with anyio.create_task_group() as task_group:
+                for _ in range(server.DAILY_CONTEXT_IO_CONCURRENCY + 1):
+                    task_group.start_soon(invoke)
+                assert await anyio.to_thread.run_sync(all_slots_started.wait, 5)
+                assert await anyio.to_thread.run_sync(lambda: "default-pool-free") == (
+                    "default-pool-free"
+                )
+                with state_lock:
+                    assert calls == server.DAILY_CONTEXT_IO_CONCURRENCY
+                    assert maximum_active == server.DAILY_CONTEXT_IO_CONCURRENCY
+                release.set()
+        finally:
+            release.set()
+            default_limiter.total_tokens = original_tokens
+
+    assert inspect.iscoroutinefunction(server.read_daily_context)
+    anyio.run(exercise)
+
+
+def test_daily_context_limiter_waiters_coalesce_one_origin_miss_then_retry(
+    cache_dir, monkeypatch
+):
+    server.daily_context.reset_for_tests()
+    burst_size = server.DAILY_CONTEXT_IO_CONCURRENCY * 2
+    arrival_count = 0
+    origin_gets = 0
+    state_lock = threading.Lock()
+    all_arrivals_captured = threading.Event()
+    real_capture = server.daily_context.capture_request_started_at
+
+    def capture_arrival() -> float:
+        nonlocal arrival_count
+        captured = real_capture()
+        with state_lock:
+            arrival_count += 1
+            if arrival_count == burst_size:
+                all_arrivals_captured.set()
+        return captured
+
+    def missing(request: httpx.Request) -> httpx.Response:
+        nonlocal origin_gets
+        assert request.url.path == "/jp/stocks_daily/0000.duckdb"
+        with state_lock:
+            origin_gets += 1
+            current_get = origin_gets
+        if current_get == 1:
+            assert all_arrivals_captured.wait(timeout=5)
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        server.daily_context, "capture_request_started_at", capture_arrival
+    )
+    remote_client = httpx.Client(
+        transport=httpx.MockTransport(missing), base_url="http://remote"
+    )
+    repository = server.TickRepository(
+        cache_dir=cache_dir,
+        server_url="http://remote",
+        http_client=remote_client,
+    )
+
+    async def exercise() -> None:
+        results: list[server.daily_context.DailyContextResult] = []
+
+        async def invoke() -> None:
+            results.append(
+                await server._run_daily_context(
+                    repository,
+                    stem="0000",
+                    before_date="2026-08-17",
+                    limit=5,
+                )
+            )
+
+        async with anyio.create_task_group() as task_group:
+            for _ in range(burst_size):
+                task_group.start_soon(invoke)
+
+        assert (
+            results
+            == [server.daily_context.DailyContextResult(bars=(), available=False)]
+            * burst_size
+        )
+        assert origin_gets == 1
+
+        assert (
+            await server._run_daily_context(
+                repository,
+                stem="0000",
+                before_date="2026-08-17",
+                limit=5,
+            )
+        ).available is False
+        assert origin_gets == 2
+
+    try:
+        anyio.run(exercise)
+    finally:
+        repository.close()
+        remote_client.close()
+
+
 def test_index_and_static_assets_are_served(client):
     index = client.get("/")
     assert index.status_code == 200
@@ -314,7 +606,7 @@ def test_index_and_static_assets_are_served(client):
 
 @pytest.mark.parametrize(
     "asset",
-    ["request-coordinator.mjs", "board-ladder.mjs"],
+    ["request-coordinator.mjs", "board-ladder.mjs", "daily-chart.mjs"],
 )
 def test_mjs_static_assets_are_served_with_a_javascript_content_type(client, asset):
     """Regression test: Python's ``mimetypes`` derives its table from the OS

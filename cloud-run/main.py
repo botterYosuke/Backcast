@@ -120,6 +120,11 @@ def list_stocks_trades() -> JSONResponse:
 
 # Whitelist: only allow known file patterns.
 #
+# `stocks_daily` is narrower than the legacy dataset routes: only per-symbol
+# 4-5 character ASCII alphanumeric stems plus the exact historical
+# `mother.duckdb` aggregate are public. Explicit ASCII classes avoid `\w`'s
+# Unicode and underscore expansion while retaining letter-bearing stems.
+#
 # `stocks_minute` uses the same `\w+` stem pattern as `stocks_trades`, not a
 # digits-only one: a stem is a 4-5 character code that may contain letters
 # (`285A`, `130A`, ... — 343 of the 4630 stems this server currently lists),
@@ -131,7 +136,7 @@ def list_stocks_trades() -> JSONResponse:
 # directly and no HTTP request is involved) — including the UI's default
 # symbol, `285A`.
 ALLOWED_PATHS = re.compile(
-    r"^jp/(stocks_daily/(?:\d+|mother)\.duckdb|stocks_board/\d+\.duckdb|stocks_trades/\w+\.duckdb|stocks_minute/\w+\.duckdb|listed_info\.duckdb)$"
+    r"^jp/(stocks_daily/(?:[0-9A-Za-z]{4,5}|mother)\.duckdb|stocks_board/\d+\.duckdb|stocks_trades/\w+\.duckdb|stocks_minute/\w+\.duckdb|listed_info\.duckdb)$"
 )
 
 # A single, well-formed, in-bounds `bytes=` range (RFC 7233), case-

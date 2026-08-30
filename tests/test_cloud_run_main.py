@@ -89,11 +89,19 @@ def sample_files(data_dir):
     # (Only one case of the stem is created — on a case-insensitive host
     # filesystem the two names would be the same file.)
     (minute_dir / "130a.duckdb").write_bytes(b"minute-data-130a")
+    daily_dir = data_dir / "jp" / "stocks_daily"
+    daily_dir.mkdir()
+    (daily_dir / "7203.duckdb").write_bytes(b"daily-data")
+    (daily_dir / "285A.duckdb").write_bytes(b"daily-data-285A")
+    (daily_dir / "1234A.duckdb").write_bytes(b"daily-data-1234A")
+    (daily_dir / "130a.duckdb").write_bytes(b"daily-data-130a")
+    (daily_dir / "mother.duckdb").write_bytes(b"daily-mother")
     return {
         "dir": trades_dir,
         "target": target,
         "board_target": board_target,
         "minute_dir": minute_dir,
+        "daily_dir": daily_dir,
     }
 
 
@@ -247,6 +255,52 @@ def test_download_resolves_a_stem_stored_under_the_other_case(client, sample_fil
 
     assert response.status_code == 200
     assert response.content == b"minute-data-130a"
+
+
+@pytest.mark.parametrize(
+    ("stem", "content"),
+    [
+        ("7203", b"daily-data"),
+        ("285A", b"daily-data-285A"),
+        ("1234A", b"daily-data-1234A"),
+        ("mother", b"daily-mother"),
+    ],
+)
+def test_download_stocks_daily_allowed_names(client, sample_files, stem, content):
+    response = client.get(f"/jp/stocks_daily/{stem}.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == content
+
+
+def test_download_stocks_daily_resolves_case_variant(client, sample_files):
+    response = client.get("/jp/stocks_daily/130A.duckdb")
+
+    assert response.status_code == 200
+    assert response.content == b"daily-data-130a"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/jp/stocks_daily/123.duckdb",
+        "/jp/stocks_daily/123456.duckdb",
+        "/jp/stocks_daily/28_A.duckdb",
+        "/jp/stocks_daily/MOTHER.duckdb",
+        "/jp/stocks_daily/7203.duckdb.extra",
+        "/jp/stocks_daily/7203%2Fextra.duckdb",
+        "/jp/stocks_daily/7203%5Cextra.duckdb",
+        "/jp/stocks_daily/%2e%2e%2Fstocks_trades%2F7203.duckdb",
+    ],
+)
+def test_download_stocks_daily_rejects_unsafe_or_out_of_contract_names(
+    client, sample_files, path
+):
+    assert client.get(path).status_code == 404
+
+
+def test_download_absent_valid_stocks_daily_file_is_404(client, sample_files):
+    assert client.get("/jp/stocks_daily/9999.duckdb").status_code == 404
 
 
 def test_stem_case_variants_tries_both_cases_of_a_letter_bearing_stem(
@@ -574,6 +628,9 @@ def test_dockerfile_pins_a_single_asgi_worker():
 def isolated_cache_env(monkeypatch):
     """Pin the tickreplay cache vars so this repo's own ``.env`` (loaded by
     ``load_dotenv()`` at main.py import) cannot decide the outcome."""
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda: False)
 
     def apply(cache_dir, server_url):
         monkeypatch.setenv("BACKCAST_DUCKDB_CACHE_DIR", str(cache_dir))

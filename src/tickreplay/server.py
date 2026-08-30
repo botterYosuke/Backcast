@@ -28,14 +28,16 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import date as Date
+from functools import partial
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import cache, cache_commit, minute_context
+from . import cache, cache_commit, daily_context, minute_context
 from .config import build_http_client, resolve_cache_config
 from .repository import (
     SymbolAvailabilityUnknownError,
@@ -45,6 +47,8 @@ from .repository import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+DAILY_CONTEXT_IO_CONCURRENCY = 4
+_DAILY_CONTEXT_LIMITER = anyio.CapacityLimiter(DAILY_CONTEXT_IO_CONCURRENCY)
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +270,7 @@ def reset_for_tests() -> None:
         to_close = _repository
         _repository = None
         _tracker = OperationTracker()
+        daily_context.reset_for_tests()
     if to_close is not None:
         try:
             to_close.close()
@@ -490,6 +495,51 @@ def read_minute_context(
         limit=limit,
     )
     return {"bars": [bar.as_dict() for bar in bars]}
+
+
+async def _run_daily_context(
+    repository: TickRepository,
+    *,
+    stem: str,
+    before_date: str,
+    limit: int,
+) -> daily_context.DailyContextResult:
+    request_started_at = daily_context.capture_request_started_at()
+    load = partial(
+        daily_context.load_daily_context,
+        repository.cache_dir,
+        repository.http_client,
+        stem=stem,
+        before_date=before_date,
+        limit=limit,
+        local_authoritative=repository.local_authoritative,
+        request_started_at=request_started_at,
+    )
+    return await anyio.to_thread.run_sync(load, limiter=_DAILY_CONTEXT_LIMITER)
+
+
+@app.get("/api/daily-context")
+async def read_daily_context(
+    stem: str = Query(..., description="daily file stem (for example 7203 or 285A)"),
+    date: str = Query(..., description="strict exclusive cutoff YYYY-MM-DD"),
+    limit: int = Query(default=500, ge=1, le=daily_context.MAX_BARS),
+) -> dict[str, object]:
+    """Best-effort completed daily bars strictly before ``date``.
+
+    Availability failures stay an HTTP-200 supplementary-data outcome. Input
+    errors remain client errors and are never disguised as unavailability.
+    """
+    repository = get_repository()
+    try:
+        result = await _run_daily_context(
+            repository,
+            stem=stem.upper(),
+            before_date=date,
+            limit=limit,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return result.as_dict()
 
 
 @app.get("/")

@@ -57,6 +57,26 @@ CREATE TABLE stocks_minute (
 )
 """
 
+# Shape verified against the columns consumed by the existing Cloud Run
+# ``stocks_daily`` ranking query. Adjustment values are deliberately present
+# so the TickReplay loader can prove it reads only the raw OHLCV columns.
+CREATE_DAILY = """
+CREATE TABLE stocks_daily (
+    Code VARCHAR,
+    Date VARCHAR,
+    Open DOUBLE,
+    High DOUBLE,
+    Low DOUBLE,
+    Close DOUBLE,
+    Volume DOUBLE,
+    AdjustmentOpen DOUBLE,
+    AdjustmentHigh DOUBLE,
+    AdjustmentLow DOUBLE,
+    AdjustmentClose DOUBLE,
+    AdjustmentVolume DOUBLE
+)
+"""
+
 
 @pytest.fixture
 def cache_dir(tmp_path: Path) -> Path:
@@ -163,7 +183,47 @@ def minute_db_factory(minute_remote_store: dict[str, bytes], tmp_path: Path):
     return make
 
 
-def _mock_handler(remote_store: dict[str, bytes], minute_store: dict[str, bytes]):
+@pytest.fixture
+def daily_remote_store() -> dict[str, bytes]:
+    """In-memory per-stem ``jp/stocks_daily`` file server."""
+    return {}
+
+
+@pytest.fixture
+def daily_db_factory(daily_remote_store: dict[str, bytes], tmp_path: Path):
+    """Build and register a per-stem ``stocks_daily`` DuckDB file.
+
+    Rows contain ``(code, date, raw O/H/L/C/V, adjusted O/H/L/C/V)``.
+    ``Date`` is stored as text to exercise the runtime's defensive date cast.
+    """
+    import duckdb
+
+    call_counter = {"n": 0}
+
+    def make(stem: str, rows: list[tuple]) -> bytes:
+        call_counter["n"] += 1
+        path = tmp_path / f"_daily_source_{stem}_{call_counter['n']}.duckdb"
+        connection = duckdb.connect(str(path))
+        try:
+            connection.execute(CREATE_DAILY)
+            connection.executemany(
+                "INSERT INTO stocks_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        finally:
+            connection.close()
+        data = path.read_bytes()
+        daily_remote_store[stem] = data
+        return data
+
+    return make
+
+
+def _mock_handler(
+    remote_store: dict[str, bytes],
+    minute_store: dict[str, bytes],
+    daily_store: dict[str, bytes],
+):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/stocks-trades":
             return httpx.Response(200, json={"stems": sorted(remote_store)})
@@ -174,7 +234,24 @@ def _mock_handler(remote_store: dict[str, bytes], minute_store: dict[str, bytes]
             body = minute_store.get(stem)
             if body is None:
                 return httpx.Response(404)
-            return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
+            return httpx.Response(
+                200, headers={"Content-Length": str(len(body))}, content=body
+            )
+        if request.url.path.startswith("/jp/stocks_daily/"):
+            stem = request.url.path.rsplit("/", 1)[-1]
+            if stem.endswith(".duckdb"):
+                stem = stem[: -len(".duckdb")]
+            body = daily_store.get(stem)
+            if body is None:
+                return httpx.Response(404)
+            etag = f'"{hashlib.sha256(body).hexdigest()}"'
+            if request.headers.get("if-none-match") == etag:
+                return httpx.Response(304)
+            return httpx.Response(
+                200,
+                headers={"Content-Length": str(len(body)), "ETag": etag},
+                content=body,
+            )
         assert request.url.path.startswith("/jp/stocks_trades/")
         stem = request.url.path.rsplit("/", 1)[-1]
         if stem.endswith(".duckdb"):
@@ -194,12 +271,16 @@ def _mock_handler(remote_store: dict[str, bytes], minute_store: dict[str, bytes]
 
 @pytest.fixture
 def mock_transport(
-    remote_store: dict[str, bytes], minute_remote_store: dict[str, bytes]
+    remote_store: dict[str, bytes],
+    minute_remote_store: dict[str, bytes],
+    daily_remote_store: dict[str, bytes],
 ) -> httpx.MockTransport:
     """Serves `/api/stocks-trades`, `/jp/stocks_trades/<stem>.duckdb` (with
-    real conditional-GET semantics), and `/jp/stocks_minute/<stem>.duckdb`
-    straight out of `remote_store`/`minute_remote_store`."""
-    return httpx.MockTransport(_mock_handler(remote_store, minute_remote_store))
+    real conditional-GET semantics), plus the per-stem minute/daily files,
+    straight out of the matching in-memory stores."""
+    return httpx.MockTransport(
+        _mock_handler(remote_store, minute_remote_store, daily_remote_store)
+    )
 
 
 @pytest.fixture

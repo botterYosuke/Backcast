@@ -18,6 +18,8 @@
   --flat: #9a9489;
 
   --accent: #2e2a24;
+  --sma25: #d97706;
+  --sma200: #7c3aed;
   --radius: 8px;
 
   --serif: "Yu Mincho", YuMincho, "Hiragino Mincho ProN", "Noto Serif JP", "MS Mincho", serif;
@@ -201,6 +203,114 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 
 
 .chart { flex: 1; min-height: 0; }
+
+.price-chart-head { align-items: center; }
+
+.price-chart-note { flex: 1; }
+
+.chart-interval {
+  display: inline-flex;
+  flex: none;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.chart-interval-tab {
+  min-width: 54px;
+  padding: 4px 11px;
+  border: 0;
+  border-radius: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.chart-interval-tab + .chart-interval-tab { border-left: 1px solid var(--line-strong); }
+
+.chart-interval-tab.is-selected,
+.chart-interval-tab[aria-selected="true"] {
+  background: var(--accent);
+  color: #fff;
+}
+
+.chart-interval-tab:focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.daily-legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.daily-legend[hidden] { display: none; }
+.daily-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+
+.daily-replay-liveness {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.daily-replay-liveness[hidden] { display: none; }
+.daily-replay-liveness #daily-replay-state { color: var(--accent); font-weight: 600; }
+.daily-replay-liveness progress { width: 68px; height: 6px; accent-color: var(--accent); }
+
+.legend-swatch {
+  display: inline-block;
+  width: 18px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.legend-swatch.sma25 { background: var(--sma25); }
+.legend-swatch.sma200 { background: var(--sma200); }
+
+.daily-status {
+  min-height: 25px;
+  padding: 3px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sunken);
+  color: var(--ink-muted);
+  font-size: 11px;
+}
+
+.daily-status[hidden] { display: none; }
+.daily-status[data-tone="error"] { color: #8c3324; }
+
+.price-chart-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chart-pane {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.chart-pane.is-active {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
 
 .minute-card { flex: 1.5; }
 
@@ -772,7 +882,14 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .tick-card,
   .tape-card { flex: none; width: auto; min-height: 0; }
 
-  .chart { flex: none; height: 220px; }
+  .price-chart-head { align-items: center; }
+  .price-chart-note { order: 3; flex-basis: 100%; }
+  .daily-legend { order: 4; width: 100%; flex-wrap: wrap; }
+  .daily-replay-liveness { order: 5; width: 100%; }
+  .chart-interval-tab { min-width: 58px; min-height: 44px; }
+  .price-chart-stage { flex: none; height: 220px; }
+  .chart-pane { height: 100%; }
+  .tick-card > .chart { flex: none; height: 220px; }
 
   .split { flex-direction: column; gap: 14px; }
 
