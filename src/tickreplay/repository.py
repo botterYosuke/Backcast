@@ -74,6 +74,25 @@ MAX_SESSION_PROBE_STEPS = 20
 
 LISTING_CACHE_FILENAME = "_listing.json"
 
+# A J-Quants listed-company snapshot (``Date, Code, CompanyName, ...``),
+# unrelated to which stems actually have a ``stocks_trades`` tick file. Not
+# refreshed on any regular schedule (confirmed stale for months at a time,
+# not a live daily feed) — ``MAX(Date)`` is simply "whatever the newest
+# snapshot happens to be", not "today's listing". When present at the root
+# of ``cache_dir`` (the common case under
+# ``BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE``, where cache_dir *is* the served
+# ``jp`` tree), a single local query replaces the live ``/api/stocks-trades``
+# round trip for the datalist-search endpoint only — see
+# ``_listed_info_stems``. Existence confirmation before actually loading a
+# symbol (`_confirm_stem_known`/`path_for`) still goes through
+# ``_resolve_listing`` exclusively, since a code here is not proof its tick
+# file exists.
+LISTED_INFO_FILENAME = "listed_info.duckdb"
+_LISTED_INFO_CODES_SELECT = (
+    "SELECT DISTINCT Code FROM listed_info "
+    "WHERE Date = (SELECT MAX(Date) FROM listed_info)"
+)
+
 _METADATA_SELECT = (
     f"SELECT Code, from_timestamp, to_timestamp, record_count "
     f"FROM {METADATA_TABLE} ORDER BY record_count DESC"
@@ -357,11 +376,36 @@ class TickRepository:
     # -- listing / existence (Step 6: server listing, not local glob) ----
 
     def list_symbol_stems(self) -> list[str]:
-        """Return the known symbol stems: live if the server answered,
-        degrading to a last-persisted listing or the local cache dir's own
-        contents otherwise (never raises)."""
-        stems, _was_live = self._resolve_listing()
+        """Return the known symbol stems for the datalist-search endpoint.
+
+        Prefers a local, network-free read of ``listed_info.duckdb`` (see
+        `_listed_info_stems`) when that file is present; otherwise falls
+        back to the live-server/persisted/local-glob chain exactly as
+        before (never raises).
+        """
+        stems = self._listed_info_stems()
+        if stems is None:
+            stems, _was_live = self._resolve_listing()
         return sorted(stem for stem in stems if SYMBOL_STEM_RE.fullmatch(stem))
+
+    def _listed_info_stems(self) -> set[str] | None:
+        """Query ``<cache_dir>/listed_info.duckdb`` for the latest snapshot's
+        codes, or ``None`` if the file is absent or fails to open/query —
+        callers must then fall back to `_resolve_listing`.
+
+        Advisory only: a code returned here is not proof a `stocks_trades`
+        tick file exists for it, so this is never used for existence
+        confirmation (`_confirm_stem_known`/`path_for`), only for the
+        candidate list an autocomplete search offers.
+        """
+        path = self.cache_dir / LISTED_INFO_FILENAME
+        if not path.is_file():
+            return None
+        try:
+            rows = self._pool.query(path, _LISTED_INFO_CODES_SELECT)
+        except duckdb.Error:
+            return None
+        return {str(row[0]) for row in rows}
 
     def _resolve_listing(self) -> tuple[set[str], bool]:
         live = self._fetch_live_listing()

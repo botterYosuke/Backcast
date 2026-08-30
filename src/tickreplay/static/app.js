@@ -86,6 +86,8 @@ const MAX_TICK_POINTS_AFTER_SEEK = 20000;
 const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロードする直前の分足の本数
 const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
+const SYMBOL_SEARCH_DEBOUNCE_MS = 200; // 銘柄候補検索: この間隔だけ入力が止まってからサーバーへ問い合わせる
+
 const BOARD_MIN_ROWS = 41;        // 板の行数（奇数・表示領域に応じて拡張）
 const BOARD_ROW_HEIGHT = 20;
 const BOARD_OVERSCAN_ROWS = 12;
@@ -2085,9 +2087,16 @@ els.symbolInput.addEventListener('change', async () => {
   }
 });
 
+let symbolSearchDebounceTimer = null;
+
 els.symbolInput.addEventListener('input', () => {
+  if (symbolSearchDebounceTimer) clearTimeout(symbolSearchDebounceTimer);
   const prefix = els.symbolInput.value.trim().toUpperCase();
-  if (prefix.length >= 1 && prefix.length <= 3) loadSymbols(prefix).catch(() => {});
+  if (prefix.length < 1 || prefix.length > 3) return;
+  symbolSearchDebounceTimer = setTimeout(() => {
+    symbolSearchDebounceTimer = null;
+    loadSymbols(prefix).catch(() => {});
+  }, SYMBOL_SEARCH_DEBOUNCE_MS);
 });
 
 els.prevDay.addEventListener('click', () => {
