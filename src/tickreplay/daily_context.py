@@ -247,6 +247,21 @@ def _live_path(cache_dir: Path, stem: str) -> Path:
     return _dataset_dir(cache_dir) / f"{stem}.duckdb"
 
 
+def _authoritative_live_candidates(cache_dir: Path, stem: str) -> tuple[Path, ...]:
+    """Exact-first local Daily paths for a case-preserving data tree."""
+    directory = _dataset_dir(cache_dir)
+    candidates: list[Path] = []
+    seen_names: set[str] = set()
+    for variant in (stem, stem.lower(), stem.upper()):
+        name = f"{variant}.duckdb"
+        # Windows Path equality folds case, so deduplicate filename strings.
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        candidates.append(directory / name)
+    return tuple(candidates)
+
+
 def _part_path(cache_dir: Path, stem: str) -> Path:
     return _dataset_dir(cache_dir) / f"{stem}.duckdb.part"
 
@@ -430,11 +445,17 @@ def _ensure_ready_locked(
     request_started_at: float,
 ) -> Path | None:
     key = _cache_key(cache_dir, stem)
+    if local_authoritative:
+        for candidate in _authoritative_live_candidates(cache_dir, stem):
+            if not candidate.is_file():
+                continue
+            usable = 0 < candidate.stat().st_size <= MAX_DAILY_FILE_BYTES
+            return candidate if usable else None
+        return None
+
     path = _live_path(cache_dir, stem)
     existing = path.is_file()
     usable = existing and 0 < path.stat().st_size <= MAX_DAILY_FILE_BYTES
-    if local_authoritative:
-        return path if usable else None
     if _negative_active(key, request_started_at):
         return None
     if usable and _was_revalidated(key):

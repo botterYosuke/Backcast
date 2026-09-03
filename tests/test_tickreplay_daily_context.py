@@ -54,6 +54,24 @@ def wrong_schema_database(tmp_path: Path, name: str) -> bytes:
     return path.read_bytes()
 
 
+def install_case_sensitive_daily_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dir: Path,
+    *,
+    existing_names: set[str],
+) -> None:
+    """Make daily-file existence depend on the exact filename string."""
+    dataset_dir = cache_dir / "stocks_daily"
+    real_is_file = Path.is_file
+
+    def case_sensitive_is_file(path: Path) -> bool:
+        if path.parent == dataset_dir and path.suffix == ".duckdb":
+            return path.name in existing_names
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", case_sensitive_is_file)
+
+
 @pytest.mark.parametrize(
     ("stem", "before_date", "limit"),
     [
@@ -262,9 +280,7 @@ def test_adjacent_strict_before_pages_are_disjoint_and_end_with_available_empty(
     assert len(newest_dates) == len(older_dates) == 3
     assert set(newest_dates).isdisjoint(older_dates)
     assert max(older_dates) < min(newest_dates)
-    assert exhausted_page == daily_context.DailyContextResult(
-        bars=(), available=True
-    )
+    assert exhausted_page == daily_context.DailyContextResult(bars=(), available=True)
 
 
 def test_executed_sql_is_bounded_raw_only_and_has_no_code_filter(
@@ -444,6 +460,190 @@ def test_authoritative_cache_never_revalidates_existing_local_file(
 
     assert result.available is True
     assert result.bars[0].close == 11
+
+
+@pytest.mark.parametrize(
+    ("stem", "expected_names"),
+    [
+        ("285A", ["285A.duckdb", "285a.duckdb"]),
+        ("285a", ["285a.duckdb", "285A.duckdb"]),
+        ("7203", ["7203.duckdb"]),
+    ],
+)
+def test_authoritative_daily_case_candidates_preserve_parent_suffix_and_order(
+    tmp_path: Path,
+    stem: str,
+    expected_names: list[str],
+):
+    candidates = daily_context._authoritative_live_candidates(tmp_path, stem)
+
+    assert [candidate.name for candidate in candidates] == expected_names
+    assert all(
+        candidate.parent == tmp_path / "stocks_daily" for candidate in candidates
+    )
+    assert all(candidate.suffix == ".duckdb" for candidate in candidates)
+
+
+def test_authoritative_uppercase_request_reads_lowercase_only_file_without_http(
+    cache_dir: Path,
+    daily_db_factory,
+    monkeypatch,
+):
+    body = daily_db_factory(
+        "285A", [daily_row("285A", "2024-01-02", 10, 12, 9, 11, 100)]
+    )
+    lowercase_path = cache_dir / "stocks_daily" / "285a.duckdb"
+    lowercase_path.parent.mkdir()
+    lowercase_path.write_bytes(body)
+    install_case_sensitive_daily_lookup(
+        monkeypatch, cache_dir, existing_names={"285a.duckdb"}
+    )
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("authoritative daily cache must not fetch")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(unexpected_request), base_url="http://loopback"
+    ) as client:
+        result = load(cache_dir, client, local_authoritative=True)
+
+    assert result.available is True
+    assert result.bars[0].close == 11
+
+
+def test_authoritative_corrupt_exact_file_is_not_masked_by_lowercase_variant(
+    cache_dir: Path,
+    daily_db_factory,
+    monkeypatch,
+):
+    body = daily_db_factory(
+        "285A", [daily_row("285A", "2024-01-02", 20, 22, 19, 21, 200)]
+    )
+    lowercase_path = cache_dir / "stocks_daily" / "285a.duckdb"
+    lowercase_path.parent.mkdir()
+    lowercase_path.write_bytes(body)
+    install_case_sensitive_daily_lookup(
+        monkeypatch,
+        cache_dir,
+        existing_names={"285A.duckdb", "285a.duckdb"},
+    )
+    queried_names: list[str] = []
+
+    def reject_exact(path: Path, before_date: str, limit: int):
+        queried_names.append(path.name)
+        if path.name == "285A.duckdb":
+            raise duckdb.IOException("corrupt exact daily file")
+        return (
+            daily_context.DailyBar(
+                time="2024-01-02",
+                open=20,
+                high=22,
+                low=19,
+                close=21,
+                volume=200,
+            ),
+        )
+
+    monkeypatch.setattr(daily_context, "_query_bars", reject_exact)
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("authoritative daily cache must not fetch")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(unexpected_request), base_url="http://loopback"
+    ) as client:
+        result = load(cache_dir, client, local_authoritative=True)
+
+    assert result == daily_context.DailyContextResult(bars=(), available=False)
+    assert queried_names == ["285A.duckdb"]
+
+
+def test_authoritative_lowercase_candidate_still_enforces_size_limit(
+    cache_dir: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(daily_context, "MAX_DAILY_FILE_BYTES", 8)
+    lowercase_path = cache_dir / "stocks_daily" / "285a.duckdb"
+    lowercase_path.parent.mkdir()
+    lowercase_path.write_bytes(b"123456789")
+    install_case_sensitive_daily_lookup(
+        monkeypatch, cache_dir, existing_names={"285a.duckdb"}
+    )
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("authoritative daily cache must not fetch")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(unexpected_request), base_url="http://loopback"
+    ) as client:
+        result = load(cache_dir, client, local_authoritative=True)
+
+    assert result == daily_context.DailyContextResult(bars=(), available=False)
+
+
+def test_authoritative_lowercase_candidate_still_enforces_schema_validation(
+    cache_dir: Path,
+    tmp_path: Path,
+    monkeypatch,
+):
+    lowercase_path = cache_dir / "stocks_daily" / "285a.duckdb"
+    lowercase_path.parent.mkdir()
+    lowercase_path.write_bytes(wrong_schema_database(tmp_path, "wrong-lower.duckdb"))
+    install_case_sensitive_daily_lookup(
+        monkeypatch, cache_dir, existing_names={"285a.duckdb"}
+    )
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("authoritative daily cache must not fetch")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(unexpected_request), base_url="http://loopback"
+    ) as client:
+        result = load(cache_dir, client, local_authoritative=True)
+
+    assert result == daily_context.DailyContextResult(bars=(), available=False)
+
+
+def test_non_authoritative_refresh_keeps_uppercase_paths(
+    cache_dir: Path,
+    daily_db_factory,
+    monkeypatch,
+):
+    body = daily_db_factory(
+        "285A", [daily_row("285A", "2024-01-02", 30, 32, 29, 31, 300)]
+    )
+    request_paths: list[str] = []
+
+    def authoritative_candidates_must_not_run(cache_root: Path, stem: str):
+        raise AssertionError("remote cache must retain canonical path handling")
+
+    monkeypatch.setattr(
+        daily_context,
+        "_authoritative_live_candidates",
+        authoritative_candidates_must_not_run,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            headers={"Content-Length": str(len(body)), "ETag": '"daily"'},
+            content=body,
+        )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://remote"
+    ) as client:
+        result = load(cache_dir, client)
+
+    assert result.available is True
+    assert result.bars[0].close == 31
+    assert request_paths == ["/jp/stocks_daily/285A.duckdb"]
+    assert daily_context._live_path(cache_dir, "285A").name == "285A.duckdb"
+    assert daily_context._part_path(cache_dir, "285A").name == "285A.duckdb.part"
+    assert daily_context._sidecar_path(cache_dir, "285A").name == (
+        "285A.duckdb.sidecar.json"
+    )
 
 
 def test_authoritative_oversize_local_file_is_unavailable_without_fetch(
