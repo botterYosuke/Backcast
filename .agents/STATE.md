@@ -262,3 +262,33 @@ Rolling progress summary (latest 5 checkpoints): [PROGRESS.md](../PROGRESS.md)
 
 - Static JavaScript: 135/135 passed. Python integration subset: 133 passed, 1 skipped. Ruff and syntax checks passed.
 - Fresh Chrome CDP verification passed exact 90+5 initialization, drag- and wheel-triggered 200-bar paging with exact +N range shifts, inactive completion and Daily return, SMA continuity, Tick/Tape/board/order/position continuity, and zero runtime exceptions.
+
+---
+
+## Current Bug Fix: stock-daily-285a-case-mismatch
+<!-- orchestra:block-id: stock-daily-285a-case-mismatch -->
+
+### Context
+
+- Error: An uppercase logical Daily stem such as 285A becomes unavailable on a case-sensitive authoritative cache when the physical file is lowercase, such as stocks_daily/285a.duckdb.
+- Root cause: daily_context maps the uppercase logical identifier to one exact physical basename and the local_authoritative branch returns unavailable before any case-equivalent local resolution.
+- Affected files: src/tickreplay/daily_context.py and focused Daily/server tests; remote cloud-run case fallback already works.
+- Current scope: 293 lowercase Daily files are potentially affected and 195 are currently reachable through normal uppercase Trades sessions.
+
+### Fix Approach
+
+- Add an exact-first, bounded same-directory case-variant resolver used only for local_authoritative Daily reads. Preserve no-HTTP behavior and leave canonical remote live/part/sidecar/commit paths unchanged.
+- Do not rename the authoritative dataset; retain exact-file precedence and existing size/schema validation.
+
+### Regression Risks
+
+- Generalizing _live_path could split lowercase reads from uppercase remote writes/sidecars or query stale data after refresh.
+- Windows Path equality folds case; tests must assert filename strings and inject case-sensitive existence semantics.
+- Minute and Trades have adjacent case issues but are separate contracts and must not be folded into this Daily patch.
+- Real Linux/container verification remains pending because Docker Desktop Linux Engine was unavailable.
+
+### Decisions
+
+- Treat local_authoritative no-HTTP behavior as intentional; the defect is physical-name resolution.
+- Prefer bounded local read fallback over bulk filename canonicalization due collision, rename, synchronization, and compatibility risk.
+- Codex CLI consultations were unusable/timeouts and provide no validation evidence; the conclusion rests on the captured repro, 134 passing related tests, git history, inventory, and two independent analyses.
