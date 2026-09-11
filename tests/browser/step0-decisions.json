@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-09-10",
+  "scope": {
+    "execution": "trusted-current-user code on the existing same origin",
+    "security_claim": "host snapshots are past-only; the Worker is not an adversarial sandbox and does not prevent same-origin Web API access",
+    "embedded_webviews": false,
+    "iframe_and_opener_compatibility": "required for existing non-spike behavior; production COOP/COEP stays disabled unless the isolated spike and rollout compatibility matrix pass"
+  },
+  "minimum_product_browsers": {
+    "desktop": [
+      "Chromium 120",
+      "Firefox 121",
+      "Safari 17.4"
+    ],
+    "mobile": [
+      "iOS/iPadOS Safari 17.4",
+      "Android Chrome 120"
+    ]
+  },
+  "automation_matrix": {
+    "chromium": "153.0.8010.12 (Playwright revision 1243)",
+    "firefox": "155.0 (Playwright revision 1543)",
+    "webkit": "26.6 (Playwright revision 2359)",
+    "mobile_emulation": [
+      "Pixel 7 / Chromium 153.0.8010.12",
+      "iPhone 14 / WebKit 26.6"
+    ],
+    "real_device_release_gate": [
+      "Safari 18.6 on macOS 13.7.8 with VoiceOver",
+      "iOS/iPadOS Safari 17.4 or newer with VoiceOver",
+      "Android Chrome 120 or newer with TalkBack"
+    ]
+  },
+  "runtime": {
+    "pyodide": "0.27.6",
+    "python": "3.12.7",
+    "workers": 1,
+    "packages": "standard-library-only",
+    "soft_interrupt": "optional when crossOriginIsolated is true",
+    "fallback": "invalidate identity and Worker.terminate; no soft-stop claim without isolation"
+  },
+  "source_limits": {
+    "canonicalization": "normalize CRLF and CR to LF; encode UTF-8; preserve Unicode code points without normalization",
+    "utf8_bytes_max": 262144,
+    "unicode_scalars_max": 262144,
+    "lines_max": 8192,
+    "longest_line_scalars_max": 4096,
+    "boundary_fixture": "tests/fixtures/strategy-max-source.py",
+    "boundary_fixture_sha256": "0568b94934fa6e2831b41e66ec7595e90f237e9b0a1fc5f3ca71e1fec0076896"
+  },
+  "protocol_shape": {
+    "price_representation": "integer logical tick levels",
+    "string_utf8_bytes_max": 128,
+    "open_orders_max": 256,
+    "fills_per_event_max": 256,
+    "event_encoded_bytes_max": 262144,
+    "response_encoded_bytes_max": 65536,
+    "account_fields": [
+      "cash_minor",
+      "position_quantity",
+      "average_price_level",
+      "realized_pnl_minor",
+      "unrealized_pnl_minor",
+      "equity_minor"
+    ],
+    "open_order_fields": [
+      "order_id",
+      "owner",
+      "side",
+      "quantity_remaining",
+      "limit_price_level",
+      "eligible_from_session_tick"
+    ],
+    "fill_fields": [
+      "fill_delivery_sequence",
+      "order_id",
+      "side",
+      "quantity",
+      "price_level",
+      "session_tick_index",
+      "replay_time_us"
+    ],
+    "redacted": [
+      "future ticks",
+      "full session arrays",
+      "DOM and callbacks",
+      "storage values",
+      "secrets"
+    ]
+  },
+  "editor_budgets": {
+    "bundle_raw_bytes_max": 512000,
+    "bundle_deterministic_gzip_bytes_max": 153600,
+    "desktop_first_open_ms_max": 350,
+    "mobile_emulation_first_open_ms_max": 800,
+    "desktop_input_latency_p95_ms_max": 32,
+    "mobile_emulation_input_latency_p95_ms_max": 64,
+    "desktop_search_ms_max": 100,
+    "mobile_emulation_search_ms_max": 250,
+    "desktop_diagnostics_ms_max": 100,
+    "mobile_emulation_diagnostics_ms_max": 250,
+    "long_task_threshold_ms": 50,
+    "worker_cpu_long_tasks_max": 0
+  },
+  "pyodide_budgets": {
+    "desktop_cold_start_ms_max": 8000,
+    "mobile_emulation_cold_start_ms_max": 15000,
+    "desktop_warm_callback_p95_ms_max": 10,
+    "mobile_emulation_warm_callback_p95_ms_max": 30,
+    "desktop_sustained_events_per_second_min": 100,
+    "mobile_emulation_sustained_events_per_second_min": 30,
+    "clone_conversion_p95_ms_max": 10,
+    "host_heap_growth_bytes_max_over_10000_events": 33554432,
+    "cooperative_interrupt_grace_ms_max": 250,
+    "hard_termination_ms_max": 500,
+    "desktop_fresh_worker_restart_ms_max": 10000,
+    "mobile_emulation_fresh_worker_restart_ms_max": 18000
+  },
+  "toolchain": {
+    "node": "24.15.0",
+    "npm": "12.0.1",
+    "esbuild": "0.28.2",
+    "zlib": "1.3.1-e00f703",
+    "syntax_targets": [
+      "chrome120",
+      "firefox121",
+      "safari17.4"
+    ],
+    "build_image": "node:24.15.0-bookworm-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d",
+    "pyodide_reconstruction_image": "python:3.13.7-slim-bookworm@sha256:adafcc17694d715c905b4c7bebd96907a1fd5cf183395f0ebc4d3428bd22d92d",
+    "browser_image": "mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27"
+  },
+  "workspace": {
+    "desktop_initial_state": "collapsed",
+    "persist_setting": true,
+    "narrow_screen_layout": "full-width inline drawer",
+    "autosave_debounce_ms": 750,
+    "indent": "four spaces; no literal tab insertion",
+    "desktop_wrapping": false,
+    "narrow_screen_soft_wrapping": true
+  },
+  "asset_retention": {
+    "minimum_generations": 3,
+    "minimum_days": 30,
+    "supported_open_page_age_hours": 24,
+    "compressed_image_bytes_max": 536870912,
+    "deletion_gate": "only after compatibility and feature images are outside rollback traffic, the 30-day and three-generation minima both remain satisfied, and no supported-age page can reference the generation"
+  },
+  "isolation": {
+    "candidate_spike_headers": {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp"
+    },
+    "production_default": "disabled to preserve existing iframe/opener behavior",
+    "non_isolated_behavior": "hard-stop-only fallback via Worker.terminate"
+  },
+  "lifecycle": {
+    "hidden": "pause dispatch and reset the scheduler wall-clock anchor on visible resume",
+    "pagehide": "synchronously invalidate run identity and terminate the Worker",
+    "pageshow_persisted": "enter stopped recovery and require explicit Restart",
+    "delivery_guarantee": "best effort; lifecycle events are not persistence guarantees"
+  },
+  "release_topology": {
+    "compatibility_then_feature": true,
+    "pre_feature_source_revision": "93c239d5f64ec9301e7ba0e2626b72399d5f2377",
+    "runtime_node_required": false,
+    "mutable_entry_cache": "no-store when introduced in Step 7A/7B",
+    "immutable_asset_cache": "public, max-age=31536000, immutable"
+  }
+}

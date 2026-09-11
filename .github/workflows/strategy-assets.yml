@@ -1,0 +1,66 @@
+name: Strategy asset reproducibility
+
+on:
+  pull_request:
+    paths:
+      - package.json
+      - package-lock.json
+      - scripts/build_strategy_editor.mjs
+      - scripts/build_strategy_release.mjs
+      - scripts/fetch_pyodide_assets.py
+      - scripts/build_strategy_images.py
+      - src/tickreplay/static/strategy/**
+      - src/tickreplay/frontend/**
+      - src/tickreplay/static/vendor/codemirror/**
+      - src/tickreplay/static/vendor/pyodide/**
+      - tests/browser/**
+      - tests/fixtures/strategy-*
+      - .github/workflows/strategy-assets.yml
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  editor-assets:
+    runs-on: ubuntu-24.04
+    container:
+      image: node:24.15.0-bookworm-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run check:strategy-editor
+      - run: npm run check:strategy-config
+      - run: npm run test:strategy-assets
+      - run: npm run check:strategy-release
+      - run: git diff --exit-code -- src/tickreplay/static/vendor/codemirror
+      - run: git diff --exit-code -- src/tickreplay/static/strategy/releases
+
+  pyodide-assets:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.13.7-slim-bookworm@sha256:adafcc17694d715c905b4c7bebd96907a1fd5cf183395f0ebc4d3428bd22d92d
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: python scripts/fetch_pyodide_assets.py --check
+      - run: python scripts/build_strategy_images.py --check
+      - run: git diff --exit-code -- src/tickreplay/static/vendor/pyodide
+
+  browser-spike:
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      STRATEGY_SPIKE_PYTHON: python3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run test:strategy-browser

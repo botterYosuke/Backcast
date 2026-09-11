@@ -1,12 +1,11 @@
 import { RequestCoordinator, isCancellationError } from './request-coordinator.mjs';
+import { totalPnl, unrealizedPnl } from './paper-trading.mjs';
+import { createOrderBroker } from './order-broker.mjs';
 import {
-  applyFill,
-  classifyClick,
-  createPortfolio,
-  isFilled,
-  totalPnl,
-  unrealizedPnl,
-} from './paper-trading.mjs';
+  advanceStrategyClock,
+  createReplayCommitter,
+  strategyPortfolioSnapshot,
+} from './replay-commit.mjs';
 import {
   MinuteHistorySession,
   applyMinuteHistoryPage,
@@ -87,6 +86,11 @@ const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロー
 const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
 const SYMBOL_SEARCH_DEBOUNCE_MS = 200; // 銘柄候補検索: この間隔だけ入力が止まってからサーバーへ問い合わせる
+const STRATEGY_RELEASE_URL = '/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs';
+
+let strategyReleaseModule = null;
+let strategyWorkspace = null;
+let strategyWorkspaceDisposed = false;
 
 const BOARD_MIN_ROWS = 41;        // 板の行数（奇数・表示領域に応じて拡張）
 const BOARD_ROW_HEIGHT = 20;
@@ -196,6 +200,25 @@ function setStatus(message, tone) {
   els.statusBar.hidden = false;
   els.statusBar.textContent = message;
   els.statusBar.dataset.tone = tone || 'info';
+}
+
+function safeCall(label, operation, onError) {
+  const recover = (error) => {
+    try {
+      return Promise.resolve(onError(error)).catch((recoveryError) => {
+        console.error(`${label} recovery failed`, recoveryError);
+        return null;
+      });
+    } catch (recoveryError) {
+      console.error(`${label} recovery failed`, recoveryError);
+      return Promise.resolve(null);
+    }
+  };
+  try {
+    return Promise.resolve(operation()).catch(recover);
+  } catch (error) {
+    return recover(error);
+  }
 }
 
 async function getJson(url, { signal } = {}) {
@@ -351,6 +374,7 @@ const state = {
   last: null,
   lastFrame: 0,
   scrubbing: false,
+  sessionGeneration: 0,
   daily: new DailyChartSession(),
 };
 
@@ -1251,13 +1275,152 @@ function applyTradesToBoard(fromIndex, toIndex) {
  * 返済しきった後は同じ日に何度でも建て直せる。
  */
 
-const trading = {
-  portfolio: createPortfolio(),
-  orders: [],       // 未約定の指値 {id, side, level, price, qty}
-  fills: [],        // 約定した注文（時系列）。建玉はここから導出する
-  events: [],       // 約定イベント（チャートのマーカーの元ネタ）
-  nextOrderId: 1,
+const orderBroker = createOrderBroker({ priceForLevel: priceOfLevel });
+const trading = orderBroker.state;
+let strategyController = null;
+let strategyCommitter = null;
+let strategyManualBlocked = false;
+let strategyClock = {
+  committedVirtualTime: 0,
+  candidateVirtualTime: 0,
+  lastFrame: 0,
 };
+
+function strategySessionIdentity() {
+  if (!state.meta) return null;
+  return {
+    stem: state.meta.stem,
+    code: state.meta.code,
+    actual_date: state.meta.date,
+    generation: state.sessionGeneration,
+  };
+}
+
+function strategyPortfolio() {
+  return strategyPortfolioSnapshot(
+    orderBroker.portfolioSnapshot(),
+    state.last,
+    levelOf,
+  );
+}
+
+function manualEntryBlocked() {
+  return strategyManualBlocked;
+}
+
+function syncManualTradingControls() {
+  const blocked = manualEntryBlocked();
+  els.orderQty.disabled = blocked;
+  els.cancelSell.disabled = blocked;
+  els.cancelBuy.disabled = blocked;
+  syncMobileTradeButtons();
+}
+
+function strategyControllerCallbacks(downstream = {}) {
+  return {
+    onStateChange(controllerState) {
+      els.playButton.disabled = ['starting', 'stopping'].includes(controllerState.tag);
+      syncManualTradingControls();
+      downstream.onStateChange?.(controllerState);
+    },
+    onDiagnostic(diagnostic) {
+      downstream.onDiagnostic?.(diagnostic);
+    },
+    onCleanup(identity) {
+      const result = orderBroker.cancelStrategyRunOrders(identity);
+      updateBoard();
+      refreshMarkers();
+      updatePositionPanel();
+      downstream.onCleanup?.({ ...identity, ...result });
+      return result;
+    },
+    onPauseReplay(detail) {
+      setPlaying(false, { syncStrategy: false });
+      downstream.onPauseReplay?.(detail);
+    },
+    onManualGateChange(blocked) {
+      strategyManualBlocked = blocked;
+      syncManualTradingControls();
+      downstream.onManualGateChange?.(blocked);
+    },
+  };
+}
+
+function attachStrategyController(controller) {
+  const required = [
+    'load', 'start', 'resume', 'dispatchOneEvent', 'pause', 'invalidate',
+    'stop', 'end', 'getState', 'isActive', 'manualEntryBlocked',
+  ];
+  if (!controller || required.some((name) => typeof controller[name] !== 'function')) {
+    throw new TypeError('invalid_strategy_controller');
+  }
+  if (strategyController?.isActive() && strategyController !== controller) {
+    throw new Error('strategy_controller_active');
+  }
+  strategyController = controller;
+  strategyCommitter = createReplayCommitter({
+    broker: orderBroker,
+    strategyPort: controller,
+    priceLevelForPrice: levelOf,
+  });
+  syncManualTradingControls();
+}
+
+async function loadStrategy(request) {
+  if (!strategyController) throw new Error('strategy_controller_unavailable');
+  const session = strategySessionIdentity();
+  if (!session) throw new Error('strategy_session_unavailable');
+  if (strategyCommitter?.status().active) strategyCommitter.invalidate('explicit_load');
+  return strategyController.load({ ...request, session });
+}
+
+async function startStrategy() {
+  if (!strategyController || !strategyCommitter) {
+    throw new Error('strategy_controller_unavailable');
+  }
+  const session = strategySessionIdentity();
+  if (!session) throw new Error('strategy_session_unavailable');
+  const openOrderSnapshot = orderBroker.strategyOpenOrders();
+  if (openOrderSnapshot.openOrdersTotal > orderBroker.limits.maxLiveOrders) {
+    throw new Error('host_capacity_violation');
+  }
+  const cursor = state.cursor;
+  const lastCommitted = cursor === 0 ? null : {
+    sessionTickIndex: cursor - 1,
+    replayTimeUs: Math.round(state.t[cursor - 1] * 1_000_000),
+    priceLevel: levelOf(state.price[cursor - 1]),
+  };
+  const result = await strategyController.start({
+    session,
+    cursor,
+    tickCount: state.t?.length ?? 0,
+    lastCommitted,
+    portfolio: strategyPortfolio(),
+    openOrders: openOrderSnapshot.openOrders,
+    replayPaused: !state.playing,
+  });
+  strategyCommitter.beginRun({
+    session,
+    runId: result.runId,
+    strategyRevision: result.runningRevision,
+  });
+  strategyClock = {
+    committedVirtualTime: state.vt,
+    candidateVirtualTime: state.vt,
+    lastFrame: 0,
+  };
+  return result;
+}
+
+function invalidateStrategyRuntime(cause) {
+  if (strategyCommitter?.status().active) return strategyCommitter.invalidate(cause);
+  if (strategyController?.isActive()) return strategyController.invalidate(cause);
+  return null;
+}
+
+function stopStrategy() {
+  return invalidateStrategyRuntime('explicit_stop');
+}
 
 /** 注文数量。単元株未満や未入力は既定値に丸める。 */
 function orderQuantity() {
@@ -1276,53 +1439,33 @@ function pendingByLevel(side) {
   return totals;
 }
 
-/** 約定 1 件を建玉に反映して、パネルとチャートのマーカーを更新する。 */
-function executeFill(side, quantity, price, time) {
-  const fill = { side, qty: quantity, price, time };
-  trading.fills.push(fill);
-  applyFill(trading.portfolio, fill).forEach((event) => trading.events.push(event));
-  refreshMarkers();
-  updatePositionPanel();
-}
-
-/** 約定の並びから建玉とイベントを作り直す（シークで履歴を切ったあと）。 */
-function rebuildPortfolio() {
-  trading.portfolio = createPortfolio();
-  trading.events = [];
-  trading.fills.forEach((fill) => {
-    applyFill(trading.portfolio, fill).forEach((event) => trading.events.push(event));
-  });
-}
-
 /*
  * シーク先より後の取引をなかったことにする。途中から再生をやり直したとき、
  * その先で出した注文と約定が残っていると、同じ値動きで二重に成績が乗る。
  * 未約定の注文もシーク先には持ち越さない（出した時刻より前へも飛べるため）。
  */
 function truncateTradingAt(targetVt) {
-  const kept = trading.fills.filter((fill) => fill.time <= targetVt);
-  const dropped = kept.length !== trading.fills.length;
-  trading.fills = kept;
-  trading.orders = [];
-  if (dropped) rebuildPortfolio();
+  orderBroker.truncateAt(targetVt);
 }
 
 /** 発注列のクリック 1 回ぶんの処理。 */
 function placeOrder(side, level) {
-  if (state.last === null) return;
+  if (state.last === null || manualEntryBlocked()) return;
   const quantity = orderQuantity();
-
-  if (classifyClick(side, level, levelOf(state.last)) === 'market') {
-    executeFill(side, quantity, state.last, currentTradeTime());
-    updateBoard();
-    return;
+  const result = orderBroker.submitManualOrder({
+    side,
+    level,
+    price: priceOfLevel(level),
+    quantity,
+    lastLevel: levelOf(state.last),
+    lastPrice: state.last,
+    time: currentTradeTime(),
+    eligibleFromSessionTick: state.cursor,
+  });
+  if (result.kind === 'market_filled') {
+    refreshMarkers();
+    updatePositionPanel();
   }
-
-  // 同じ行を続けて押したときは数量を積み増す（注文の本数は増やさない）。
-  const price = priceOfLevel(level);
-  const existing = trading.orders.find((order) => order.side === side && order.level === level);
-  if (existing) existing.qty += quantity;
-  else trading.orders.push({ id: trading.nextOrderId++, side, level, price, qty: quantity });
   updateBoard();
 }
 
@@ -1331,21 +1474,29 @@ function placeOrder(side, level) {
  * 指値は選べず、常に成行注文（placeOrder の成行分岐と同じ処理）にする。
  */
 function placeMobileMarketOrder(side) {
-  if (state.last === null) return;
-  executeFill(side, orderQuantity(), state.last, currentTradeTime());
+  if (state.last === null || manualEntryBlocked()) return;
+  orderBroker.submitManualMarket({
+    side,
+    quantity: orderQuantity(),
+    price: state.last,
+    time: currentTradeTime(),
+    eligibleFromSessionTick: state.cursor,
+  });
+  refreshMarkers();
+  updatePositionPanel();
   updateBoard();
 }
 
 function syncMobileTradeButtons() {
-  const disabled = state.last === null;
+  const disabled = state.last === null || manualEntryBlocked();
   els.mobileBuyButton.disabled = disabled;
   els.mobileSellButton.disabled = disabled;
 }
 
 function cancelOrders(side) {
-  const before = trading.orders.length;
-  trading.orders = trading.orders.filter((order) => order.side !== side);
-  if (trading.orders.length !== before) updateBoard();
+  if (manualEntryBlocked()) return;
+  const result = orderBroker.cancelManualOrders(side);
+  if (result.canceledOrderIds.length) updateBoard();
 }
 
 /**
@@ -1354,14 +1505,15 @@ function cancelOrders(side) {
  */
 function matchOrders(fromIndex, toIndex) {
   if (!trading.orders.length) return;
-  for (let index = fromIndex; index < toIndex; index += 1) {
-    if (!trading.orders.length) break;
-    const price = state.price[index];
-    const filled = trading.orders.filter((order) => isFilled(order, price));
-    if (!filled.length) continue;
-    trading.orders = trading.orders.filter((order) => !isFilled(order, price));
-    filled.forEach((order) => executeFill(order.side, order.qty, order.price, state.t[index]));
-  }
+  const result = orderBroker.matchRange({
+    fromIndex,
+    toIndex,
+    times: state.t,
+    prices: state.price,
+  });
+  if (!result.fills.length) return;
+  refreshMarkers();
+  updatePositionPanel();
 }
 
 /** 直近に流れた約定の時刻。まだ 1 件も流れていなければ仮想時刻。 */
@@ -1479,10 +1631,7 @@ function updatePositionPanel() {
 
 /** 建玉・注文・約定履歴をすべて捨てる（先頭に戻す / 読み込み直し）。 */
 function resetTrading() {
-  trading.portfolio = createPortfolio();
-  trading.orders = [];
-  trading.fills = [];
-  trading.events = [];
+  orderBroker.reset();
   closePnlModal();
   refreshMarkers();
   updatePositionPanel();
@@ -1764,6 +1913,7 @@ function redrawAll() {
 
 /** vt を targetVt に移し、そこまでの状態を作り直す（描画は最後に一度）。 */
 function seekTo(targetVt) {
+  if (strategyController?.isActive()) void invalidateStrategyRuntime('seek');
   state.bars = state.contextBars.slice();
   state.cursor = 0;
   state.last = null;
@@ -1783,10 +1933,138 @@ function seekTo(targetVt) {
 
 // ----------------------------------------------------------- replay engine
 
+function strategyTickPayload(index) {
+  const replayTimeUs = Math.round(state.t[index] * 1_000_000);
+  const priceLevel = levelOf(state.price[index]);
+  const quantity = state.qty[index];
+  const tradeType = state.type[index];
+  if (!Number.isSafeInteger(replayTimeUs) || replayTimeUs < 0 ||
+      !Number.isSafeInteger(priceLevel) || priceLevel < 1 ||
+      !Number.isSafeInteger(quantity) || quantity < 1 ||
+      typeof tradeType !== 'string' || !tradeType) {
+    throw new Error('invalid_strategy_tick');
+  }
+  return {
+    session_tick_index: index,
+    replay_time_us: replayTimeUs,
+    price_level: priceLevel,
+    quantity,
+    trade_type: tradeType,
+  };
+}
+
+async function commitStrategyTick(index) {
+  const touched = [];
+  try {
+    const result = await strategyCommitter.commitTick({
+      sessionTickIndex: index,
+      tick: strategyTickPayload(index),
+      tradePrice: state.price[index],
+      time: state.t[index],
+      isFinalTick: index === state.t.length - 1,
+      applyTick: () => {
+        applyTick(index, touched);
+        state.cursor = index + 1;
+      },
+      afterTick: ({ matched }) => {
+        if (matched.fills.length || matched.authoritativeFillCount) refreshMarkers();
+        const framePorts = {
+          updateMinute: (bar) => {
+            candleSeries.update(paintedBar(bar));
+            volumeSeries.update(paintedVolume(bar));
+          },
+          deferMinute: () => { minuteChartDeferred = true; },
+          deriveDaily: () => {
+            if (state.daily.canAppendTick(minuteSessionIdentity(state.meta))) {
+              state.daily.deriveTerminal();
+            }
+          },
+          updateDaily: updateDailyPartialChart,
+          pushTicks: pushTickPoints,
+          pushTape: pushTapeRows,
+          matchOrders: () => {},
+          updateBoard: applyTradesToBoard,
+          updatePosition: updatePositionPanel,
+        };
+        commitReplayFrame({
+          mode: chartMode,
+          touchedBars: touched,
+          from: index,
+          to: index + 1,
+          ports: framePorts,
+        });
+        followTickView();
+        updateClock();
+        syncScrubber();
+        updateDailyReplayLiveness();
+      },
+    });
+    strategyClock = {
+      committedVirtualTime: state.vt,
+      candidateVirtualTime: state.vt,
+      lastFrame: 0,
+    };
+    state.lastFrame = 0;
+    if (result.kind !== 'tick_committed' || index !== state.t.length - 1) return;
+
+    setPlaying(false, { syncStrategy: false });
+    await strategyController.end({
+      reason: 'replay_end',
+      final_session_tick_index: index,
+      fill_cursor: result.fillCursor,
+      portfolio: strategyPortfolio(),
+    });
+    strategyCommitter.complete();
+    setStatus('');
+  } catch (error) {
+    void invalidateStrategyRuntime('worker_or_protocol_error');
+    setPlaying(false, { syncStrategy: false });
+    setStatus('ストラテジーを停止しました: ' + error.message, 'error');
+  }
+}
+
+function runStrategyReplayFrame(timestamp) {
+  const status = strategyCommitter.status();
+  const nextTickTime = state.cursor < state.t.length ? state.t[state.cursor] : Number.NaN;
+  strategyClock = advanceStrategyClock(strategyClock, {
+    timestamp,
+    playing: state.playing,
+    blocked: status.inFlight,
+    speed: state.speed,
+    nextTickTime,
+    skipGaps: els.skipGaps.checked,
+    gapThreshold: GAP_SKIP_SECONDS,
+  });
+  state.lastFrame = strategyClock.lastFrame;
+
+  if (strategyClock.shouldCommitTick && !status.inFlight) {
+    state.vt = strategyClock.committedVirtualTime;
+    void commitStrategyTick(state.cursor);
+    return;
+  }
+  runReplayFrame({
+    mode: chartMode,
+    touchedBars: [],
+    from: state.cursor,
+    to: state.cursor,
+    ports: {
+      followTick: () => followTickView(),
+      updateClock: () => updateClock(),
+      syncScrubber: () => syncScrubber(),
+      updateLiveness: () => updateDailyReplayLiveness(),
+    },
+  });
+}
+
 function step(timestamp) {
   requestAnimationFrame(step);
   if (!state.playing || !state.t || !state.t.length) {
     state.lastFrame = timestamp;
+    return;
+  }
+
+  if (strategyCommitter?.status().active) {
+    runStrategyReplayFrame(timestamp);
     return;
   }
 
@@ -1871,9 +2149,21 @@ function pushTickPoints(fromIndex, toIndex) {
   }
 }
 
-function setPlaying(playing) {
+function setPlaying(playing, { syncStrategy = true } = {}) {
+  if (syncStrategy && strategyCommitter?.status().active) {
+    const controllerState = strategyController.getState();
+    if (playing && controllerState.tag === 'paused') strategyCommitter.resume();
+    if (!playing && controllerState.tag === 'running') strategyCommitter.pause();
+  }
   state.playing = playing;
   state.lastFrame = 0;
+  if (strategyCommitter?.status().active) {
+    strategyClock = {
+      committedVirtualTime: state.vt,
+      candidateVirtualTime: state.vt,
+      lastFrame: 0,
+    };
+  }
   els.playButton.textContent = playing ? '⏸' : '▶';
   updateDailyReplayLiveness();
 }
@@ -1950,6 +2240,7 @@ async function loadMinuteContextBars(session, firstTickSeconds, sessionIdentity)
 }
 
 async function loadSession(stem, date, direction) {
+  void invalidateStrategyRuntime('session_change');
   requests.cancel('symbol-info');
   // 最初の await より前に、飛んでいる分足履歴の取得を取り消して世代を進める。
   // これ以降、古い世代のレスポンスは isCurrent() / isGeneration() で弾かれる。
@@ -1990,6 +2281,7 @@ async function loadSession(stem, date, direction) {
 
     if (!nextT.length) {
       state.meta = nextMeta;
+      state.sessionGeneration = generation;
       state.t = nextT;
       state.price = nextPrice;
       state.qty = nextQty;
@@ -2024,6 +2316,7 @@ async function loadSession(stem, date, direction) {
     const contextBars = await loadMinuteContextBars(session, nextT[0], sessionIdentity);
     if (!minuteHistory.isLoadingSession(generation, sessionIdentity)) return;
     state.meta = nextMeta;
+    state.sessionGeneration = generation;
     state.t = nextT;
     state.price = nextPrice;
     state.qty = nextQty;
@@ -2065,6 +2358,90 @@ async function loadSession(stem, date, direction) {
 }
 
 // ----------------------------------------------------------------- wiring
+
+function enterStrategyRawRecovery(root) {
+  if (!root) return;
+  root.dataset.strategyMode = 'raw-recovery';
+  const panel = root.querySelector('[data-strategy-panel]');
+  const toggle = root.querySelector('[data-strategy-action="toggle"]');
+  const source = root.querySelector('[data-strategy-source]');
+  const editor = root.querySelector('[data-strategy-editor]');
+  const importInput = root.querySelector('[data-strategy-import]');
+  const status = root.querySelector('[data-strategy-status]');
+  if (panel) panel.hidden = false;
+  if (toggle) toggle.setAttribute('aria-expanded', 'true');
+  if (editor) editor.hidden = true;
+  if (source) {
+    source.hidden = false;
+    source.readOnly = true;
+    source.tabIndex = 0;
+    source.setAttribute('aria-readonly', 'true');
+    source.removeAttribute('aria-hidden');
+  }
+  root.querySelectorAll('[data-strategy-action]').forEach((control) => {
+    control.disabled = true;
+  });
+  if (importInput) importInput.disabled = true;
+  if (status) {
+    status.textContent = '戦略ワークスペースを初期化できませんでした。ソースの選択とコピーのみ利用できます。';
+    status.dataset.tone = 'error';
+  }
+}
+
+function bootstrapStrategyWorkspace() {
+  const root = document.querySelector('[data-strategy-workspace]');
+  return safeCall('strategy workspace bootstrap', () => (
+    import(STRATEGY_RELEASE_URL)
+      .then((releaseModule) => {
+        strategyReleaseModule = releaseModule;
+        return releaseModule.mount({
+          root,
+          host: window.tickReplayStrategyHost,
+          safeCall,
+        });
+      })
+      .then((workspace) => {
+        if (!workspace || typeof workspace.dispose !== 'function') {
+          throw new TypeError('invalid_strategy_workspace');
+        }
+        if (strategyWorkspaceDisposed) {
+          workspace.dispose();
+          return null;
+        }
+        strategyWorkspace = workspace;
+        return workspace;
+      })
+  ), () => {
+    enterStrategyRawRecovery(root);
+    return null;
+  });
+}
+
+function disposeStrategyWorkspace() {
+  strategyWorkspaceDisposed = true;
+  const workspace = strategyWorkspace;
+  strategyWorkspace = null;
+  strategyReleaseModule = null;
+  if (workspace) {
+    void safeCall('strategy workspace dispose', () => workspace.dispose(), () => null);
+  }
+}
+
+window.tickReplayStrategyHost = Object.freeze({
+  controllerCallbacks: strategyControllerCallbacks,
+  attachController: attachStrategyController,
+  load: loadStrategy,
+  start: startStrategy,
+  stop: stopStrategy,
+  invalidate: invalidateStrategyRuntime,
+  getControllerState: () => strategyController?.getState() ?? null,
+  getDiagnostics: () => strategyController?.diagnosticHistory() ?? [],
+  getLogs: () => strategyController?.logs() ?? null,
+  getTerminalOutcome: () => strategyController?.terminalOutcome() ?? null,
+  getSessionIdentity: strategySessionIdentity,
+});
+
+void bootstrapStrategyWorkspace();
 
 els.loadButton.addEventListener('click', () => {
   const stem = els.symbolInput.value.trim().toUpperCase();
@@ -2117,6 +2494,7 @@ els.playButton.addEventListener('click', () => {
 
 els.resetButton.addEventListener('click', () => {
   if (!state.meta || !state.t.length) return;
+  void invalidateStrategyRuntime('reset');
   setPlaying(false);
   resetTrading();
   seekTo(state.t[0] - 0.001);
@@ -2217,6 +2595,8 @@ els.pnlModal.addEventListener('click', (event) => {
 });
 
 document.addEventListener('keydown', (event) => {
+  const strategyWorkspace = event.target.closest?.('[data-strategy-workspace], [contenteditable="true"]');
+  if (strategyWorkspace || event.target instanceof HTMLTextAreaElement) return;
   // ESC は入力欄にフォーカスがあっても効かせる（成績をすぐ見たいので）。
   if (event.key === 'Escape') {
     event.preventDefault();
@@ -2229,6 +2609,41 @@ document.addEventListener('keydown', (event) => {
     event.preventDefault();
     els.playButton.click();
   }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    if (strategyController?.getState().tag === 'running') setPlaying(false);
+    return;
+  }
+  state.lastFrame = 0;
+  strategyClock = {
+    committedVirtualTime: state.vt,
+    candidateVirtualTime: state.vt,
+    lastFrame: 0,
+  };
+});
+
+window.addEventListener('pagehide', (event) => {
+  setPlaying(false, { syncStrategy: false });
+  void invalidateStrategyRuntime('explicit_stop');
+  if (!event.persisted) disposeStrategyWorkspace();
+});
+
+window.addEventListener('pageshow', (event) => {
+  if (!event.persisted) return;
+  setPlaying(false, { syncStrategy: false });
+  state.lastFrame = 0;
+  strategyClock = {
+    committedVirtualTime: state.vt,
+    candidateVirtualTime: state.vt,
+    lastFrame: 0,
+  };
+  updateBoard();
+  refreshMarkers();
+  updatePositionPanel();
+  updateClock();
+  syncScrubber();
 });
 
 // ------------------------------------------------------------------ start

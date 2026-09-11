@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "price_representation": "integer logical tick levels",
+  "string_utf8_bytes_max": 128,
+  "open_orders_max": 256,
+  "fills_max": 256,
+  "event_encoded_bytes_max": 262144,
+  "response_encoded_bytes_max": 65536,
+  "event_template": {
+    "protocol_version": 1,
+    "session": {
+      "stem": "A128",
+      "code": "A1280",
+      "actual_date": "2026-09-10"
+    },
+    "run_id": 1,
+    "strategy_revision": 1,
+    "sequence": 1,
+    "tick": {
+      "session_tick_index": 99999,
+      "replay_time_us": 36000000000,
+      "price_level": 1000000,
+      "quantity": 1000000,
+      "trade_type": "buy"
+    },
+    "portfolio": {
+      "cash_minor": 1000000000,
+      "position_quantity": 1000000,
+      "average_price_level": 1000000,
+      "realized_pnl_minor": 1000000000,
+      "unrealized_pnl_minor": 1000000000,
+      "equity_minor": 2000000000
+    },
+    "fill_cursor": 256
+  }
+}

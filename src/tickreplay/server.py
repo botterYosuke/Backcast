@@ -21,6 +21,7 @@ operation-start handshake, consumed by Step 8's frontend polling).
 
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import threading
 import uuid
@@ -49,6 +50,89 @@ from .repository import (
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DAILY_CONTEXT_IO_CONCURRENCY = 4
 _DAILY_CONTEXT_LIMITER = anyio.CapacityLimiter(DAILY_CONTEXT_IO_CONCURRENCY)
+IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+MUTABLE_CACHE_CONTROL = "no-store"
+STRATEGY_REPORT_ONLY_CSP = (
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline'; worker-src 'self'; connect-src 'self'; "
+    "object-src 'none'; base-uri 'self'"
+)
+STRATEGY_ASSET_MEDIA_TYPES = {
+    ".mjs": "text/javascript",
+    ".wasm": "application/wasm",
+    ".zip": "application/zip",
+    ".whl": "application/zip",
+    ".json": "application/json",
+    ".py": "text/x-python",
+    ".txt": "text/plain",
+    ".gz": "application/gzip",
+}
+
+
+class SelectiveGZipMiddleware:
+    """Retain dynamic gzip except for the committed measurement sidecar.
+
+    ``strategy-editor.mjs.gz`` is a directly downloadable provenance artifact,
+    not a negotiated representation of ``strategy-editor.mjs``. Passing it
+    through Starlette's gzip middleware would add a second Content-Encoding
+    layer and ``Vary``, changing the bytes and validators frozen in its
+    manifest.
+    """
+
+    def __init__(self, app, minimum_size: int = 2048) -> None:
+        self.app = app
+        self.gzip_app = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope.get("path", "").endswith(".mjs.gz"):
+            await self.app(scope, receive, send)
+            return
+        await self.gzip_app(scope, receive, send)
+
+
+def _is_hex_identifier(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _is_immutable_strategy_asset(path: str) -> bool:
+    parts = tuple(part for part in path.replace("\\", "/").split("/") if part)
+    if len(parts) >= 4 and parts[:2] == ("vendor", "codemirror"):
+        return _is_hex_identifier(parts[2])
+    if len(parts) >= 5 and parts[:2] == ("vendor", "pyodide"):
+        return _is_hex_identifier(parts[3])
+    if len(parts) >= 4 and parts[:2] == ("strategy", "releases"):
+        return _is_hex_identifier(parts[2])
+    return False
+
+
+class StrategyStaticFiles(StaticFiles):
+    """Static serving with explicit mutable/immutable strategy cache classes."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code not in {200, 304}:
+            return response
+        immutable = _is_immutable_strategy_asset(path)
+        response.headers["Cache-Control"] = (
+            IMMUTABLE_CACHE_CONTROL if immutable else MUTABLE_CACHE_CONTROL
+        )
+        for suffix, media_type in STRATEGY_ASSET_MEDIA_TYPES.items():
+            if path.endswith(suffix):
+                response.headers["Content-Type"] = media_type
+                break
+        if path.endswith(".mjs.gz"):
+            full_path, stat_result = self.lookup_path(path)
+            if stat_result is not None:
+                digest = hashlib.sha256(Path(full_path).read_bytes()).hexdigest()
+                response.headers["ETag"] = f'"sha256-{digest}"'
+            response.headers["Content-Type"] = "application/gzip"
+            if "content-encoding" in response.headers:
+                del response.headers["content-encoding"]
+            if "vary" in response.headers:
+                del response.headers["vary"]
+        return response
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +376,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="歩み値リプレイ", version="0.1.0", lifespan=lifespan)
 # Sessions are columnar JSON of up to ~100k executions; gzip cuts the transfer
 # to roughly a quarter without any client-side work.
-app.add_middleware(GZipMiddleware, minimum_size=2048)
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=2048)
 
 
 def _parse_date(value: str) -> Date:
@@ -544,7 +628,13 @@ async def read_daily_context(
 
 @app.get("/")
 def read_index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={
+            "Cache-Control": MUTABLE_CACHE_CONTROL,
+            "Content-Security-Policy-Report-Only": STRATEGY_REPORT_ONLY_CSP,
+        },
+    )
 
 
 # Python's mimetypes module derives its table from the OS registry on
@@ -554,6 +644,7 @@ def read_index() -> FileResponse:
 # request-coordinator.mjs would 200 but silently never run. Registered
 # explicitly so StaticFiles' guess_type() reports it correctly regardless
 # of the host OS's registry contents.
-mimetypes.add_type("text/javascript", ".mjs")
+for suffix, media_type in STRATEGY_ASSET_MEDIA_TYPES.items():
+    mimetypes.add_type(media_type, suffix)
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", StrategyStaticFiles(directory=STATIC_DIR), name="static")

@@ -1,0 +1,64 @@
+{
+  "inputs": [
+    {
+      "bytes": 13936,
+      "name": "LICENSE-CPYTHON.txt",
+      "purpose": "CPython license",
+      "sha256": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
+      "source": "https://raw.githubusercontent.com/python/cpython/v3.12.7/LICENSE"
+    },
+    {
+      "bytes": 16725,
+      "name": "LICENSE-PYODIDE.txt",
+      "purpose": "Pyodide and bundled-runtime license notices",
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+      "source": "https://raw.githubusercontent.com/pyodide/pyodide/0.27.6/LICENSE"
+    },
+    {
+      "bytes": 112205,
+      "name": "pyodide-lock.json",
+      "purpose": "Pyodide package metadata required by the loader",
+      "sha256": "abc1e50465438c019cc0c08286fc9b44484de777b49f10169a6978ee1d9745ba",
+      "source": "https://cdn.jsdelivr.net/pyodide/v0.27.6/full/pyodide-lock.json"
+    },
+    {
+      "bytes": 1255388,
+      "name": "pyodide.asm.js",
+      "purpose": "Emscripten runtime glue",
+      "sha256": "af1e2e8f8d2030f5d4c89ff05de5747820cebf65eca01fe89a46fdd3a4189450",
+      "source": "https://cdn.jsdelivr.net/pyodide/v0.27.6/full/pyodide.asm.js"
+    },
+    {
+      "bytes": 10105098,
+      "name": "pyodide.asm.wasm",
+      "purpose": "Python WebAssembly runtime",
+      "sha256": "c99674c2b0c3ab1b758942683ad46004f1967e93e4ad682e9d0ec0c340e09b71",
+      "source": "https://cdn.jsdelivr.net/pyodide/v0.27.6/full/pyodide.asm.wasm"
+    },
+    {
+      "bytes": 13946,
+      "name": "pyodide.mjs",
+      "purpose": "ES module loader",
+      "sha256": "9fc7d11de0b7fab8a45604db1d2df2609fc9bc4f029d091eafbb0601fa6cd435",
+      "source": "https://cdn.jsdelivr.net/pyodide/v0.27.6/full/pyodide.mjs"
+    },
+    {
+      "bytes": 2360652,
+      "name": "python_stdlib.zip",
+      "purpose": "Python standard library",
+      "sha256": "b4d44bd9ed296f12447938bb370fd3e8c07e40d0daac473de1edc4a541f43c4c",
+      "source": "https://cdn.jsdelivr.net/pyodide/v0.27.6/full/python_stdlib.zip"
+    }
+  ],
+  "kind": "pyodide-standard-library-runtime",
+  "policy": {
+    "approved_wheels": [],
+    "dynamic_package_install": false,
+    "load_packages_from_imports": false,
+    "micropip": false,
+    "standard_library_only": true
+  },
+  "pyodide_version": "0.27.6",
+  "python_version": "3.12.7",
+  "schema_version": 1
+}

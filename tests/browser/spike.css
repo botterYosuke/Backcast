@@ -1,0 +1,56 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 70rem;
+}
+
+button {
+  min-height: 44px;
+  min-width: 44px;
+  margin: 0.25rem;
+}
+
+textarea,
+#editor-mount {
+  border: 1px solid CanvasText;
+  box-sizing: border-box;
+  display: block;
+  font-family: ui-monospace, monospace;
+  height: 26rem;
+  margin-top: 0.75rem;
+  max-width: 100%;
+  width: 100%;
+}
+
+textarea[hidden],
+#editor-mount[hidden] {
+  display: none;
+}
+
+#editor-mount .cm-editor {
+  height: 100%;
+}
+
+#editor-mount .cm-scroller {
+  overflow: auto;
+}
+
+@media (max-width: 768px) {
+  body {
+    padding: 0.5rem;
+  }
+
+  #editor-mount .cm-content {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}

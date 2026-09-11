@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import mimetypes
 import threading
 import time
+from pathlib import Path
 
 import anyio
 import httpx
@@ -24,6 +27,22 @@ ROWS = [
     ("2026-08-17 09:00:00.000000", 102.0, 300, "1", "13010"),
     ("2026-08-17 09:00:30.500000", 103.0, 400, "2", "13010"),
 ]
+
+PRE_FEATURE_HEADERS = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "tickreplay-pre-feature-headers.json"
+    ).read_text()
+)["layers"]["inner_tickreplay"]
+
+
+def _expected_headers_after_strategy_serving(expected):
+    headers = dict(expected["headers"])
+    if expected["method"] == "GET" and expected["path"] == "/":
+        headers["cache-control"] = server.MUTABLE_CACHE_CONTROL
+        headers["content-security-policy-report-only"] = server.STRATEGY_REPORT_ONLY_CSP
+    elif expected["path"].startswith("/static/"):
+        headers["cache-control"] = server.MUTABLE_CACHE_CONTROL
+    return headers
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +67,22 @@ def client(cache_dir, http_client, tick_db_factory, monkeypatch):
         server.get_repository().symbol_info("1301")
         yield test_client
     server.reset_for_tests()
+
+
+@pytest.mark.parametrize("expected", PRE_FEATURE_HEADERS)
+def test_pre_feature_header_baseline_changes_only_for_approved_routes(client, expected):
+    response = client.request(
+        expected["method"],
+        expected["path"],
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert response.status_code == expected["status"]
+    assert {
+        name: response.headers.get(name) for name in expected["headers"]
+    } == _expected_headers_after_strategy_serving(expected)
+    for header_name in expected["generated_validators"]:
+        assert response.headers.get(header_name)
 
 
 # ------------------------------------------------------------- fail-fast
@@ -604,6 +639,19 @@ def test_index_and_static_assets_are_served(client):
     assert "Lightweight Charts" in library.text[:400]
 
 
+def test_strategy_recovery_textarea_precedes_scripts_and_is_read_only(client):
+    html = client.get("/", headers={"Accept-Encoding": "identity"}).text
+
+    textarea = html.index("data-strategy-source")
+    application_script = html.index(
+        '<script type="module" src="/static/app.js"></script>'
+    )
+    assert textarea < application_script
+    assert "data-strategy-workspace" in html
+    assert 'aria-readonly="true"' in html[textarea : textarea + 500]
+    assert "readonly" in html[textarea : textarea + 500]
+
+
 @pytest.mark.parametrize(
     "asset",
     ["request-coordinator.mjs", "board-ladder.mjs", "daily-chart.mjs"],
@@ -625,6 +673,127 @@ def test_mjs_static_assets_are_served_with_a_javascript_content_type(client, ass
         "text/javascript",
         "application/javascript",
     }, content_type
+
+
+CODEMIRROR_BASE = (
+    "/static/vendor/codemirror/"
+    "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56"
+)
+PYODIDE_BASE = (
+    "/static/vendor/pyodide/0.27.6/"
+    "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0"
+)
+STRATEGY_RELEASE_BASE = (
+    "/static/strategy/releases/"
+    "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da"
+)
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type"),
+    [
+        (f"{CODEMIRROR_BASE}/strategy-editor.mjs", "text/javascript"),
+        (f"{CODEMIRROR_BASE}/manifest.json", "application/json"),
+        (f"{CODEMIRROR_BASE}/THIRD_PARTY_LICENSES.txt", "text/plain"),
+        (f"{CODEMIRROR_BASE}/strategy-editor.mjs.gz", "application/gzip"),
+        (f"{PYODIDE_BASE}/pyodide.mjs", "text/javascript"),
+        (f"{PYODIDE_BASE}/pyodide.asm.wasm", "application/wasm"),
+        (f"{PYODIDE_BASE}/python_stdlib.zip", "application/zip"),
+        (f"{PYODIDE_BASE}/pyodide-lock.json", "application/json"),
+        (f"{PYODIDE_BASE}/LICENSE-PYODIDE.txt", "text/plain"),
+    ],
+)
+def test_immutable_strategy_assets_have_explicit_mime_and_cache_headers(
+    client, path, content_type
+):
+    response = client.get(path, headers={"Accept-Encoding": "identity"})
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].split(";")[0] == content_type
+    assert response.headers["Cache-Control"] == server.IMMUTABLE_CACHE_CONTROL
+    assert response.headers.get("Cross-Origin-Opener-Policy") is None
+    assert response.headers.get("Cross-Origin-Embedder-Policy") is None
+
+
+def test_mutable_strategy_sources_are_no_store(client):
+    response = client.get(
+        "/static/strategy/strategy-workspace.mjs",
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("name", "content_type"),
+    [
+        ("strategy-release.mjs", "text/javascript"),
+        ("strategy-workspace.mjs", "text/javascript"),
+        ("strategy-worker.mjs", "text/javascript"),
+        ("strategy-runner.py", "text/x-python"),
+        ("manifest.json", "application/json"),
+        ("identity.json", "application/json"),
+    ],
+)
+def test_content_addressed_release_closure_is_immutable(client, name, content_type):
+    response = client.get(
+        f"{STRATEGY_RELEASE_BASE}/{name}",
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Content-Type"] == content_type
+    assert response.headers["Cache-Control"] == server.IMMUTABLE_CACHE_CONTROL
+
+
+def test_editor_gzip_sidecar_is_direct_only_with_its_own_byte_etag(client):
+    sidecar_path = f"{CODEMIRROR_BASE}/strategy-editor.mjs.gz"
+    sidecar = client.get(sidecar_path, headers={"Accept-Encoding": "gzip"})
+    module = client.get(
+        f"{CODEMIRROR_BASE}/strategy-editor.mjs",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    expected_bytes = (
+        server.STATIC_DIR / sidecar_path.removeprefix("/static/")
+    ).read_bytes()
+
+    assert sidecar.content == expected_bytes
+    assert sidecar.headers["Content-Type"] == "application/gzip"
+    assert sidecar.headers.get("Content-Encoding") is None
+    assert sidecar.headers.get("Vary") is None
+    assert (
+        sidecar.headers["ETag"]
+        == f'"sha256-{hashlib.sha256(expected_bytes).hexdigest()}"'
+    )
+    assert module.headers.get("Content-Encoding") == "gzip"
+    assert module.headers.get("Vary") == "Accept-Encoding"
+    assert module.content != expected_bytes
+
+
+def test_registered_strategy_asset_mime_types_are_platform_independent():
+    expected = {
+        "asset.mjs": "text/javascript",
+        "asset.wasm": "application/wasm",
+        "asset.zip": "application/zip",
+        "asset.whl": "application/zip",
+        "asset.json": "application/json",
+        "asset.py": "text/x-python",
+        "asset.txt": "text/plain",
+        "asset.gz": "application/gzip",
+    }
+    assert server.STRATEGY_ASSET_MEDIA_TYPES == {
+        Path(name).suffix: media_type for name, media_type in expected.items()
+    }
+    assert {
+        name: mimetypes.guess_type(name)[0]
+        for name in expected
+        if not name.endswith(".gz")
+    } == {
+        name: media_type
+        for name, media_type in expected.items()
+        if not name.endswith(".gz")
+    }
 
 
 # ------------------------------------------ pending/operationId handshake

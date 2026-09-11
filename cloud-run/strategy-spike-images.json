@@ -1,0 +1,95 @@
+{
+  "compatibility_image": {
+    "base_revision": "93c239d5f64ec9301e7ba0e2626b72399d5f2377",
+    "entry_files": {
+      "src/tickreplay/static/app.js": {
+        "bytes": 81209,
+        "sha256": "8ae0ffd92bd5fa5a56ec6e8f9ab648a74bdcf322c293a5e6b7949637e73397db"
+      },
+      "src/tickreplay/static/index.html": {
+        "bytes": 8432,
+        "sha256": "05f04c3511a2fbb61579e191904add487cfa8f57b78d02e24535f2a1bf5c3577"
+      },
+      "src/tickreplay/static/styles.css": {
+        "bytes": 19819,
+        "sha256": "ce6542755be75cd8fba0ca22943ac52f24f41f322324f33497668b14d33f2610"
+      }
+    },
+    "feature_entry_points": [],
+    "immutable_overlay": {
+      "codemirror_bundle_version": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+      "codemirror_manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c",
+      "overlay_payload_bytes": 15063529,
+      "pyodide_asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
+      "pyodide_manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e",
+      "retained_strategy_release_ids": [
+        "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
+        "645a8821cbda8281794ccb7714806a80db04c40e7f4d2419eb55f2054e938514",
+        "b82b5f75fd84822b19e28f5b581788af118c066c1ba9eb7e04f1ce32522b4cd9",
+        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37"
+      ],
+      "strategy_release_entry_url": "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs",
+      "strategy_release_id": "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
+      "strategy_release_manifest_sha256": "ab6afd52deb3b886096683859e492413021f3386a6878b72f5ac3d43b81b2146"
+    },
+    "rollback_eligible": true
+  },
+  "feature_image": {
+    "base_revision": "working-tree-release-input",
+    "entry_files": {
+      "src/tickreplay/static/app.js": {
+        "bytes": 93798,
+        "sha256": "ac56d855913496ed2e42f9c9f36780d0288bb3b17f00660c096ef2abe5d9b55e"
+      },
+      "src/tickreplay/static/index.html": {
+        "bytes": 12022,
+        "sha256": "1a22b8f83f2effe4589a873d7743d5f4109fa7de8e4bc00417264a427fa9fcf4"
+      },
+      "src/tickreplay/static/styles.css": {
+        "bytes": 23331,
+        "sha256": "e9f5354dc3a7b82219892af6f64c65168e61e97da2488db67b0b2cd4a9b68a25"
+      }
+    },
+    "feature_entry_points": [
+      "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs"
+    ],
+    "immutable_overlay": {
+      "codemirror_bundle_version": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+      "codemirror_manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c",
+      "overlay_payload_bytes": 15063529,
+      "pyodide_asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
+      "pyodide_manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e",
+      "retained_strategy_release_ids": [
+        "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
+        "645a8821cbda8281794ccb7714806a80db04c40e7f4d2419eb55f2054e938514",
+        "b82b5f75fd84822b19e28f5b581788af118c066c1ba9eb7e04f1ce32522b4cd9",
+        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37"
+      ],
+      "strategy_release_entry_url": "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs",
+      "strategy_release_id": "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
+      "strategy_release_manifest_sha256": "ab6afd52deb3b886096683859e492413021f3386a6878b72f5ac3d43b81b2146"
+    },
+    "rollback_eligible": false
+  },
+  "local_simulation": {
+    "beyond_window_recovery": "raw/degraded recovery may be entered; fresh navigation uses retained compatibility entry points",
+    "compatibility_entry_hashes_unchanged": true,
+    "same_overlay_in_both_images": true,
+    "within_window_delayed_asset_resolution": true
+  },
+  "publication": {
+    "compatibility_image_digest": null,
+    "feature_image_digest": null,
+    "reason": "requires a running container builder and authorized Cloud Run staging target",
+    "staging_project": null
+  },
+  "retention": {
+    "compressed_image_bytes_max": 536870912,
+    "deletion_gate": "only after compatibility and feature images are outside rollback traffic, the 30-day and three-generation minima both remain satisfied, and no supported-age page can reference the generation",
+    "minimum_days": 30,
+    "minimum_generations": 3,
+    "supported_open_page_age_hours": 24
+  },
+  "schema_version": 1,
+  "status": "local-input-manifest-only"
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "codemirror-strategy-editor",
+  "bundle_version": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+  "immutable_url": "/static/vendor/codemirror/86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56/strategy-editor.mjs",
+  "identity_sha256": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+  "files": [
+    {
+      "name": "THIRD_PARTY_LICENSES.txt",
+      "bytes": 22538,
+      "sha256": "56340278974da5bf412080cbbec8dfa603f5b855e7c103036126f2b87909d9fe"
+    },
+    {
+      "name": "identity.json",
+      "bytes": 9774,
+      "sha256": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56"
+    },
+    {
+      "name": "strategy-editor.mjs",
+      "bytes": 447508,
+      "sha256": "97a409aa3075b29b84814ca465743e8eb7329b336050cf2bc4b881075d52d434"
+    },
+    {
+      "name": "strategy-editor.mjs.LEGAL.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "strategy-editor.mjs.gz",
+      "bytes": 149530,
+      "sha256": "10798ee023c7cea338c3df039f3d4670e6ab509ae7a119c068345cc4d418275d"
+    }
+  ],
+  "budgets": {
+    "raw_bytes_max": 512000,
+    "deterministic_gzip_bytes_max": 153600
+  }
+}

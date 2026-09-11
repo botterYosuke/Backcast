@@ -40,6 +40,10 @@ default-groups = ["cloud-run-test"]
 [tool.ruff]
 target-version = "py311"
 line-length = 88
+# This generated, content-frozen browser boundary fixture deliberately contains
+# a maximum-shape source program. Linting or formatting it would change the
+# SHA-256 identity recorded in the Step 0 contract.
+extend-exclude = ["tests/fixtures/strategy-max-source.py"]
 
 [tool.ruff.lint]
 select = [

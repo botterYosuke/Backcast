@@ -4,7 +4,6 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>歩み値リプレイ</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23faf8f4'/%3E%3Crect x='5' y='2' width='1' height='12' fill='%23c0392b'/%3E%3Crect x='3' y='4' width='5' height='7' fill='%23c0392b'/%3E%3Crect x='11' y='3' width='1' height='11' fill='%231d5fa8'/%3E%3Crect x='9' y='6' width='5' height='6' fill='%231d5fa8'/%3E%3C/svg%3E" />
 <link rel="stylesheet" href="/static/styles.css" />
 <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -136,6 +135,90 @@
 
       <input id="scrubber" class="scrubber" type="range" min="0" max="1000" value="0" step="1" />
       <output id="clock" class="clock">--:--:-- / --:--:--</output>
+    </section>
+
+    <section class="card strategy-card" data-strategy-workspace data-strategy-mode="raw-recovery">
+      <div class="card-head strategy-head">
+        <h2 id="strategy-title">Python 戦略</h2>
+        <p class="card-note">ローカル保存。tick i の判断は tick i + 1 から有効です。</p>
+        <button
+          class="strategy-toggle"
+          type="button"
+          data-strategy-action="toggle"
+          aria-expanded="false"
+          aria-controls="strategy-panel"
+        >戦略を開く</button>
+      </div>
+      <div id="strategy-panel" class="strategy-panel" data-strategy-panel hidden>
+        <p id="strategy-source-help" class="strategy-help">
+          初期化できない場合も、この欄からソースを選択・コピーできます。戦略ソースは
+          ブラウザの localStorage に平文で保存されます。
+        </p>
+        <label id="strategy-source-label" class="strategy-source-label" for="strategy-source">
+          Python 戦略ソース
+        </label>
+        <textarea
+          id="strategy-source"
+          class="strategy-source"
+          data-strategy-source
+          aria-labelledby="strategy-source-label"
+          aria-describedby="strategy-source-help"
+          aria-readonly="true"
+          readonly
+          spellcheck="false"
+          autocorrect="off"
+          autocapitalize="off"
+          autocomplete="off"
+        >def on_start(state):
+    return None
+
+def on_event(event):
+    # Orders returned here first become eligible on the next replay tick.
+    return []
+
+def on_end(summary):
+    return None
+</textarea>
+        <div class="strategy-editor" data-strategy-editor hidden></div>
+
+        <div class="strategy-actions" role="toolbar" aria-label="Python 戦略操作">
+          <button type="button" data-strategy-action="save" disabled>Save Draft</button>
+          <button type="button" data-strategy-action="load" disabled>Load</button>
+          <button type="button" data-strategy-action="start" disabled>Start</button>
+          <button type="button" data-strategy-action="stop" disabled>Stop</button>
+          <button type="button" data-strategy-action="restart" disabled>Restart</button>
+          <label class="strategy-file-button">
+            Import .py
+            <input type="file" accept=".py,text/x-python" data-strategy-import disabled />
+          </label>
+          <button type="button" data-strategy-action="export" disabled>Export .py</button>
+          <button type="button" data-strategy-action="sample" disabled>Sample</button>
+          <button type="button" data-strategy-action="clear-source" disabled>Clear Saved Source</button>
+          <button type="button" data-strategy-action="download-diagnostics" disabled>
+            Download Run Diagnostics
+          </button>
+        </div>
+
+        <div class="strategy-conflict-actions" aria-label="保存競合の解決">
+          <button type="button" data-strategy-action="reload-latest" disabled>Reload Latest</button>
+          <button type="button" data-strategy-action="overwrite" disabled>Overwrite with This Draft</button>
+        </div>
+        <p class="strategy-status" data-strategy-status role="status" aria-live="polite">
+          戦略ワークスペースを初期化できませんでした。ソースの選択とコピーのみ利用できます。
+        </p>
+        <p class="strategy-revision" data-strategy-revision></p>
+        <p class="strategy-start-target" data-strategy-start-target></p>
+        <div class="strategy-output-grid">
+          <section aria-labelledby="strategy-diagnostics-title">
+            <h3 id="strategy-diagnostics-title">Diagnostics</h3>
+            <pre data-strategy-diagnostics tabindex="0"></pre>
+          </section>
+          <section aria-labelledby="strategy-logs-title">
+            <h3 id="strategy-logs-title">stdout / stderr</h3>
+            <pre data-strategy-logs tabindex="0"></pre>
+          </section>
+        </div>
+      </div>
     </section>
 
   </div><!-- /.layout-main -->

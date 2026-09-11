@@ -13,6 +13,8 @@ lifespan entirely and any tickreplay route would then 500.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,6 +23,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 CLOUD_RUN_DIR = Path(__file__).resolve().parents[1] / "cloud-run"
+PRE_FEATURE_HEADERS = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "tickreplay-pre-feature-headers.json"
+    ).read_text()
+)["layers"]["outer_cloud_run"]
+
+
+def _expected_headers_after_strategy_serving(expected):
+    import tickreplay.server
+
+    headers = dict(expected["headers"])
+    if expected["path"] == "/":
+        headers["cache-control"] = tickreplay.server.MUTABLE_CACHE_CONTROL
+        headers["content-security-policy-report-only"] = (
+            tickreplay.server.STRATEGY_REPORT_ONLY_CSP
+        )
+    elif expected["path"].startswith("/static/"):
+        headers["cache-control"] = tickreplay.server.MUTABLE_CACHE_CONTROL
+    return headers
 
 
 @pytest.fixture
@@ -103,6 +124,22 @@ def sample_files(data_dir):
         "minute_dir": minute_dir,
         "daily_dir": daily_dir,
     }
+
+
+@pytest.mark.parametrize("expected", PRE_FEATURE_HEADERS)
+def test_pre_feature_header_baseline_changes_only_for_approved_routes(client, expected):
+    response = client.request(
+        expected["method"],
+        expected["path"],
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert response.status_code == expected["status"]
+    assert {
+        name: response.headers.get(name) for name in expected["headers"]
+    } == _expected_headers_after_strategy_serving(expected)
+    for header_name in expected["generated_validators"]:
+        assert response.headers.get(header_name)
 
 
 # ------------------------------------------------------------------- healthz
@@ -545,6 +582,54 @@ def test_tickreplay_symbols_endpoint_reachable_through_lifespan(client, sample_f
     assert response.status_code == 200
     body = response.json()
     assert "symbols" in body
+
+
+def test_outer_mount_preserves_strategy_asset_cache_mime_and_sidecar_semantics(
+    client,
+):
+    import tickreplay.server
+
+    base = (
+        "/static/vendor/codemirror/"
+        "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56"
+    )
+    module = client.get(
+        f"{base}/strategy-editor.mjs", headers={"Accept-Encoding": "identity"}
+    )
+    sidecar = client.get(
+        f"{base}/strategy-editor.mjs.gz", headers={"Accept-Encoding": "gzip"}
+    )
+    sidecar_bytes = (
+        tickreplay.server.STATIC_DIR
+        / f"{base}/strategy-editor.mjs.gz".removeprefix("/static/")
+    ).read_bytes()
+
+    assert module.status_code == sidecar.status_code == 200
+    assert module.headers["Content-Type"] == "text/javascript"
+    assert module.headers["Cache-Control"] == tickreplay.server.IMMUTABLE_CACHE_CONTROL
+    assert sidecar.content == sidecar_bytes
+    assert sidecar.headers["Content-Type"] == "application/gzip"
+    assert sidecar.headers.get("Content-Encoding") is None
+    assert sidecar.headers.get("Vary") is None
+    assert sidecar.headers["ETag"] == (
+        f'"sha256-{hashlib.sha256(sidecar_bytes).hexdigest()}"'
+    )
+    assert sidecar.headers.get("Cross-Origin-Opener-Policy") is None
+    assert sidecar.headers.get("Cross-Origin-Embedder-Policy") is None
+
+
+def test_strategy_html_has_report_only_policy_without_production_isolation(client):
+    import tickreplay.server
+
+    response = client.get("/", headers={"Accept-Encoding": "identity"})
+
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Content-Security-Policy-Report-Only"] == (
+        tickreplay.server.STRATEGY_REPORT_ONLY_CSP
+    )
+    assert response.headers.get("Content-Security-Policy") is None
+    assert response.headers.get("Cross-Origin-Opener-Policy") is None
+    assert response.headers.get("Cross-Origin-Embedder-Policy") is None
 
 
 # --------------------------------------------------------------------- graphql

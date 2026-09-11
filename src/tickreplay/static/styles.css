@@ -435,6 +435,144 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------ strategy workspace */
+
+.strategy-card { flex: none; }
+
+.strategy-head { align-items: center; }
+
+.strategy-toggle { margin-left: auto; }
+
+.strategy-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 9px;
+  padding: 12px 14px 14px;
+}
+
+.strategy-panel[hidden] { display: none; }
+
+.strategy-help,
+.strategy-status,
+.strategy-revision,
+.strategy-start-target {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 11.5px;
+}
+
+.strategy-source-label {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.strategy-source,
+.strategy-editor {
+  width: 100%;
+  min-height: 260px;
+  max-height: 46vh;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: #fff;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.strategy-source {
+  padding: 10px 12px;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 4;
+}
+
+.strategy-source:focus-visible,
+.strategy-file-button:focus-within,
+.strategy-editor .cm-editor.cm-focused {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.strategy-editor { overflow: hidden; }
+.strategy-editor .cm-editor { height: 100%; min-height: 260px; }
+.strategy-editor .cm-scroller { overflow: auto; font-family: var(--mono); }
+
+.strategy-actions,
+.strategy-conflict-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.strategy-file-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 6px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.strategy-file-button:has(input:disabled) { opacity: 0.45; cursor: default; }
+.strategy-file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+
+.strategy-conflict-actions { padding-top: 2px; }
+
+.strategy-status {
+  min-height: 24px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--line-strong);
+  background: var(--surface-sunken);
+}
+
+.strategy-status[data-tone="error"] { border-left-color: var(--up); color: #8c3324; }
+.strategy-status[data-tone="success"] { border-left-color: #2e7d32; color: #235f27; }
+
+.strategy-revision,
+.strategy-start-target { font-family: var(--mono); }
+
+.strategy-output-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.strategy-output-grid section { min-width: 0; }
+
+.strategy-output-grid h3 {
+  margin: 0 0 4px;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.strategy-output-grid pre {
+  min-height: 56px;
+  max-height: 140px;
+  margin: 0;
+  padding: 7px 9px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* ------------------------------------------------------------------ 板 */
 
 .board-card {
@@ -903,4 +1041,15 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .card.is-collapsed > *:not(.card-head) { display: none; }
 
   .transport { flex-wrap: wrap; }
+
+  .strategy-head .card-note { order: 3; flex-basis: 100%; }
+  .strategy-toggle { min-height: 44px; }
+  .strategy-panel { padding: 11px 10px 14px; }
+  .strategy-source,
+  .strategy-editor { min-height: 55vh; max-height: none; white-space: pre-wrap; }
+  .strategy-editor .cm-editor { min-height: 55vh; }
+  .strategy-actions button,
+  .strategy-file-button,
+  .strategy-conflict-actions button { min-height: 44px; }
+  .strategy-output-grid { grid-template-columns: 1fr; }
 }

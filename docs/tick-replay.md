@@ -505,3 +505,283 @@ BACKCAST_DUCKDB_CACHE_DIR=S:/jp
 # kept here only so an old .env is easy to diff against this one.
 # BACKCAST_JQUANTS_DUCKDB_ROOT=S:/jp
 ```
+
+## ブラウザ Python 戦略 ABI v1
+
+この節は strategy workspace、Worker、broker、replay が共有する規範契約である。
+実装より文書を優先し、定数やフィールドが食い違う変更はリリースできない。
+
+### 実行範囲と安全性
+
+- 実行環境は Pyodide `0.27.6` / Python `3.12.7`、専用 Worker 1 本、標準
+  ライブラリのみである。`micropip`、自動 package 読み込み、追加 wheel は使わない。
+- 現在の利用者自身が信頼するコードだけを、既存ページと同一 origin で実行する。
+  Worker は security sandbox ではない。Python はブラウザ Web API や同一 origin API
+  に到達でき、CSP の `connect-src 'self'` もこれを禁止しない。
+- host が Python に渡す market snapshot は commit 済みの過去だけである。ただし、
+  これは悪意あるコードに対する技術的な no-network / no-future-data 保証ではない。
+  その保証が必要になった場合は separate-origin threat model を新規設計する。
+- `crossOriginIsolated` なら cooperative interrupt を利用できる。利用できない環境では
+  run identity を先に無効化して `Worker.terminate()` する hard-stop のみを保証する。
+  Worker の Python heap、filesystem、注文、約定、portfolio は永続化しない。
+- strategy 無効時は従来の frame 単位高速処理を維持する。strategy 有効時は正しい
+  因果順序を優先するため、x500 の実効速度が指定値を下回ることがある。
+
+### 因果順序と backpressure
+
+tick identity は完全な session identity
+`(stem, code, actual_date, generation)` と absolute `session_tick_index` の組であり、
+Worker RPC sequence とは別物である。
+
+```text
+tick i の直前
+  → tick i に eligible な前回 command batch を cancellations-first で atomic commit
+  → tick i を replay state に commit
+  → canonical order_id 昇順で eligible order を照合
+  → fills / portfolio / marker を commit
+  → commit 後の snapshot を on_event(i) に 1 件だけ送信
+  → response を検証し、command を i + 1 用に stage
+```
+
+`on_event(i)` が返した submit/cancel は必ず
+`eligible_from_session_tick = i + 1` となり、tick `i` 以前を変更しない。同じ新規指値を
+tick `i` と `i + 1` がともに通過しても、約定可能なのは `i + 1` からである。
+cancel は tick `i` の約定後、tick `i + 1` の照合前に効く。
+
+未解決 RPC は常に最大1件で、event を捨てたり Worker queue に積み上げたりしない。
+待機中も animation frame と操作 UI は動かすが、replay cursor、virtual time、次 tick は
+進めない。Pause 中に正当な response が返った場合は stage だけ行い、Resume 後の次 tick
+まで commit しない。
+
+### Start、状態、無効化
+
+Start は replay が一時停止中で、かつ未処理 tick がある場合だけ受け付ける。
+`state.cursor` は次の未処理 absolute tick である。cursor 0 の `on_start` は
+`next_session_tick_index=0` とし、`last_committed_session_tick_index`、時刻、価格は
+すべて `null` で、tick 0 の価格・数量・時刻・trade type を含めない。cursor > 0 では
+直前の `cursor - 1` だけを渡す。空 session または cursor が末尾なら
+`session_complete` として副作用なしで拒否する。
+
+| 状態 | 意味 | 主な遷移 |
+| --- | --- | --- |
+| `idle` | runtime 未生成 | 明示的 Load → `loading` |
+| `loading` | source compile / ABI 検証中 | 成功 → `ready`、失敗 → `errored` |
+| `ready` | loaded revision あり、run なし | Start → `starting` |
+| `starting` | `on_start` 未解決、Play/tick dispatch 禁止 | 成功 → `paused` |
+| `paused` | active run は保持、event dispatch 停止 | Play → `running` |
+| `running` | 1 tick / 1 RPC の commit barrier が有効 | Pause → `paused` |
+| `stopping` | identity 無効化、注文 cleanup、Worker 停止中 | 終了理由に応じ `completed` / `errored` |
+| `completed` | replay end 済み、trading result 確定 | 未処理 tick を作る明示操作後に Reload/Restart |
+| `errored` | active run の terminal failure | 明示的 Load/Restart だけで回復 |
+
+同じ main-thread turn の無効化理由は次の優先順で1回だけ処理する。
+
+```text
+session_change > reset > seek > explicit_load > explicit_stop
+  > timeout > worker_or_protocol_error > replay_end
+```
+
+Stop、seek、reset、session change、明示的 Reload、active phase failure は、その
+session/run/revision の strategy-origin 注文だけを一度 cancel する。Start 前から存在する
+manual limit は保持する。Pause は注文を保持する。replay end は残注文を一度 cancel して
+`on_end` を best-effort 実行するが、`on_end` の例外・timeout・crash は確定済みの
+orders/fills/portfolio を変更せず状態を `completed` に保つ。active run 中は新規 manual
+submit/cancel と strategy submit/cancel を相互排他にする。
+
+deadline は desktop で load 20,000 ms、compile 3,000 ms、start 1,000 ms、event
+250 ms、end 500 ms、mobile で順に 40,000 / 6,000 / 2,000 / 500 / 1,000 ms とする。
+cooperative interrupt grace は250 ms、hard termination は500 msである。
+
+### Source、保存、revision
+
+canonical source は先頭の UTF-8 BOM を1個だけ除去し、CRLF/CR を LF に正規化した
+Unicode 文字列である。SHA-256 はその UTF-8 bytes の lowercase 64桁 hex とする。
+上限は UTF-8 262,144 bytes、Unicode scalar 262,144、8,192行、1行4,096 scalar。
+Import は単一の case-insensitive `.py`、strict UTF-8だけを受け付け、超過や不正入力で
+現在の draft を壊さない。
+
+- `draft_revision` は tab-local で初期値0。受理した source change ごとに増える。
+- `loaded_revision` は初期値0。Load の compile/ABI 成功時だけ1から増える。
+- `running_revision` は run が無いとき absent、Start 成功時に loaded revision を複写する。
+- draft edit、autosave、settings change は loaded/running revision や Worker を変更しない。
+  Reload だけが現在の canonical draft を新しい executable revision にする。Restart は
+  最後に成功した loaded source/revision を fresh Worker へ再compileし、現在の draft を
+  暗黙に採用しない。
+
+source record は
+`{schemaVersion, writerId, recordId, parentRecordId, draftRevision, sourceHash, source, updatedAt}`、
+settings record は `{schemaVersion, writerId, recordId, settings, updatedAt}` として別 key に
+保存する。source Save は write 前に parent を比較し、`setItem` 後に candidate record を
+read-backする。これは排他ロックではなく「read-back 時点で確認済み」にすぎない。
+別 tab の divergent record を storage/focus/visibility で観測したら `superseded` とし、
+autosave を停止して reload-latest または明示的 overwrite を要求する。
+
+autosave は最後の受理変更から750 ms後で、明示 Save と同じ conflict/read-back 経路を
+使う。dirty/conflicted/failed 中だけ `beforeunload` 警告を有効にする。
+`visibilitychange` hidden と `pagehide` では即時 flush を試みるが、mobile lifecycle は
+保存保証ではない。`pageshow.persisted` は draft と loaded source を保持したまま run を
+suspended にし、Worker/staged command/strategy order/timing debt を残さず、明示 Restart
+を要求する。source は localStorage に平文の application data として保存されるため、
+秘密を含めない。Clear Saved Source は settings を削除しない。
+
+### ABI envelope と上限
+
+全 envelope は `protocol_version: 1`、完全な session identity、source hash/revision、
+run ID、RPC sequence を持つ。unknown major version は fail closed とする。価格は float
+ではなく正の integer logical tick level、時刻は `replay_time_us` の非負整数で表す。
+
+`on_start(context)` の context は cursor fields、次の account snapshot、古い順の
+open order snapshot を持つ。`on_event(event)` は commit 済み tick と、その tick で生じた
+連続した run-local fills、fill cursor、post-fill account、open orders を持つ。
+
+```text
+account:
+  cash_minor, position_quantity, average_price_level|null,
+  realized_pnl_minor, unrealized_pnl_minor, equity_minor
+
+open_order:
+  order_id, owner, side, quantity_remaining, limit_price_level,
+  eligible_from_session_tick
+
+fill:
+  fill_delivery_sequence, order_id, side, quantity, price_level,
+  session_tick_index, replay_time_us
+```
+
+`open_orders` は canonical order ID 昇順の先頭256件で、`open_orders_total` と
+`open_orders_truncated` を必ず伴う。hidden order も authoritative に照合し、run-scoped
+cancel の対象になる。fill は1 event 最大256件で、省略配信は禁止する。超過時は約定を
+authoritative に保持しつつ Python へ一部だけ渡さず `host_capacity_violation` で停止する。
+
+入力 event/request は最大262,144 encoded bytes、callback response は最大65,536
+encoded bytes、string は最大128 UTF-8 bytes、command は1 event 32件、1 run 10,000件、
+live order は合計256件である。`client_intent_id` はrun全体で一意とし、batch は
+cancellations-first/submissions-second で全件検証後に all-or-none commit する。
+
+command は次の3種類だけである。
+
+```python
+{"type": "submit_market", "client_intent_id": "m1", "side": "buy", "quantity": 100}
+{"type": "submit_limit", "client_intent_id": "l1", "side": "sell", "quantity": 100,
+ "limit_price_level": 1234}
+{"type": "cancel_strategy_orders", "client_intent_id": "c1", "side": "buy"}
+```
+
+`cancel_strategy_orders.side` は省略可能で、省略時は現在のrunのstrategy注文すべてが対象。
+空対象のcancelは成功する idempotent no-op である。
+
+### Workspace、診断、回復
+
+HTML は script より前から labeled/read-only/focusable な raw textarea を持つ。workspace
+host 成功後にのみ編集可能にし、最初の panel 展開で CodeMirror を lazy load する。
+最初の明示的 Load まで Worker/Pyodide を生成しない。CodeMirror failure は source と全
+action を保持した editable textarea の **degraded strategy editor**、workspace host
+failure は最新の DOM 同期 source を選択・copyだけできる **raw copy recovery**、runtime
+failure は編集/Save/Import/Export/Sampleを保持して実行だけを無効にする。
+
+Save Draft、Load、Start、Stop、Restart、Import `.py`、Export `.py`、Sample、Clear Saved
+Source、Download Run Diagnostics を提供する。共通 shortcut は `Mod-S`、
+`Mod-Shift-Enter`、`Mod-Enter`、`Mod-.`。CodeMirror 専用は `Mod-F`、`Ctrl-Space`、
+Tab/Shift-Tab、Escape後のTab移動、`Ctrl-M`（macOSは`Shift-Alt-M`）である。fallback は
+native Tab と browser search を奪わない。IME composition 中はapplication shortcutを
+実行しない。
+
+diagnostic range は1-origin line、0-origin Unicode scalar column、end-exclusive。
+source hash と visible revision が一致し、range が有効な場合だけUTF-16 CodeMirror offset
+へ変換する。stale/unmappable diagnostic は別 source へ clamp せず、履歴だけに残す。
+履歴は200件か262,144 encoded bytesの小さい方で oldest complete entry から削除する。
+stdout/stderr は各262,144 bytesに制限する。run diagnostics はmemory-onlyで、明示的
+Download時だけ再現 metadata とtraceをJSON化する。source は明示選択なしに含めない。
+
+CodeMirror completion は ABI callback、event field、command、documented constant の固定
+候補だけであり、Python language server、runtime introspection、network completion では
+ない。multi-file編集、code navigation、LSP-backed IDEが必要になった場合だけ Monaco を
+再検討する。marimo は設計参考であり runtime/source dependency ではない。
+
+### 最小 strategy と callback schema
+
+`on_event` は必須、`on_start` と `on_end` は任意である。class `Strategy` の instance
+method または同名の module-level function として定義する。同期関数と async 関数の
+どちらも使える。`on_start` は必ず `None`、`on_event` は command の list または
+`None` を返す。次の例は最初の event で100株の成行買いを1回だけ発注する。
+
+```python
+class Strategy:
+    def __init__(self):
+        self.sent = False
+
+    def on_start(self, context):
+        # cursor 0 では直前 tick の時刻・価格・index はすべて None。
+        self.sent = False
+        return None
+
+    def on_event(self, event):
+        if self.sent:
+            return None
+        self.sent = True
+        return [{
+            "type": "submit_market",
+            "client_intent_id": "first-buy",
+            "side": "buy",
+            "quantity": 100,
+        }]
+
+    def on_end(self, summary):
+        return None
+```
+
+`on_start(context)` の exact keys は次のとおりで、`portfolio` と
+`open_orders*` の形は上の ABI envelope 節に従う。
+
+```text
+next_session_tick_index, last_committed_session_tick_index,
+last_replay_time_us, last_price_level, portfolio,
+open_orders, open_orders_total, open_orders_truncated
+```
+
+`on_event(event)` の exact keys は `tick`, `fills`, `fill_cursor`, `portfolio`,
+`open_orders`, `open_orders_total`, `open_orders_truncated` である。`tick` は次の
+exact keys だけを持つ。
+
+```text
+session_tick_index, replay_time_us, price_level, quantity, trade_type
+```
+
+callback が返す command は前節の3 schema以外を受理しない。unknown field、float、
+NaN、0以下の quantity/price、重複または再利用した `client_intent_id`、上限超過は
+batch 全体を拒否する。とくに `on_event(i)` の発注・取消は **tick i ではなく
+tick i + 1 から有効**であり、過去へ遡って約定しない。
+
+### 操作モデルと troubleshooting
+
+- Save Draft は canonical source だけを保存する。Load はその時点の immutable
+  snapshot を compileし、Start は最後に成功した loaded revision を現在 cursor から
+  実行する。編集中の draft は running revision を変更しない。
+- Restart は最後の loaded source を fresh Worker に再compileする。Worker heap、Python
+  global、filesystem、注文、約定、portfolio copy は復元しない。
+- seek、reset、session change、Reload、Stop は current run のstrategy注文だけを取消す。
+  manual注文は維持する。Pause はstrategy注文を維持する。
+- callback 中は次 tick を進めない deterministic backpressure を採用するため、x500 は
+  CPU/Worker round trip次第で表示指定速度に達しないことがある。
+- source は browser localStorage に平文で保存される。秘密を入れず、不要になったら
+  Clear Saved Source を使う。Import/Sample は draftを置換するだけで、Save/Load/Start
+  は暗黙実行しない。
+- CodeMirrorが使えない場合はeditable textareaへ縮退する。workspace自体を読み込めない
+  場合は最新 source のread-only raw-copy面が残る。runtime failure時も編集・保存・
+  Import/Export/Sampleは維持され、Loadで明示的に再試行できる。
+- `Mod-S` はSave、`Mod-Shift-Enter` はLoad、`Mod-Enter` はStart、`Mod-.` はStop、
+  `F8` は次のdiagnosticへ移動する。IME composition中は実行しない。fallback textareaでは
+  native Tab とbrowser searchを奪わない。
+- desktopでは横scroll、narrow screenではsourceを変えずsoft wrapする。completionは固定
+  ABI候補だけで、Python language serverやnetwork補完ではない。
+
+同一origin Pyodideはbrowser Web APIと同一origin APIへ到達できるため、現在の利用者が
+信頼するcodeだけを実行する。通常routeはnon-isolatedでhard stopのみである。timeout時は
+run identityを無効化してWorkerを破棄するため、再開にはRestartが必要になる。
+
+現在のbrowser entryは content-addressed release
+`1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da` に固定される。
+`app.js`、HTML、CSSなどmutable entryは`no-store`、release closureとversioned vendorは
+1年immutableで配信する。更新、二段階compatibility/feature image、24時間のopen-page
+互換、rollback、asset/license再構築手順は
+`docs/pyodide-strategy-release-runbook.md` を参照する。

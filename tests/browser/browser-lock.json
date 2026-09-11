@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "harness": {
+    "package": "@playwright/test",
+    "version": "1.63.0",
+    "npm_integrity": "sha512-oxMK4vllB9RK5NQ2l1pq1IfOf2AvnEuj/vYGDj0H2nMtmtZpKtCwt/l00GEO6xjGfpBNAvjovvYdCm50dRQkpQ==",
+    "repository": "https://github.com/microsoft/playwright",
+    "license": "Apache-2.0",
+    "license_sha256": "45873d00a0dd243596deb4aa23b2493b3d1f0671921bf2538ea431d7380220eb"
+  },
+  "browser_manifest": {
+    "source": "node_modules/playwright-core/browsers.json from playwright-core@1.63.0",
+    "sha256": "545d52f8382c391e605562c330e9c1c534a16045898203037a49bb8bd769a946",
+    "bytes": 1137
+  },
+  "automation_browsers": [
+    {
+      "name": "chromium",
+      "version": "153.0.8010.12",
+      "revision": "1243"
+    },
+    {
+      "name": "chromium-headless-shell",
+      "version": "153.0.8010.12",
+      "revision": "1243"
+    },
+    {
+      "name": "firefox",
+      "version": "155.0",
+      "revision": "1543"
+    },
+    {
+      "name": "webkit",
+      "version": "26.6",
+      "revision": "2359",
+      "macos_14_revision_override": "2251"
+    },
+    {
+      "name": "ffmpeg",
+      "revision": "1011"
+    }
+  ],
+  "acquisition": {
+    "command": "npx playwright install chromium firefox webkit",
+    "acceptance_job_network": false,
+    "integrity_authority": "browser bytes are supplied by the digest-pinned Playwright image; local downloads are non-authoritative developer convenience",
+    "ci_image": "mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27",
+    "ci_image_linux_amd64_manifest": "sha256:bc6ab0d6d44ff4826e4cb8c1e6d801e185bfc42bb0753f8e2a30efc70db054c7",
+    "ci_image_linux_arm64_manifest": "sha256:a0f4498920a5dbac63196d9140ed738ef00470f27e2e74029abd8850b7bd5717"
+  },
+  "observed_local_browsers": [
+    {
+      "name": "Google Chrome",
+      "version": "152.0.7977.83",
+      "platform": "macOS 13.7.8 x86_64",
+      "executable_sha256": "5f3d43277ede0c2804c099e71f712d033a3351216f49ac34d9482cab00ec9d0c"
+    },
+    {
+      "name": "Safari",
+      "version": "18.6 (18621.3.11.19.1)",
+      "platform": "macOS 13.7.8 x86_64",
+      "safaridriver_sha256": "9629a5c3ac0f00882081fa879d2f86a8775c9f275dd6329a5a1e4ad895263c12"
+    }
+  ],
+  "real_device_requirements": [
+    "VoiceOver on macOS Safari 18.6",
+    "VoiceOver on iOS/iPadOS Safari 17.4 or newer",
+    "TalkBack on Android Chrome 120 or newer"
+  ]
+}

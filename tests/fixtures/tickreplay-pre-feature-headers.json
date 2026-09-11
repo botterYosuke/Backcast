@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-10T21:54:00+09:00",
+  "source_revision": "93c239d5f64ec9301e7ba0e2626b72399d5f2377",
+  "entry_files": {
+    "src/tickreplay/static/index.html": {
+      "bytes": 8432,
+      "sha256": "05f04c3511a2fbb61579e191904add487cfa8f57b78d02e24535f2a1bf5c3577"
+    },
+    "src/tickreplay/static/app.js": {
+      "bytes": 81209,
+      "sha256": "8ae0ffd92bd5fa5a56ec6e8f9ab648a74bdcf322c293a5e6b7949637e73397db"
+    },
+    "src/tickreplay/static/styles.css": {
+      "bytes": 19819,
+      "sha256": "ce6542755be75cd8fba0ca22943ac52f24f41f322324f33497668b14d33f2610"
+    }
+  },
+  "header_names": [
+    "content-type",
+    "content-encoding",
+    "vary",
+    "cache-control",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "cross-origin-opener-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-resource-policy",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "permissions-policy",
+    "strict-transport-security"
+  ],
+  "policy_classification": {
+    "enforced_csp": null,
+    "report_only_csp": null,
+    "coop": null,
+    "coep": null,
+    "corp": null,
+    "approved_spike_route_superset": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; worker-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'"
+  },
+  "layers": {
+    "inner_tickreplay": [
+      {
+        "method": "GET",
+        "path": "/",
+        "status": 200,
+        "headers": {
+          "content-type": "text/html; charset=utf-8",
+          "content-encoding": null,
+          "vary": "Accept-Encoding",
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": ["etag", "last-modified"]
+      },
+      {
+        "method": "HEAD",
+        "path": "/",
+        "status": 405,
+        "headers": {
+          "content-type": "application/json",
+          "content-encoding": null,
+          "vary": null,
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": []
+      },
+      {
+        "method": "GET",
+        "path": "/static/app.js",
+        "status": 200,
+        "headers": {
+          "content-type": "application/javascript",
+          "content-encoding": null,
+          "vary": "Accept-Encoding",
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": ["etag", "last-modified"]
+      },
+      {
+        "method": "GET",
+        "path": "/api/status?stem=9999",
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "content-encoding": null,
+          "vary": null,
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": []
+      }
+    ],
+    "outer_cloud_run": [
+      {
+        "method": "GET",
+        "path": "/",
+        "status": 200,
+        "headers": {
+          "content-type": "text/html; charset=utf-8",
+          "content-encoding": null,
+          "vary": "Accept-Encoding",
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": ["etag", "last-modified"]
+      },
+      {
+        "method": "GET",
+        "path": "/static/app.js",
+        "status": 200,
+        "headers": {
+          "content-type": "application/javascript",
+          "content-encoding": null,
+          "vary": "Accept-Encoding",
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": ["etag", "last-modified"]
+      },
+      {
+        "method": "GET",
+        "path": "/healthz",
+        "status": 200,
+        "headers": {
+          "content-type": "text/plain; charset=utf-8",
+          "content-encoding": null,
+          "vary": null,
+          "cache-control": null,
+          "content-security-policy": null,
+          "content-security-policy-report-only": null,
+          "cross-origin-opener-policy": null,
+          "cross-origin-embedder-policy": null,
+          "cross-origin-resource-policy": null,
+          "x-content-type-options": null,
+          "x-frame-options": null,
+          "referrer-policy": null,
+          "permissions-policy": null,
+          "strict-transport-security": null
+        },
+        "generated_validators": []
+      }
+    ]
+  }
+}

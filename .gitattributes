@@ -1,0 +1,3 @@
+# Content-addressed CodeMirror outputs preserve byte-exact generated content.
+src/tickreplay/static/vendor/codemirror/*/strategy-editor.mjs whitespace=-blank-at-eol
+src/tickreplay/static/vendor/codemirror/*/THIRD_PARTY_LICENSES.txt whitespace=-blank-at-eof

@@ -64,3 +64,7 @@ logs/
 
 # Jupyter
 .ipynb_checkpoints/
+# Build-only JavaScript dependencies; generated vendor assets are committed.
+node_modules/
+test-results/
+playwright-report/
