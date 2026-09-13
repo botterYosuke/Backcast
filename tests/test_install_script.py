@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install.sh"
@@ -18,12 +22,17 @@ def run_install(
     target: Path,
     *options: str,
     script: Path = INSTALL_SCRIPT,
+    extra_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if extra_path is not None:
+        env["PATH"] = f"{extra_path}{os.pathsep}{env['PATH']}"
     return subprocess.run(
         ["bash", str(script), "--yes", *options, str(target)],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -584,3 +593,206 @@ def test_update_rolls_back_safe_dir_on_mid_swap_failure(tmp_path: Path) -> None:
     )
     assert restored_listing == original_listing
     assert (target / ".agents/INDEX.md").read_text(encoding="utf-8") == original_index
+
+
+def snapshot_files(root: Path) -> dict[str, bytes | str]:
+    return {
+        str(path.relative_to(root)): (
+            os.readlink(path)
+            if path.is_symlink()
+            else path.read_bytes()
+            if path.is_file()
+            else "directory"
+        )
+        for path in root.rglob("*")
+        if ".git" not in path.relative_to(root).parts
+    }
+
+
+@pytest.mark.parametrize("via_link", [False, True])
+def test_install_rejects_control_characters_in_physical_root(
+    tmp_path: Path, via_link: bool
+) -> None:
+    sibling = tmp_path / "project"
+    target = tmp_path / "project\n"
+    init_git_repo(sibling)
+    init_git_repo(target)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target)
+    result = run_install(alias if via_link else target)
+    assert result.returncode == 2
+    assert snapshot_files(sibling) == {}
+    assert snapshot_files(target) == {}
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "syntax",
+        "noise",
+        "nul",
+        "unknown",
+        "always-safe",
+        "missing-python",
+        "old-python",
+        "broken-python",
+    ],
+)
+def test_bootstrap_helper_failure_precedes_target_mutation(
+    tmp_path: Path, fault: str
+) -> None:
+    template = build_template_repo(tmp_path)
+    target = tmp_path / "project"
+    init_git_repo(target)
+    installed = run_install(target, script=template / "scripts/install.sh")
+    assert installed.returncode == 0, installed.stderr
+    helper = template / ".agents/skills/_shared/path_safety.py"
+    contents = {
+        "syntax": "invalid python !",
+        "noise": "print('')\n",
+        "nul": "import sys\nsys.stdout.buffer.write(b'\\x00')\n",
+        "unknown": "raise SystemExit(17)\n",
+        "always-safe": "raise SystemExit(0)\n",
+    }
+    extra_path = None
+    if fault.endswith("-python"):
+        extra_path = tmp_path / "bin"
+        extra_path.mkdir()
+        python = extra_path / "python3"
+        statuses = {"missing-python": 127, "old-python": 2, "broken-python": 139}
+        python.write_text(f"#!/bin/sh\nexit {statuses[fault]}\n")
+        if fault == "old-python":
+            python.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I -c "
+                "'import sys; sys.version_info = (3, 8); exec(sys.argv[1])' \"$3\"\n"
+            )
+        python.chmod(0o755)
+    elif fault == "missing":
+        helper.unlink()
+    else:
+        helper.write_text(contents[fault])
+    subprocess.run(["git", "-C", str(template), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(template), "commit", "--allow-empty", "-qm", "broken helper"],
+        check=True,
+    )
+    before = snapshot_files(target)
+    updated = run_update(target, template, extra_path=extra_path)
+    assert updated.returncode != 0
+    assert "path safety" in updated.stderr.lower()
+    assert snapshot_files(target) == before
+    fresh = tmp_path / "fresh"
+    init_git_repo(fresh)
+    (fresh / "sentinel").write_bytes(b"unchanged")
+    before = snapshot_files(fresh)
+    installed = run_install(
+        fresh, script=template / "scripts/install.sh", extra_path=extra_path
+    )
+    assert installed.returncode != 0
+    assert "path safety" in installed.stderr.lower()
+    assert snapshot_files(fresh) == before
+
+
+def test_update_deprecated_cleanup_preserves_unsafe_targets(tmp_path: Path) -> None:
+    template = build_template_repo(tmp_path)
+    target = tmp_path / "project"
+    init_git_repo(target)
+    installed = run_install(target, script=template / "scripts/install.sh")
+    assert installed.returncode == 0, installed.stderr
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("outside")
+    (target / ".gemini").symlink_to(outside)
+    (target / ".claude/hooks").symlink_to("..")
+    (target / ".claude/rules").mkdir()
+    (target / ".claude/rules/obsolete").write_text("remove")
+    result = run_update(target, template)
+    assert result.returncode == 0, result.stderr
+    assert (outside / "sentinel").read_text() == "outside"
+    assert (target / ".gemini").is_symlink()
+    assert (target / ".claude/hooks").is_symlink()
+    assert not (target / ".claude/rules").exists()
+    assert "Refusing to remove" in result.stderr
+
+
+def test_update_uses_fetched_helper_when_installed_helper_is_absent(
+    tmp_path: Path,
+) -> None:
+    template = build_template_repo(tmp_path)
+    target = tmp_path / "project"
+    init_git_repo(target)
+    installed = run_install(target, script=template / "scripts/install.sh")
+    assert installed.returncode == 0, installed.stderr
+    (target / ".agents/skills/_shared/path_safety.py").unlink()
+    (target / ".gemini").mkdir()
+    (target / ".gemini/obsolete").write_text("remove")
+    result = run_update(target, template)
+    assert result.returncode == 0, result.stderr
+    assert not (target / ".gemini").exists()
+    assert (target / ".agents/skills/_shared/path_safety.py").is_file()
+
+
+@pytest.mark.parametrize("flavor", ["gnu", "bsd", "broken"])
+def test_settings_sed_capability_selection(tmp_path: Path, flavor: str) -> None:
+    target = tmp_path / "project"
+    settings = target / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    original = '{"hook":".claude/hooks/a", "other":"keep"}\n'
+    settings.write_text(original)
+    settings.chmod(0o640)
+    metadata = settings.stat()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    # Emulate argument parsing only; the host sed still performs the exact edit.
+    sed = shim / "sed"
+    sed.write_text(
+        "#!/usr/bin/env bash\n"
+        f"flavor={flavor}\n"
+        '[[ "$flavor" != broken ]] || exit 1\n'
+        'if [[ "$1" == -i ]]; then\n'
+        "  shift\n"
+        '  if [[ "$flavor" == bsd ]]; then\n'
+        '    [[ "$1" == "" ]] || exit 1\n'
+        "    shift\n"
+        "  else\n"
+        '    [[ "$1" != "" ]] || exit 1\n'
+        "  fi\n"
+        "  if /usr/bin/sed --version >/dev/null 2>&1; then\n"
+        '    exec /usr/bin/sed -i "$@"\n'
+        "  else\n"
+        '    exec /usr/bin/sed -i "" "$@"\n'
+        "  fi\n"
+        "fi\n"
+        'exec /usr/bin/sed "$@"\n'
+    )
+    sed.chmod(0o755)
+    definitions = (
+        (REPO_ROOT / "scripts/update.sh").read_text().rsplit('\nmain "$@"', 1)[0]
+    )
+    driver = tmp_path / "sed-driver.sh"
+    driver.write_text(
+        definitions
+        + '\nPROJECT_ROOT="$1"\nTMPDIR_UPDATE="$2"\nselect_sed_in_place\nmigrate_native_settings_paths\nmigrate_native_settings_paths'
+    )
+    result = subprocess.run(
+        ["bash", str(driver), str(target), str(tmp_path / "probe")],
+        env={**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    if flavor == "broken":
+        assert result.returncode != 0
+        assert settings.read_text() == original
+    else:
+        assert result.returncode == 0, result.stderr
+        assert settings.read_text() == original.replace(
+            ".claude/hooks/", ".agents/hooks/"
+        )
+        after = settings.stat()
+        assert (after.st_mode, after.st_uid, after.st_gid) == (
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+        )
+    assert sorted(path.name for path in settings.parent.iterdir()) == ["settings.json"]

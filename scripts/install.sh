@@ -3,7 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+SOURCE_ROOT="$(cd -P "${SCRIPT_DIR}/.." && [[ "${PWD}" != *[[:cntrl:]]* ]] && pwd -P)" || {
+    echo "[ERROR] Path safety refuses control characters in the template root." >&2
+    exit 2
+}
 TEMPLATE_OWNED_DIRS=(
     ".codex"
     ".agents/rules"
@@ -60,6 +63,44 @@ TARGET_SET=false
 TARGET_ROOT=""
 BACKUP_ROOT=""
 CONFLICTS=()
+PATH_SAFETY_HELPER="${SOURCE_ROOT}/.agents/skills/_shared/path_safety.py"
+PATH_SAFETY_CAPTURE=""
+
+cleanup_path_safety() {
+    [[ -z "${PATH_SAFETY_CAPTURE}" ]] || rm -f -- "${PATH_SAFETY_CAPTURE}"
+}
+trap cleanup_path_safety EXIT
+
+# Capture to a file: Bash substitution cannot distinguish newline/NUL noise.
+# Protocol: 0 strictly inside, 1 outside/root, 2 environment/resolution failure.
+check_path_safety() {
+    local status=0
+    python3 -I "${PATH_SAFETY_HELPER}" "$1" "$2" > "${PATH_SAFETY_CAPTURE}" || status=$?
+    if [[ -s "${PATH_SAFETY_CAPTURE}" ]] || [[ "${status}" != 0 && "${status}" != 1 ]]; then
+        error "Path safety check failed (Python >= 3.9 and a valid helper are required)."
+        exit 2
+    fi
+    return "${status}"
+}
+
+preflight_path_safety() {
+    PATH_SAFETY_CAPTURE="$(mktemp)"
+    local status=0
+    python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 2)' \
+        > "${PATH_SAFETY_CAPTURE}" || status=$?
+    if [[ "${status}" != 0 || -s "${PATH_SAFETY_CAPTURE}" || ! -f "${PATH_SAFETY_HELPER}" ]]; then
+        error "Path safety requires Python >= 3.9 and the template helper."
+        exit 2
+    fi
+    if check_path_safety "${TARGET_ROOT}" "${TARGET_ROOT}"; then
+        error "Path safety helper rejected: root must be unsafe."
+        exit 2
+    fi
+    if ! check_path_safety "${TARGET_ROOT}" "${TARGET_ROOT}/.orchestra-path-probe-$$"; then
+        error "Path safety helper rejected: child must be inside."
+        exit 2
+    fi
+}
 
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*"; }
@@ -135,7 +176,11 @@ resolve_target() {
         error "Target directory does not exist: ${TARGET_ARG}"
         exit 2
     fi
-    TARGET_ROOT="$(cd "${TARGET_ARG}" && pwd -P)"
+    # Reject before command substitution can strip a trailing path newline.
+    TARGET_ROOT="$(cd -P "${TARGET_ARG}" && [[ "${PWD}" != *[[:cntrl:]]* ]] && pwd -P)" || {
+        error "Path safety refuses control characters in the target root."
+        exit 2
+    }
     if [[ "${TARGET_ROOT}" == "${SOURCE_ROOT}" ]]; then
         error "The template repository cannot be installed into itself."
         error "Use scripts/update.sh to update an existing installation."
@@ -148,7 +193,7 @@ resolve_target() {
 }
 
 validate_destination_paths() {
-    local path resolved parent component current
+    local path parent component current
     local paths=(
         "${TEMPLATE_OWNED_DIRS[@]}"
         "${LEGACY_NATIVE_PATHS[@]}"
@@ -176,9 +221,8 @@ validate_destination_paths() {
             fi
         done
 
-        resolved="$(realpath -m -- "${TARGET_ROOT}/${path}")"
-        if [[ "${resolved}" != "${TARGET_ROOT}/"* ]]; then
-            error "Refusing path that resolves outside the target: ${path} -> ${resolved}"
+        if ! check_path_safety "${TARGET_ROOT}" "${TARGET_ROOT}/${path}"; then
+            error "Refusing path that resolves outside the target or to its root: ${path}"
             exit 2
         fi
     done
@@ -318,7 +362,7 @@ repair_claude_entrypoint() {
     local link="${TARGET_ROOT}/CLAUDE.md"
     local canonical="${TARGET_ROOT}/AGENTS.md"
     if [[ -L "${link}" ]] \
-        && [[ "$(realpath -m -- "${link}")" == "$(realpath -m -- "${canonical}")" ]]; then
+        && [[ "${link}" -ef "${canonical}" ]]; then
         return 0
     fi
     rm -rf -- "${link}"
@@ -451,6 +495,7 @@ main() {
     parse_args "$@"
     require_source_paths
     resolve_target
+    preflight_path_safety
     validate_destination_paths
     validate_project_files
     collect_conflicts

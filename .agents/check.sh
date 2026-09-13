@@ -98,7 +98,7 @@ print(d.get('env', {}).get('CODEX_MODEL', ''))
 
     # Extract model from config.toml (simple grep; avoids toml parser dep)
     local config_model
-    config_model=$(grep -E '^model\s*=' "${config}" | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+    config_model=$(grep -E '^model[[:space:]]*=' "${config}" | head -1 | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
 
     if [[ -z "${config_model}" ]]; then
         echo "  Could not read model from ${config}"
@@ -131,8 +131,8 @@ print(d.get('env', {}).get('CODEX_MODEL', ''))
     local consult="${ROOT}/.agents/skills/_shared/codex_consult.py"
     if [[ -f "${consult}" ]]; then
         local consult_model
-        consult_model=$(grep -E '^DEFAULT_MODEL\s*=' "${consult}" \
-            | head -1 | sed 's/.*=\s*"\(.*\)"/\1/')
+        consult_model=$(grep -E '^DEFAULT_MODEL[[:space:]]*=' "${consult}" \
+            | head -1 | sed 's/.*=[[:space:]]*"\(.*\)"/\1/')
         if [[ -z "${consult_model}" ]]; then
             echo "  Could not read DEFAULT_MODEL from codex_consult.py"
             ok=false
@@ -296,7 +296,7 @@ check_native_boundaries() {
     done
 
     if [[ ! -L "${ROOT}/CLAUDE.md" ]] ||
-        [[ "$(realpath -m -- "${ROOT}/CLAUDE.md")" != "$(realpath -m -- "${ROOT}/AGENTS.md")" ]]; then
+        [[ ! "${ROOT}/CLAUDE.md" -ef "${ROOT}/AGENTS.md" ]]; then
         echo "  CLAUDE.md must be a symlink to root AGENTS.md"
         ok=false
     fi
@@ -330,13 +330,13 @@ check_native_boundaries() {
             agents|skills) ;;
             *) echo "  Unexpected .claude entry: ${native_entry}"; ok=false ;;
         esac
-    done < <(find "${ROOT}/.claude" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+    done < <(find "${ROOT}/.claude" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort)
     while IFS= read -r native_entry; do
         if [[ "${native_entry}" != "config.toml" ]]; then
             echo "  Unexpected .codex entry: ${native_entry}"
             ok=false
         fi
-    done < <(find "${ROOT}/.codex" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+    done < <(find "${ROOT}/.codex" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort)
 
     if [[ ! -f "${ROOT}/.claude/settings.json" ]] ||
         ! grep -Fq '.agents/hooks/' "${ROOT}/.claude/settings.json" ||

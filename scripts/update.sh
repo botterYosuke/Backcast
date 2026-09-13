@@ -23,7 +23,10 @@ REPO_BOUNDARY="@orchestra:repo-boundary"
 LEGACY_BOUNDARY="@orchestra:local-boundary"
 BOUNDARY_LINE="# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(cd -P "${SCRIPT_DIR}/.." && [[ "${PWD}" != *[[:cntrl:]]* ]] && pwd -P)" || {
+    echo "[ERROR] Path safety refuses control characters in the project root." >&2
+    exit 2
+}
 
 # Directories/files to overwrite entirely from template
 SAFE_DIRS=(
@@ -116,6 +119,62 @@ UPDATED_FILES=()
 AUTO_YES=false
 TARGET_REF=""
 SELF_UPDATED=false
+PATH_SAFETY_HELPER=""
+PATH_SAFETY_CAPTURE=""
+SED_IN_PLACE=()
+
+# Keep this status-only protocol aligned with scripts/install.sh.
+check_path_safety() {
+    local status=0
+    python3 -I "${PATH_SAFETY_HELPER}" "$1" "$2" > "${PATH_SAFETY_CAPTURE}" || status=$?
+    if [[ -s "${PATH_SAFETY_CAPTURE}" ]] || [[ "${status}" != 0 && "${status}" != 1 ]]; then
+        error "Path safety check failed (Python >= 3.9 and a valid helper are required)."
+        exit 2
+    fi
+    return "${status}"
+}
+
+preflight_path_safety() {
+    # The installed helper may be absent/obsolete; use the fetched template.
+    PATH_SAFETY_HELPER="${TEMPLATE_DIR}/.agents/skills/_shared/path_safety.py"
+    PATH_SAFETY_CAPTURE="${TMPDIR_UPDATE}/path-safety.stdout"
+    local status=0
+    python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 2)' \
+        > "${PATH_SAFETY_CAPTURE}" || status=$?
+    if [[ "${status}" != 0 || -s "${PATH_SAFETY_CAPTURE}" || ! -f "${PATH_SAFETY_HELPER}" ]]; then
+        error "Path safety requires Python >= 3.9 and the template helper."
+        exit 2
+    fi
+    if check_path_safety "${PROJECT_ROOT}" "${PROJECT_ROOT}"; then
+        error "Path safety helper rejected: root must be unsafe."
+        exit 2
+    fi
+    if ! check_path_safety "${PROJECT_ROOT}" "${PROJECT_ROOT}/.orchestra-path-probe-$$"; then
+        error "Path safety helper rejected: child must be inside."
+        exit 2
+    fi
+}
+
+select_sed_in_place() {
+    # Probe disposable files before any project mutation, never settings itself.
+    local probe_dir="${TMPDIR_UPDATE}/sed-probe"
+    mkdir -p "${probe_dir}"
+    printf '%s\n' '.claude/hooks/probe' > "${probe_dir}/input"
+    printf '%s\n' '.agents/hooks/probe' > "${probe_dir}/expected"
+    if sed -i 's#\.claude/hooks/#.agents/hooks/#g' "${probe_dir}/input" 2>/dev/null \
+        && cmp -s "${probe_dir}/input" "${probe_dir}/expected"; then
+        SED_IN_PLACE=(-i)
+        return 0
+    fi
+    printf '%s\n' '.claude/hooks/probe' > "${probe_dir}/input"
+    if sed -i '' 's#\.claude/hooks/#.agents/hooks/#g' "${probe_dir}/input" 2>/dev/null \
+        && cmp -s "${probe_dir}/input" "${probe_dir}/expected"; then
+        SED_IN_PLACE=(-i '')
+        return 0
+    fi
+    error "Neither GNU nor BSD sed in-place editing is available."
+    exit 2
+}
 
 # In-flight stage-and-swap tracking (see sync_safe_dirs). At most one
 # SAFE_DIR is mid-transition at a time since the loop is sequential; the
@@ -320,14 +379,8 @@ cleanup_deprecated_paths() {
 
         # Escape check: resolve symlinks in parent components and ensure
         # the final target is still strictly inside PROJECT_ROOT.
-        local resolved
-        resolved="$(realpath -m -- "${target}")"
-        if [[ "${resolved}" != "${project_root_abs}/"* ]]; then
-            error "Refusing to remove '${path}': resolves outside PROJECT_ROOT (${resolved})."
-            continue
-        fi
-        if [[ "${resolved}" == "${project_root_abs}" ]]; then
-            error "Refusing to remove '${path}': resolves to PROJECT_ROOT itself."
+        if ! check_path_safety "${project_root_abs}" "${target}"; then
+            error "Refusing to remove '${path}': resolves outside PROJECT_ROOT or to the root itself."
             continue
         fi
 
@@ -341,6 +394,21 @@ cleanup_deprecated_paths() {
         UPDATED_FILES+=("REMOVED: ${path}")
     done
 }
+
+# BSD cp -n returns 1 for an intentionally skipped conflict. Walk only shared
+# real directories and copy absent entries so errors still stop the update.
+merge_missing_entries() (
+    shopt -s dotglob nullglob
+    local source destination
+    for source in "$1"/*; do
+        destination="$2/${source##*/}"
+        if [[ -d "${source}" && ! -L "${source}" && -d "${destination}" && ! -L "${destination}" ]]; then
+            merge_missing_entries "${source}" "${destination}"
+        elif [[ ! -e "${destination}" && ! -L "${destination}" ]]; then
+            cp -a -- "${source}" "${destination}"
+        fi
+    done
+)
 
 migrate_legacy_native_data() {
     header "Migrating Legacy Native Data"
@@ -367,7 +435,7 @@ migrate_legacy_native_data() {
         fi
         mkdir -p "${backup_root}/.claude" "${canonical}"
         cp -a -- "${legacy}" "${backup_root}/.claude/${name}"
-        cp -an -- "${legacy}/." "${canonical}/"
+        merge_missing_entries "${legacy}" "${canonical}"
         UPDATED_FILES+=(".agents/${name} (merged from .claude/${name})")
     done
 
@@ -608,7 +676,7 @@ repair_claude_entrypoint() {
     local link="${PROJECT_ROOT}/CLAUDE.md"
     local canonical="${PROJECT_ROOT}/AGENTS.md"
     if [[ -L "${link}" ]] \
-        && [[ "$(realpath -m -- "${link}")" == "$(realpath -m -- "${canonical}")" ]]; then
+        && [[ "${link}" -ef "${canonical}" ]]; then
         info "Verified CLAUDE.md -> AGENTS.md"
         return 0
     fi
@@ -664,7 +732,7 @@ migrate_native_settings_paths() {
         return 0
     fi
 
-    sed -i 's#\.claude/hooks/#.agents/hooks/#g' "${settings}"
+    sed "${SED_IN_PLACE[@]}" 's#\.claude/hooks/#.agents/hooks/#g' "${settings}"
     UPDATED_FILES+=(".claude/settings.json (migrated hook paths)")
     info "Migrated .claude hook paths to canonical .agents/hooks paths."
 }
@@ -779,6 +847,8 @@ main() {
     parse_args "$@"
     preflight_checks
     fetch_template
+    preflight_path_safety
+    select_sed_in_place
     migrate_legacy_native_data
     cleanup_deprecated_paths
     migrate_legacy_agent_state

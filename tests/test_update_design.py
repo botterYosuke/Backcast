@@ -234,6 +234,15 @@ def test_multiline_cell_content_stays_on_one_row(project: Path) -> None:
 def test_an_unfilled_template_row_is_completed_in_place(project: Path) -> None:
     """The DESIGN.md template ships "| Performance | | |"; filling it beats
     appending a second Performance row and leaving the empty one behind."""
+    design = project / ".agents" / "docs" / "DESIGN.md"
+    design.write_text(
+        "# Design\n\n"
+        "## 非機能要件 (Non-Functional Requirements)\n\n"
+        f"{NFR_HEADER}\n"
+        "|----------|-------------|-----------------|\n"
+        "| Performance | | |\n",
+        encoding="utf-8",
+    )
     before = len(table_rows(design_text(project), NFR_HEADER))
     run(
         project,

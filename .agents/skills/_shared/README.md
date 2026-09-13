@@ -39,8 +39,13 @@ swallowed. Both failure modes are worse than the split.
 | `run_tests.py` | Run one test target and compare the observed outcome against `--expect fail\|pass`, so the TDD Red/Green invariant is an exit code. Distinguishes `failed` from `collection_error` and `no_tests_collected`. |
 | `verify_delegation.py` | Collect Guardrail evidence about a delegated run's diff (deletions, placeholders, weakened tests, out-of-scope files). Reports; never accepts — `verdict` is always `needs-review`. |
 | `verify.sh` | Run the configured quality gates (ruff check, ruff format, ty, pytest) and report one JSON summary. A failed gate is exit `2`; "no gate could run" is a failure unless `--allow-no-gates`. |
+| `path_safety.py` | Bootstrap containment check (Python >= 3.9): two absolute root/candidate arguments; no stdout; exit 0 strictly inside, 1 root/outside, 2 invalid input/runtime/resolution failure. Installer/updater use this status-only exception to the JSON contract so paths never pass through shell output parsing. |
 
 ## Shared Script Contract
+
+The status-only `path_safety.py` bootstrap protocol above is an explicit exception
+to JSON output and the `--project-root`/`--help` interface below. Its positional
+root argument provides relocation; all other safety conventions still apply.
 
 Every script in `_shared/` follows these conventions, and skill-bundled helpers
 follow them too, so callers can handle all of them identically:

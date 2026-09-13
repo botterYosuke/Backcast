@@ -33,6 +33,7 @@ from functools import partial
 from pathlib import Path
 
 import anyio
+import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse

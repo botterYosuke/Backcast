@@ -92,7 +92,9 @@ def test_run_git_decodes_utf8_independently_of_platform_locale(
     marker = "cache\u2014"
     real_run = subprocess.run
 
-    def emit_utf8(_command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def emit_utf8(
+        _command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
         assert kwargs["encoding"] == "utf-8"
         assert kwargs["errors"] == "replace"
         return real_run(

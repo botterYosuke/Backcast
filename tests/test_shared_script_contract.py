@@ -46,6 +46,13 @@ PYTHON_SCRIPTS = sorted(SKILLS_DIR.rglob("*.py"))
 SHELL_SCRIPTS = sorted(SKILLS_DIR.rglob("*.sh"))
 ALL_SCRIPTS = sorted(PYTHON_SCRIPTS + SHELL_SCRIPTS)
 
+# This bootstrap's approved protocol cannot transport paths or JSON on stdout.
+# Keep it in every generic safety/doc/stdlib check; only JSON-interface cases
+# use the narrower lists. Its positional root provides fixture relocation.
+STATUS_ONLY_SCRIPTS = {SKILLS_DIR / "_shared" / "path_safety.py"}
+JSON_PYTHON_SCRIPTS = [s for s in PYTHON_SCRIPTS if s not in STATUS_ONLY_SCRIPTS]
+JSON_SCRIPTS = [s for s in ALL_SCRIPTS if s not in STATUS_ONLY_SCRIPTS]
+
 assert PYTHON_SCRIPTS, f"no bundled Python scripts found under {SKILLS_DIR}"
 assert SHELL_SCRIPTS, f"no bundled shell scripts found under {SKILLS_DIR}"
 
@@ -130,7 +137,7 @@ def test_module_docstring_has_usage_and_exit_codes(script: Path) -> None:
 # --- 2/4. --help exits 0 and documents --project-root -----------------------
 
 
-@pytest.mark.parametrize("script", PYTHON_SCRIPTS, ids=_script_id)
+@pytest.mark.parametrize("script", JSON_PYTHON_SCRIPTS, ids=_script_id)
 def test_help_exits_zero_and_documents_project_root(
     script: Path, tmp_path: Path
 ) -> None:
@@ -144,7 +151,7 @@ def test_help_exits_zero_and_documents_project_root(
 # --- 3. an argparse-level failure stays on the JSON contract ----------------
 
 
-@pytest.mark.parametrize("script", PYTHON_SCRIPTS, ids=_script_id)
+@pytest.mark.parametrize("script", JSON_PYTHON_SCRIPTS, ids=_script_id)
 def test_unknown_flag_stays_on_json_contract(script: Path, tmp_path: Path) -> None:
     result = _run(script, tmp_path, "--definitely-not-a-real-flag")
     assert result.returncode == 1, (
@@ -239,7 +246,7 @@ EXIT_VOCABULARY = {0, 1, 2, 3}
 PROSE_SUCCESS_SCRIPTS = {SKILLS_DIR / "checkpointing" / "checkpoint.py"}
 
 
-@pytest.mark.parametrize("script", ALL_SCRIPTS, ids=_script_id)
+@pytest.mark.parametrize("script", JSON_SCRIPTS, ids=_script_id)
 def test_bare_invocation_emits_one_json_object_with_a_boolean_ok(
     script: Path, tmp_path: Path
 ) -> None:
@@ -267,6 +274,46 @@ def test_bare_invocation_emits_one_json_object_with_a_boolean_ok(
     assert "Traceback" not in result.stderr, (
         f"{_script_id(script)} leaked a traceback:\n{result.stderr}"
     )
+
+
+@pytest.mark.parametrize("script", sorted(STATUS_ONLY_SCRIPTS), ids=_script_id)
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [
+        ("inside", 0),
+        ("root", 1),
+        ("outside", 1),
+        ("relative", 2),
+        ("bare", 2),
+        ("help", 2),
+        ("unknown", 2),
+    ],
+)
+def test_status_only_bootstrap_contract(
+    script: Path,
+    tmp_path: Path,
+    case: str,
+    expected_status: int,
+) -> None:
+    """Explicit exception retains strict output, input, and no-mutation checks."""
+    arguments = {
+        "inside": [str(tmp_path), str(tmp_path / "missing/child")],
+        "root": [str(tmp_path), str(tmp_path)],
+        "outside": [str(tmp_path), str(tmp_path.parent / "sibling")],
+        "relative": [str(tmp_path), "relative/child"],
+        "bare": [],
+        "help": ["--help"],
+        "unknown": ["--project-root", str(tmp_path), "--definitely-not-a-real-flag"],
+    }
+    result = subprocess.run(
+        [sys.executable, "-I", str(script), *arguments[case]],
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == expected_status, result.stderr
+    assert result.stdout == b""
+    assert b"Traceback" not in result.stderr
+    assert list(tmp_path.iterdir()) == []
 
 
 # --- 8. the success path carries `ok: true` ----------------------------------
@@ -325,6 +372,8 @@ SUCCESS_CASES: dict[Path, tuple[Callable[[Path], None], list[str]]] = {
 }
 
 SUCCESS_EXEMPT: dict[Path, str] = {
+    # Status-only containment protocol; all output remains empty, even on error.
+    SKILLS_DIR / "_shared" / "path_safety.py": "tests/test_path_safety.py",
     # Needs a fake codex/claude/gemini executable on PATH.
     SKILLS_DIR / "_shared" / "codex_consult.py": "tests/test_codex_consult.py",
     SKILLS_DIR / "_shared" / "cli_consult.py": "tests/test_cli_consult.py",

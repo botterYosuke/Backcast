@@ -11,15 +11,44 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-import pytest
 
 from tickreplay import minute_context
 
 ROWS_7203 = [
-    ("2024-04-01", "09:00", "72030", 3801.0, 3824.0, 3801.0, 3820.0, 1682000, 6401186800),
+    (
+        "2024-04-01",
+        "09:00",
+        "72030",
+        3801.0,
+        3824.0,
+        3801.0,
+        3820.0,
+        1682000,
+        6401186800,
+    ),
     ("2024-04-01", "09:01", "72030", 3820.0, 3824.0, 3813.0, 3817.0, 235700, 899600100),
-    ("2024-04-01", "14:59", "72030", 3643.0, 3644.0, 3640.0, 3640.0, 351700, 1280554100),
-    ("2024-04-01", "15:00", "72030", 3639.0, 3639.0, 3639.0, 3639.0, 4476400, 16289619600),
+    (
+        "2024-04-01",
+        "14:59",
+        "72030",
+        3643.0,
+        3644.0,
+        3640.0,
+        3640.0,
+        351700,
+        1280554100,
+    ),
+    (
+        "2024-04-01",
+        "15:00",
+        "72030",
+        3639.0,
+        3639.0,
+        3639.0,
+        3639.0,
+        4476400,
+        16289619600,
+    ),
 ]
 
 
@@ -88,7 +117,9 @@ def test_bars_before_unreachable_server_returns_empty(cache_dir: Path):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("boom")
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://fake")
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://fake"
+    )
     bars = minute_context.bars_before(
         cache_dir,
         client,
@@ -121,8 +152,13 @@ def test_bars_before_reuses_local_cache_without_redownloading(
 ):
     minute_db_factory("7203", ROWS_7203)
     first = minute_context.bars_before(
-        cache_dir, http_client, stem="7203", code="72030",
-        before_date="2024-04-02", before_time="09:00", limit=3,
+        cache_dir,
+        http_client,
+        stem="7203",
+        code="72030",
+        before_date="2024-04-02",
+        before_time="09:00",
+        limit=3,
     )
     assert len(first) == 3
 
@@ -131,8 +167,13 @@ def test_bars_before_reuses_local_cache_without_redownloading(
 
     client2 = httpx.Client(transport=httpx.MockTransport(fail), base_url="http://fake")
     second = minute_context.bars_before(
-        cache_dir, client2, stem="7203", code="72030",
-        before_date="2024-04-02", before_time="09:00", limit=3,
+        cache_dir,
+        client2,
+        stem="7203",
+        code="72030",
+        before_date="2024-04-02",
+        before_time="09:00",
+        limit=3,
     )
     assert second == first
 
@@ -141,7 +182,9 @@ def test_bars_before_corrupt_download_returns_empty(cache_dir: Path):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"not a duckdb file")
 
-    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://fake")
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://fake"
+    )
     bars = minute_context.bars_before(
         cache_dir,
         client,

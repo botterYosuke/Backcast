@@ -292,3 +292,40 @@ Rolling progress summary (latest 5 checkpoints): [PROGRESS.md](../PROGRESS.md)
 - Treat local_authoritative no-HTTP behavior as intentional; the defect is physical-name resolution.
 - Prefer bounded local read fallback over bulk filename canonicalization due collision, rename, synchronization, and compatibility risk.
 - Codex CLI consultations were unusable/timeouts and provide no validation evidence; the conclusion rests on the captured repro, 134 passing related tests, git history, inventory, and two independent analyses.
+
+---
+
+## Current Bug Fix: preflight-quality-gate-failures
+<!-- orchestra:block-id: preflight-quality-gate-failures -->
+
+### Context
+
+- Error: The full preflight reports Ruff check/format and Ty failures plus 21 failed / 1208 passed pytest tests on macOS.
+- Root cause: GNU-only realpath -m blocks 18 installer/update tests and masks a BSD-incompatible sed -i; three tracked regular files violate required symlink contracts; one writer test depends on mutable live DESIGN; static defects remain in two tests and the AnyIO import boundary.
+- Affected files: scripts/install.sh, scripts/update.sh, .agents/check.sh, CLAUDE.md, .claude/agents, .claude/skills, focused orchestration/writer tests, tests/test_collect_repo_state.py, tests/test_tickreplay_minute_context.py, and src/tickreplay/server.py.
+
+### Fix Approach
+
+- Add a Python 3.9-compatible fail-closed missing-path resolver with an explicit shell protocol, use the fetched-template helper before updater mutation, and replace only GNU realpath -m sites that require missing-path behavior.
+- Make settings migration portable through GNU/BSD sed capability selection while preserving existing sed semantics; restore only three exact verified link placeholders; isolate the blank DESIGN fixture; apply minimal Ruff/format and explicit anyio.to_thread import repairs.
+- Add focused safety tests before running the full preflight and repro.py --expect-exit 0.
+
+### Regression Risks
+
+- Path-resolution changes can weaken containment or deprecated-path deletion safety; tolerate only missing components and reject cycles, permissions, non-directories, malformed output, relative paths, and unsafe path characters.
+- Updater helper availability must precede the first target mutation; interpreter/helper failure must leave project bytes unchanged.
+- Settings migration retains the existing sed durability and metadata limits; capability detection must fail before migration, while link repair must preserve unexpected content and must not modify Git configuration.
+- macOS is reproduced; GNU/Linux execution remains to be verified.
+
+### Decisions
+
+- Do not remove -- delimiters broadly: host probes prove realpath/readlink delimiter support; only -m and GNU-style sed -i are incompatible.
+- Do not weaken orchestration tests: the three placeholders are committed as mode 100644 and must become actual relative symlinks.
+- Keep production DESIGN writer and AnyIO threading semantics unchanged; fix the fixture and import boundary.
+- Codex plan validation returned NEEDS_REVISION twice; after simplifying the resolver transport, making link repair resumable, and retaining sed with GNU/BSD capability selection, final revalidation returned PASS with no required plan changes.
+
+### Validation
+
+- The independent full preflight passed: Ruff check, Ruff format, Ty, and 1275 pytest tests; one pre-existing Starlette/httpx deprecation warning remains.
+- The native contract checker passed 8/8 checks, including the three restored relative symlinks. Focused portability and safety tests passed under the project runtime, and the resolver protocol also passed a system Python 3.9.6 smoke test.
+- Security review found no findings. Quality review found no blocking findings after correcting this block's wording about the retained sed durability limits. Test review found three nonblocking regression-test gaps; GNU/Linux execution remains unverified.
