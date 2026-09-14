@@ -50,6 +50,152 @@ function cancelStrategyOrders(clientIntentId, side) {
   return command;
 }
 
+for (const side of ['buy', 'sell']) {
+  test(`strategy ${side} fill rejects unsafe minor amounts without changing any broker state`, () => {
+    const broker = createOrderBroker();
+    broker.beginStrategyRun(RUN);
+    broker.commitStrategyBatch(strategyBatch({ commands: [
+      submitMarket('oversized', side, Number.MAX_SAFE_INTEGER),
+    ] }), { sessionTickIndex: 1 });
+    const before = broker.exportState();
+    assert.throws(() => broker.matchTick({
+      sessionTickIndex: 1, tradePrice: 100, time: 1, deliveryRun: RUN,
+    }), { code: 'strategy_representation_error' });
+    assert.equal(broker.exportState(), before);
+  });
+}
+
+test('no-fill valuation overflow rejects atomically and a subsequent representable tick succeeds', () => {
+  const broker = createOrderBroker();
+  broker.submitManualMarket({ side: 'buy', quantity: 2, price: 1, time: 0 });
+  broker.beginStrategyRun(RUN);
+  const before = broker.exportState();
+  assert.throws(() => broker.matchTick({
+    sessionTickIndex: 0, tradePrice: Number.MAX_SAFE_INTEGER, time: 1, deliveryRun: RUN,
+  }), { code: 'strategy_representation_error' });
+  assert.equal(broker.exportState(), before);
+  assert.equal(broker.matchTick({
+    sessionTickIndex: 0, tradePrice: 2, time: 1, deliveryRun: RUN,
+  }).kind, 'matched');
+});
+
+test('Start refuses legacy manual overflow before creating a strategy ledger', () => {
+  const broker = createOrderBroker();
+  broker.submitManualMarket({ side: 'buy', quantity: Number.MAX_SAFE_INTEGER, price: 100, time: 0 });
+  const before = broker.exportState();
+  assert.throws(() => broker.beginStrategyRun(RUN), { code: 'strategy_representation_error' });
+  assert.equal(broker.exportState(), before);
+});
+
+test('active manual aggregation cannot leave an unsafe open-order quantity', () => {
+  const broker = createOrderBroker();
+  broker.submitManualLimit({ side: 'buy', level: 1, price: 1, quantity: Number.MAX_SAFE_INTEGER });
+  broker.beginStrategyRun(RUN);
+  const before = broker.exportState();
+  assert.throws(() => broker.submitManualLimit({ side: 'buy', level: 1, price: 1, quantity: 1 }), {
+    code: 'strategy_representation_error',
+  });
+  assert.equal(broker.exportState(), before);
+});
+
+for (const field of ['nextOrderId', 'nextSubmissionSequence']) {
+  test(`batch rejects ${field} overflow without allocation or ledger acceptance`, () => {
+    const broker = createOrderBroker();
+    broker.beginStrategyRun(RUN);
+    broker.state[field] = Number.MAX_SAFE_INTEGER;
+    const before = broker.exportState();
+    assert.throws(() => broker.commitStrategyBatch(strategyBatch({ commands: [
+      submitMarket('counter-boundary', 'buy', 1),
+    ] }), { sessionTickIndex: 1 }), { code: 'strategy_representation_error' });
+    assert.equal(broker.exportState(), before);
+  });
+}
+
+test('opposite fills may not hide an unrepresentable intermediate portfolio', () => {
+  const broker = createOrderBroker();
+  broker.beginStrategyRun(RUN);
+  broker.commitStrategyBatch(strategyBatch({ commands: [
+    submitMarket('buy', 'buy', Number.MAX_SAFE_INTEGER),
+    submitMarket('sell', 'sell', Number.MAX_SAFE_INTEGER),
+  ] }), { sessionTickIndex: 1 });
+  const before = broker.exportState();
+  assert.throws(() => broker.matchTick({ sessionTickIndex: 1, tradePrice: 100, time: 1, deliveryRun: RUN }), {
+    code: 'strategy_representation_error',
+  });
+  assert.equal(broker.exportState(), before);
+});
+
+for (const side of ['buy', 'sell']) {
+  test(`safe ${side} exposure boundary passes and its next quantity fails atomically`, () => {
+    const maximum = Math.floor(Number.MAX_SAFE_INTEGER / 10000);
+    for (const quantity of [maximum, maximum + 1]) {
+      const broker = createOrderBroker();
+      broker.beginStrategyRun(RUN);
+      broker.commitStrategyBatch(strategyBatch({ commands: [submitMarket('edge', side, quantity)] }), { sessionTickIndex: 1 });
+      const before = broker.exportState();
+      const match = () => broker.matchTick({ sessionTickIndex: 1, tradePrice: 100, time: 1, deliveryRun: RUN });
+      if (quantity === maximum) {
+        assert.equal(match().fills.length, 1);
+        assert.equal(broker.state.portfolio.qty, side === 'buy' ? quantity : -quantity);
+      } else {
+        assert.throws(match, { code: 'strategy_representation_error' });
+        assert.equal(broker.exportState(), before);
+      }
+    }
+  });
+
+  test(`safe ${side} aggregate position boundary rejects one additional share`, () => {
+    const broker = createOrderBroker({ priceLevelForPrice: () => 1 });
+    broker.submitManualMarket({ side, quantity: Number.MAX_SAFE_INTEGER, price: 0.001, time: 0 });
+    broker.beginStrategyRun(RUN);
+    broker.commitStrategyBatch(strategyBatch({ commands: [submitMarket('one-more', side, 1)] }), { sessionTickIndex: 1 });
+    const before = broker.exportState();
+    assert.throws(() => broker.matchTick({ sessionTickIndex: 1, tradePrice: 0.001, time: 1, deliveryRun: RUN }), {
+      code: 'strategy_representation_error',
+    });
+    assert.equal(broker.exportState(), before);
+  });
+
+  test(`${side} close and reversal retain valid realized P&L and average price`, () => {
+    const broker = createOrderBroker();
+    broker.submitManualMarket({ side, quantity: 2, price: 100, time: 0 });
+    broker.beginStrategyRun(RUN);
+    const opposite = side === 'buy' ? 'sell' : 'buy';
+    broker.commitStrategyBatch(strategyBatch({ commands: [submitMarket('reverse', opposite, 3)] }), { sessionTickIndex: 1 });
+    const result = broker.matchTick({ sessionTickIndex: 1, tradePrice: 110, time: 1, deliveryRun: RUN });
+    assert.equal(result.fills.length, 1);
+    assert.deepEqual(broker.portfolioSnapshot(), {
+      qty: side === 'buy' ? -1 : 1, avgPrice: 110, realized: side === 'buy' ? 20 : -20,
+      entryCount: 2, exitCount: 1,
+    });
+  });
+}
+
+for (const counter of ['nextFillId', 'fillCursor']) {
+  test(`${counter} boundary overflow leaves pending fill and delivery ledger unchanged`, () => {
+    const broker = createOrderBroker();
+    broker.beginStrategyRun(RUN);
+    broker.commitStrategyBatch(strategyBatch({ commands: [submitMarket('fill', 'buy', 1)] }), { sessionTickIndex: 1 });
+    if (counter === 'fillCursor') [...broker.state.runLedgers.values()][0].fillCursor = Number.MAX_SAFE_INTEGER;
+    else broker.state.nextFillId = Number.MAX_SAFE_INTEGER;
+    const before = broker.exportState();
+    assert.throws(() => broker.matchTick({ sessionTickIndex: 1, tradePrice: 100, time: 1, deliveryRun: RUN }), {
+      code: 'strategy_representation_error',
+    });
+    assert.equal(broker.exportState(), before);
+  });
+}
+
+test('empty command batches cannot accept an overflowing eligibility cursor into the ledger', () => {
+  const broker = createOrderBroker();
+  broker.beginStrategyRun(RUN);
+  const before = broker.exportState();
+  assert.throws(() => broker.commitStrategyBatch(strategyBatch({
+    observedSessionTickIndex: Number.MAX_SAFE_INTEGER,
+  }), { sessionTickIndex: Number.MAX_SAFE_INTEGER + 1 }), { code: 'strategy_representation_error' });
+  assert.equal(broker.exportState(), before);
+});
+
 test('manual normalization preserves immediate market, aggregation, cancellation, and golden projection', () => {
   const broker = createOrderBroker();
 

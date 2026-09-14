@@ -10,6 +10,7 @@ import {
   encodedByteLength,
   truncateUtf8,
   validateDiagnostic,
+  validateEventPayload,
   validateWorkerResponse,
 } from './strategy-protocol.mjs';
 
@@ -102,6 +103,9 @@ export class StrategyController {
 
     this.worker = null;
     this.workerGeneration = 0;
+    this.admission = 0;
+    this.workerResources = new WeakMap();
+    this.retiringWorkers = new Set();
     this.interruptView = null;
     this.pending = null;
     this.loaded = null;
@@ -168,9 +172,11 @@ export class StrategyController {
     performanceClass = this.performanceClass,
   }) {
     if (!this.deadlines[performanceClass]) throw new StrategyControllerError('precondition', 'unknown performance class');
-    if (this.worker || this.run || this.invalidationJob) {
-      await this.invalidate('explicit_load');
-    }
+    const admission = ++this.admission;
+    const invalidating = this.worker || this.run || this.invalidationJob
+      ? this.#invalidate('explicit_load', false) : null;
+    if (invalidating) await invalidating;
+    this.#assertAdmission(admission);
     const sourceIdentity = {
       source_hash: sourceHash,
       strategy_revision: draftRevision,
@@ -199,6 +205,7 @@ export class StrategyController {
     this.performanceClass = performanceClass;
     try {
       this.interruptView = this.createInterruptBuffer();
+      this.workerResources.get(worker).interruptView = this.interruptView;
       if (this.interruptView) {
         worker.postMessage({
           kind: 'strategy_interrupt_setup',
@@ -207,13 +214,14 @@ export class StrategyController {
         });
       }
     } catch (error) {
-      await this.#terminateWorker();
+      await this.#terminateWorker(worker);
       throw error;
     }
     this.terminalValue = null;
     this.#setStatus('loading', 'load');
     try {
-      const response = await this.#request(request);
+      const response = await this.#request(request, { worker, admission });
+      this.#assertAdmission(admission);
       const revision = this.nextLoadedRevision;
       this.nextLoadedRevision += 1;
       this.loaded = freeze({
@@ -226,11 +234,14 @@ export class StrategyController {
         callbacks: clone(response.result.callbacks ?? ['on_event']),
       });
       this.#setStatus('ready', null);
+      this.#assertWorkerOwner({ worker, admission });
       return freeze({ ok: true, loadedRevision: revision, sourceHash });
     } catch (error) {
-      await this.#terminateWorker();
+      await this.#terminateWorker(worker);
+      this.#assertAdmission(admission);
       this.terminalValue = freeze({ kind: 'load_failed', phase: 'load', code: error.code ?? 'load_failed' });
       this.#setStatus('errored', 'load');
+      this.#assertAdmission(admission);
       throw error;
     }
   }
@@ -245,6 +256,7 @@ export class StrategyController {
     replayPaused = true,
   }) {
     this.#assertCanStart({ session, cursor, tickCount, lastCommitted, openOrders, replayPaused });
+    const owner = { worker: this.worker, admission: this.admission };
     const snapshot = boundedOpenOrders(openOrders);
     const runId = this.makeId('run');
     const sourceIdentity = this.#runningSourceIdentity();
@@ -273,15 +285,20 @@ export class StrategyController {
       cleanupDone: false,
     };
     this.terminalValue = null;
-    this.#setManualBlocked(true);
-    this.#setStatus('starting', 'start');
     try {
-      await this.#request(request);
+      this.#setManualBlocked(true);
+      this.#assertWorkerOwner(owner);
+      this.#setStatus('starting', 'start');
+      await this.#request(request, owner);
+      this.#assertWorkerOwner(owner);
       this.#assertCurrentRun(request);
       this.#setStatus('paused', null);
+      this.#assertWorkerOwner(owner);
       return freeze({ ok: true, runId, runningRevision: this.run.strategyRevision });
     } catch (error) {
-      await this.invalidate(error.code === 'timeout' ? 'timeout' : 'worker_or_protocol_error');
+      if (this.run?.runId === request.run_id) {
+        await this.invalidate(error.code === 'timeout' ? 'timeout' : 'worker_or_protocol_error');
+      }
       throw error;
     }
   }
@@ -302,7 +319,7 @@ export class StrategyController {
     return this.getState();
   }
 
-  async dispatchOneEvent({
+  validateEventSnapshot({
     tick,
     fills,
     fillCursor,
@@ -311,10 +328,22 @@ export class StrategyController {
     openOrdersTotal,
     openOrdersTruncated,
   }) {
+    if (this.run && !Number.isSafeInteger(this.run.sequence + 1)) {
+      throw new StrategyProtocolError('invalid_integer', 'next event sequence exceeds the safe integer range');
+    }
+    return validateEventPayload({
+      tick, fills, fill_cursor: fillCursor, portfolio, open_orders: openOrders,
+      open_orders_total: openOrdersTotal, open_orders_truncated: openOrdersTruncated,
+    });
+  }
+
+  async dispatchOneEvent(input) {
+    const { tick } = input;
     if (this.statusTag !== 'running') {
       throw new StrategyControllerError('invalid_state', 'strategy must be running to dispatch an event');
     }
     if (this.pending) throw new StrategyControllerError('single_flight', 'single-flight callback already pending');
+    const owner = { worker: this.worker, admission: this.admission };
     const sequence = this.run.sequence + 1;
     const request = createRequestEnvelope({
       phase: 'event',
@@ -323,19 +352,11 @@ export class StrategyController {
       runId: this.run.runId,
       source: this.#runningSourceIdentity(),
       sequence,
-      payload: {
-        tick,
-        fills,
-        fill_cursor: fillCursor,
-        portfolio,
-        open_orders: openOrders,
-        open_orders_total: openOrdersTotal,
-        open_orders_truncated: openOrdersTruncated,
-      },
+      payload: this.validateEventSnapshot(input),
     });
     this.run.sequence = sequence;
     try {
-      const response = await this.#request(request);
+      const response = await this.#request(request, owner);
       this.#assertCurrentRun(request);
       const commands = response.result.commands;
       return freeze({
@@ -350,15 +371,22 @@ export class StrategyController {
         commands,
       });
     } catch (error) {
-      await this.invalidate(error.code === 'timeout' ? 'timeout' : 'worker_or_protocol_error');
+      if (this.run?.runId === request.run_id) {
+        await this.invalidate(error.code === 'timeout' ? 'timeout' : 'worker_or_protocol_error');
+      }
       throw error;
     }
   }
 
   invalidate(cause) {
+    return this.#invalidate(cause, true);
+  }
+
+  #invalidate(cause, cancelAdmission) {
     if (!Object.hasOwn(CAUSE_PRIORITY, cause)) {
       return Promise.reject(new StrategyControllerError('invalid_cause', 'unknown invalidation cause'));
     }
+    if (cancelAdmission) this.admission += 1;
     if (this.invalidationJob) {
       if (CAUSE_PRIORITY[cause] > CAUSE_PRIORITY[this.invalidationJob.cause]) {
         this.invalidationJob.cause = cause;
@@ -369,13 +397,11 @@ export class StrategyController {
     const failurePhase = this.statusPhase
       ?? (this.statusTag === 'starting' ? 'start' : 'event');
     this.run = null;
-    this.#rejectPending(new StrategyControllerError('invalidated', `strategy request invalidated: ${cause}`));
-    if (!capturedRun) return this.#invalidateWithoutRun(cause);
-
     let resolveJob;
     const promise = new Promise((resolve) => { resolveJob = resolve; });
-    const job = { cause, capturedRun, failurePhase, promise, resolve: resolveJob };
+    const job = { cause, capturedRun, failurePhase, promise, resolve: resolveJob, worker: this.worker };
     this.invalidationJob = job;
+    this.#rejectPending(new StrategyControllerError('invalidated', `strategy request invalidated: ${cause}`));
     this.#setStatus('stopping', cause);
     queueMicrotask(() => { void this.#finalizeInvalidation(job); });
     return promise;
@@ -391,28 +417,37 @@ export class StrategyController {
     }
     if (this.pending) throw new StrategyControllerError('single_flight', 'cannot finalize with a callback pending');
     const capturedRun = clone(this.run);
+    const worker = this.worker;
+    const admission = this.admission;
     await this.#cleanupRun(capturedRun, 'replay_end', 'end');
+    this.#assertAdmission(admission);
     this.#setStatus('stopping', 'end');
-    this.run.sequence += 1;
-    const request = createRequestEnvelope({
-      phase: 'end',
-      requestId: this.makeId('request'),
-      session: this.run.session,
-      runId: this.run.runId,
-      source: this.#runningSourceIdentity(),
-      sequence: this.run.sequence,
-      payload: summary,
-    });
     try {
-      await this.#request(request);
+      this.#assertWorkerOwner({ worker, admission });
+      const request = createRequestEnvelope({
+        phase: 'end',
+        requestId: this.makeId('request'),
+        session: this.run.session,
+        runId: this.run.runId,
+        source: this.#runningSourceIdentity(),
+        sequence: this.run.sequence + 1,
+        payload: summary,
+      });
+      this.run.sequence = request.sequence;
+      await this.#request(request, { worker, admission });
     } catch (error) {
+      this.#assertAdmission(admission);
       if (!error.diagnostic) this.#appendSyntheticDiagnostic('end', error.code ?? 'end_failure', error.message);
     }
+    this.#assertAdmission(admission);
     this.run = null;
-    await this.#terminateWorker();
+    await this.#terminateWorker(worker);
+    this.#assertAdmission(admission);
     this.#setManualBlocked(false);
+    this.#assertAdmission(admission);
     this.terminalValue = freeze({ kind: 'completed', cause: 'replay_end' });
     this.#setStatus('completed', null);
+    this.#assertAdmission(admission);
     return this.terminalOutcome();
   }
 
@@ -448,6 +483,19 @@ export class StrategyController {
     }
   }
 
+  #assertAdmission(admission) {
+    if (admission !== this.admission) {
+      throw new StrategyControllerError('invalidated', 'strategy Load invalidated by a newer operation');
+    }
+  }
+
+  #assertWorkerOwner({ worker, admission }) {
+    this.#assertAdmission(admission);
+    if (!worker || worker !== this.worker || this.workerResources.get(worker)?.termination || this.invalidationJob) {
+      throw new StrategyControllerError('invalidated', 'strategy request Worker is no longer current');
+    }
+  }
+
   #runningSourceIdentity() {
     return {
       source_hash: this.loaded.sourceHash,
@@ -471,27 +519,34 @@ export class StrategyController {
     }
     this.workerGeneration += 1;
     const generation = this.workerGeneration;
-    worker.addEventListener('message', (event) => this.#guardWorkerListener(
-      () => this.#onWorkerMessage(worker, generation, event.data),
-    ));
-    worker.addEventListener('messageerror', () => this.#guardWorkerListener(
-      () => this.#onWorkerFailure(worker, generation, 'messageerror'),
-    ));
-    worker.addEventListener('error', (event) => this.#guardWorkerListener(
-      () => this.#onWorkerFailure(
-        worker,
-        generation,
-        isErrorEvent(event) ? event.message : 'worker error',
+    const listeners = {
+      message: (event) => this.#guardWorkerListener(
+        () => this.#onWorkerMessage(worker, generation, event.data),
       ),
-    ));
+      messageerror: () => this.#guardWorkerListener(
+        () => this.#onWorkerFailure(worker, generation, 'messageerror'),
+      ),
+      error: (event) => this.#guardWorkerListener(
+        () => this.#onWorkerFailure(
+          worker,
+          generation,
+          isErrorEvent(event) ? event.message : 'worker error',
+        ),
+      ),
+    };
+    this.workerResources.set(worker, { listeners, termination: null, interruptView: null });
+    for (const [type, listener] of Object.entries(listeners)) worker.addEventListener(type, listener);
   }
 
   #guardWorkerListener(listener) {
+    const owner = { worker: this.worker, admission: this.admission };
     try {
       listener();
     } catch (error) {
       this.#rejectPending(error instanceof Error ? error : new Error(String(error)));
-      void this.invalidate('worker_or_protocol_error');
+      if (this.worker === owner.worker && this.admission === owner.admission) {
+        void this.invalidate('worker_or_protocol_error');
+      }
     }
   }
 
@@ -513,26 +568,27 @@ export class StrategyController {
       throw new StrategyProtocolError('invalid_kind', 'unknown Worker message kind');
     }
     if (!this.pending || message.request_id !== this.pending.request.request_id) return;
+    const pending = this.pending;
     let response;
     try {
-      response = validateWorkerResponse(message, this.#expectedIdentity(this.pending.request));
+      response = validateWorkerResponse(message, this.#expectedIdentity(pending.request));
     } catch (error) {
-      this.#settlePending(false, error);
+      this.#settlePending(false, error, pending);
       return;
     }
     if (!response.ok) {
       this.#appendDiagnostic(response.diagnostic);
       this.#settlePending(false, new StrategyControllerError(
         'worker_failure', response.diagnostic.message, response.diagnostic,
-      ));
+      ), pending);
       return;
     }
-    this.#settlePending(true, response);
+    this.#settlePending(true, response, pending);
   }
 
   #onProgress(message) {
     if (!this.pending || this.pending.request.phase !== 'load') return;
-    if (message.request_id !== this.pending.request.request_id || message.stage !== 'runtime_ready') return;
+    if (!this.#logMatchesRequest(message, this.pending.request) || message.stage !== 'runtime_ready') return;
     this.#armDeadline(this.pending, this.deadlines[this.performanceClass].compile);
   }
 
@@ -601,20 +657,28 @@ export class StrategyController {
     };
   }
 
-  #request(request) {
+  #request(request, owner) {
+    try {
+      this.#assertWorkerOwner(owner);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     if (this.pending) {
       return Promise.reject(new StrategyControllerError('single_flight', 'single-flight request already pending'));
     }
     if (!this.worker) return Promise.reject(new StrategyControllerError('worker_missing', 'Worker is unavailable'));
     return new Promise((resolve, reject) => {
-      const pending = { request, resolve, reject, timer: null, settled: false };
+      const pending = { request, owner, resolve, reject, timer: null, settled: false };
       this.pending = pending;
       this.#armDeadline(pending, this.deadlines[this.performanceClass][request.phase]);
       this.#emitState();
       try {
-        this.worker.postMessage(request);
+        this.#assertWorkerOwner(owner);
+        if (pending.settled || this.pending !== pending) return;
+        owner.worker.postMessage(request);
       } catch (error) {
-        this.#settlePending(false, new StrategyControllerError('post_message', String(error)));
+        this.#settlePending(false, error instanceof StrategyControllerError
+          ? error : new StrategyControllerError('post_message', String(error)), pending);
       }
     });
   }
@@ -625,17 +689,18 @@ export class StrategyController {
       if (pending.settled || this.pending !== pending) return;
       this.#settlePending(false, new StrategyControllerError(
         'timeout', `${pending.request.phase} timeout after ${milliseconds}ms`,
-      ));
+      ), pending);
     }, milliseconds);
   }
 
-  #settlePending(succeeded, value) {
-    const pending = this.pending;
+  #settlePending(succeeded, value, pending = this.pending) {
     if (!pending || pending.settled) return;
     pending.settled = true;
     if (pending.timer !== null) this.clearTimer(pending.timer);
-    this.pending = null;
-    this.#emitState();
+    if (this.pending === pending) {
+      this.pending = null;
+      this.#emitState();
+    }
     if (succeeded) pending.resolve(value);
     else pending.reject(value);
   }
@@ -644,27 +709,21 @@ export class StrategyController {
     if (this.pending) this.#settlePending(false, error);
   }
 
-  async #invalidateWithoutRun(cause) {
-    if (this.worker) await this.#terminateWorker();
-    if (this.statusTag !== 'loading' || cause !== 'explicit_load') this.#setStatus('idle', null);
-    this.#setManualBlocked(false);
-    const outcome = freeze({ kind: 'stopped', cause, hadRun: false });
-    this.terminalValue = outcome;
-    return outcome;
-  }
-
   async #finalizeInvalidation(job) {
     try {
-      await this.#cleanupRun(job.capturedRun, job.cause, job.failurePhase);
-      await this.#terminateWorker();
+      if (job.capturedRun) await this.#cleanupRun(job.capturedRun, job.cause, job.failurePhase);
+      await this.#terminateWorker(job.worker);
+      await Promise.all([...this.retiringWorkers]);
       this.#setManualBlocked(false);
       const isError = ERROR_CAUSES.has(job.cause);
       const outcome = freeze({
         kind: isError ? 'error' : 'stopped',
         cause: job.cause,
-        session: job.capturedRun.session,
-        runId: job.capturedRun.runId,
-        strategyRevision: job.capturedRun.strategyRevision,
+        ...(job.capturedRun ? {
+          session: job.capturedRun.session,
+          runId: job.capturedRun.runId,
+          strategyRevision: job.capturedRun.strategyRevision,
+        } : { hadRun: false }),
       });
       this.terminalValue = outcome;
       this.#setStatus(isError ? 'errored' : 'idle', null);
@@ -714,19 +773,33 @@ export class StrategyController {
     );
   }
 
-  async #terminateWorker() {
-    const worker = this.worker;
-    if (!worker) return;
-    this.worker = null;
-    this.workerGeneration += 1;
-    if (this.interruptView) {
-      Atomics.store(this.interruptView, 0, 2);
-      await new Promise((resolve) => {
-        this.setTimer(resolve, Math.min(this.deadlines.interruptGrace, this.deadlines.hardTerminate));
-      });
+  #terminateWorker(worker = this.worker) {
+    if (!worker) return Promise.resolve();
+    const resource = this.workerResources.get(worker);
+    if (resource.termination) return resource.termination;
+    if (this.worker === worker) {
+      this.worker = null;
+      this.interruptView = null;
+      this.workerGeneration += 1;
     }
-    worker.terminate();
-    this.interruptView = null;
+    for (const [type, listener] of Object.entries(resource.listeners)) {
+      worker.removeEventListener?.(type, listener);
+    }
+    resource.termination = (async () => {
+      if (resource.interruptView) {
+        Atomics.store(resource.interruptView, 0, 2);
+        await new Promise((resolve) => {
+          this.setTimer(resolve, Math.min(this.deadlines.interruptGrace, this.deadlines.hardTerminate));
+        });
+      }
+      worker.terminate();
+    })();
+    this.retiringWorkers.add(resource.termination);
+    resource.termination.then(
+      () => this.retiringWorkers.delete(resource.termination),
+      () => this.retiringWorkers.delete(resource.termination),
+    );
+    return resource.termination;
   }
 
   #appendSyntheticDiagnostic(phase, category, message, run = this.run, severity = 'error') {

@@ -81,6 +81,7 @@ export class StrategyWorkerRuntime {
       const outcome = request.phase === 'load'
         ? await this.#load(request)
         : await this.#invokeRunner(request.phase, request.payload);
+      if (this.currentRequest !== request) return;
       this.#emitLogs(request, outcome);
       if (!outcome.ok) {
         this.#postRunnerFailure(request, outcome.diagnostic);
@@ -89,9 +90,9 @@ export class StrategyWorkerRuntime {
       const result = this.#resultFor(request.phase, outcome);
       this.#postResponse(request, { ok: true, result });
     } catch (error) {
-      this.#postFailure(request, this.#categoryFor(request.phase), error);
+      if (this.currentRequest === request) this.#postFailure(request, this.#categoryFor(request.phase), error);
     } finally {
-      this.currentRequest = null;
+      if (this.currentRequest === request) this.currentRequest = null;
     }
   }
 
@@ -130,6 +131,11 @@ export class StrategyWorkerRuntime {
       kind: 'strategy_progress',
       protocol_version: PROTOCOL_VERSION,
       request_id: request.request_id,
+      phase: request.phase,
+      session: request.session,
+      run_id: request.run_id,
+      source: request.source,
+      sequence: request.sequence,
       stage: 'runtime_ready',
     });
     const response = await this.fetchResource(runnerUrl, { cache: 'force-cache' });
@@ -166,8 +172,11 @@ export class StrategyWorkerRuntime {
       if (typeof result !== 'string') throw new Error('strategy runner returned a non-string result');
       return JSON.parse(result);
     } finally {
-      destroyProxy(resultProxy);
-      if (globalsProxy !== resultProxy) destroyProxy(globalsProxy);
+      try {
+        destroyProxy(resultProxy);
+      } finally {
+        if (globalsProxy !== resultProxy) destroyProxy(globalsProxy);
+      }
     }
   }
 

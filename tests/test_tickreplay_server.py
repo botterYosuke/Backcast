@@ -652,6 +652,22 @@ def test_strategy_recovery_textarea_precedes_scripts_and_is_read_only(client):
     assert "readonly" in html[textarea : textarea + 500]
 
 
+def test_strategy_load_warning_is_persistent_and_describes_execution_controls(client):
+    html = client.get("/").text
+
+    assert 'id="strategy-execution-warning"' in html
+    assert "信頼できるコードだけ" in html
+    assert "Start より前にトップレベルの Python が直ちに実行" in html
+    assert "Worker はセキュリティ sandbox ではなく" in html
+    assert "ネットワーク通信や同一オリジンのブラウザ機能" in html
+    assert 'aria-describedby="strategy-source-help strategy-execution-warning"' in html
+    assert (
+        'data-strategy-action="load" '
+        'aria-describedby="strategy-execution-warning"' in html
+    )
+    assert "localStorage に平文で保存" in html
+
+
 @pytest.mark.parametrize(
     "asset",
     ["request-coordinator.mjs", "board-ladder.mjs", "daily-chart.mjs"],
@@ -685,7 +701,7 @@ PYODIDE_BASE = (
 )
 STRATEGY_RELEASE_BASE = (
     "/static/strategy/releases/"
-    "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da"
+    "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d"
 )
 
 

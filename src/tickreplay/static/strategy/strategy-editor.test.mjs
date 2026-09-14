@@ -117,7 +117,10 @@ test('completion source is a fixed ABI-only list and never inspects runtime stat
 });
 
 test('enhancement exposes one editor, mirrors changes synchronously, and restores fallback', () => {
-  const textarea = element({ 'aria-labelledby': 'label', 'aria-describedby': 'help' });
+  const textarea = element({
+    'aria-labelledby': 'label',
+    'aria-describedby': 'help execution-warning',
+  });
   textarea.value = 'print(1)';
   textarea.selectionStart = 2;
   textarea.selectionEnd = 2;
@@ -143,6 +146,10 @@ test('enhancement exposes one editor, mirrors changes synchronously, and restore
   assert.equal(textarea.hidden, true);
   assert.equal(textarea.tabIndex, -1);
   assert.equal(container.view.contentDOM.getAttribute('role'), 'textbox');
+  assert.equal(
+    container.view.contentDOM.getAttribute('aria-describedby'),
+    'help execution-warning',
+  );
   container.view.dispatch({ changes: { from: 0, to: 8, insert: 'print(2)' } });
   assert.deepEqual(changes, ['print(2)']);
   assert.equal(textarea.value, 'print(1)', 'workspace owns raw textarea synchronization');
@@ -152,6 +159,7 @@ test('enhancement exposes one editor, mirrors changes synchronously, and restore
   assert.equal(textarea.value, 'print(2)');
   assert.equal(textarea.hidden, false);
   assert.equal(textarea.readOnly, false);
+  assert.equal(textarea.getAttribute('aria-describedby'), 'help execution-warning');
   assert.deepEqual(degraded, ['extension failed']);
   assert.equal(toolkit.destroyed(), 1);
   editor.dispose();

@@ -73,6 +73,23 @@ def on_event(event):
     assert second["commands"][0]["client_intent_id"] == "buy-3"
 
 
+def test_load_executes_top_level_python_before_start(runner_module):
+    source = """
+print("top-level marker during Load")
+def on_event(event):
+    return []
+"""
+
+    loaded = invoke(
+        runner_module,
+        {"operation": "load", "source": source, "filename": "load-marker.py"},
+    )
+
+    assert loaded["ok"] is True
+    assert loaded["callbacks"] == ["on_event"]
+    assert loaded["stdout"] == "top-level marker during Load\n"
+
+
 def test_strategy_object_form_supports_async_callbacks(runner_module):
     source = """
 class Strategy:
@@ -321,6 +338,26 @@ def test_request_and_source_limits_and_canonicalization(runner_module):
     parsed = json.loads(asyncio.run(runner_module.handle_json(oversized)))
     assert parsed["ok"] is False
     assert parsed["diagnostic"]["category"] == "request_limit"
+
+
+@pytest.mark.parametrize("line_count", [8192, 8193])
+@pytest.mark.parametrize("final_newline", [False, True])
+@pytest.mark.parametrize(
+    ("newline", "prefix"),
+    [("\n", ""), ("\r\n", "\ufeff")],
+    ids=["lf", "bom-crlf"],
+)
+def test_source_physical_line_limit_matches_canonical_contract(
+    runner_module, line_count, final_newline, newline, prefix
+):
+    lines = ["def on_event(event): return []", *(["# pad"] * (line_count - 1))]
+    source = prefix + newline.join(lines) + (newline if final_newline else "")
+
+    loaded = invoke(runner_module, {"operation": "load", "source": source})
+
+    assert loaded["ok"] is (line_count == runner_module.MAX_SOURCE_LINES)
+    if line_count > runner_module.MAX_SOURCE_LINES:
+        assert loaded["diagnostic"]["category"] == "source_limit"
 
 
 def test_end_ignores_returned_commands_and_dispose_is_idempotent(runner_module):

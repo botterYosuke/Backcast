@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const RELEASES_ROOT = join(ROOT, 'src/tickreplay/static/strategy/releases');
-const CURRENT_RELEASE_ID = '1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da';
+const CURRENT_RELEASE_ID = 'fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d';
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');

@@ -84,7 +84,7 @@ function nodeSubtle() {
   };
 }
 
-function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads = [] } = {}) {
+function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads = [], subtle = nodeSubtle() } = {}) {
   const { root, values } = workspaceDom(source);
   const windowObject = eventTarget({ matchMedia: () => ({ matches: false }) });
   const documentObject = eventTarget({ visibilityState: 'visible' });
@@ -158,7 +158,7 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
     host,
     release,
     storage,
-    subtle: nodeSubtle(),
+    subtle,
     makeId: (prefix) => `${prefix}-${++nextId}`,
     windowObject,
     documentObject,
@@ -321,6 +321,87 @@ test('common shortcuts map Load, Start, Stop and diagnostics without composition
   });
   await app.root.fire('keydown', { key: 'F8' });
   assert.equal(app.values.status.textContent, 'error: go here');
+  app.workspace.dispose();
+});
+
+test('new Load wins reversed hashing and Stop settles outstanding hash without publication', async () => {
+  const hashes = [];
+  const app = harness({ subtle: { digest: (_algorithm, bytes) => new Promise((resolve) => {
+    hashes.push({ bytes, resolve });
+  }) } });
+  const first = app.workspace.loadDraft({ source: 'first = 1', draftRevision: 1 }).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = app.workspace.loadDraft({ source: 'second = 2', draftRevision: 2 });
+  await new Promise((resolve) => setImmediate(resolve));
+  hashes.at(-1).resolve(createHash('sha256').update(hashes.at(-1).bytes).digest());
+  await second;
+  hashes[0].resolve(createHash('sha256').update(hashes[0].bytes).digest());
+  assert.equal((await first).code, 'load_superseded');
+  assert.equal(app.workspace.state().loadedSnapshot.source, 'second = 2');
+  const pending = app.workspace.loadDraft().catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.workspace.stop();
+  const outcome = await Promise.race([pending, new Promise((resolve) => setImmediate(() => resolve('unsettled')))]);
+  assert.equal(outcome.code, 'load_superseded');
+  app.workspace.dispose();
+});
+
+test('Stop and dispose before controller acquisition prevent any subsequent Load', async () => {
+  for (const action of ['stop', 'dispose']) {
+    const app = harness();
+    let releaseController;
+    app.release.loadController = () => new Promise((resolve) => { releaseController = resolve; });
+    const pending = app.workspace.loadDraft().catch((error) => error);
+    await app.workspace[action]();
+    releaseController(app.controller);
+    const result = await pending;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(result.code, 'load_superseded');
+    assert.equal(app.calls.some((call) => Array.isArray(call) && call[0] === 'load'), false);
+    assert.equal(app.calls.includes('attachController'), false);
+    assert.equal(app.workspace.state().loadedSnapshot, null);
+    app.workspace.dispose();
+  }
+});
+
+test('Load invalidates the prior controller before hashing a replacement', async () => {
+  const app = harness();
+  await app.workspace.loadDraft();
+  app.calls.length = 0;
+  const next = app.workspace.loadDraft();
+  assert.deepEqual(app.calls[0], ['invalidate', 'explicit_load']);
+  await next;
+  app.workspace.dispose();
+});
+
+test('canceled UI Loads settle quietly and raw recovery cancels pending hashing', async () => {
+  const app = harness({ subtle: { digest: () => new Promise(() => {}) } });
+  const clicking = app.values.load.fire('click');
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.workspace.stop();
+  await clicking;
+  assert.equal(app.values.status.textContent.includes('失敗しました'), false);
+  const pending = app.workspace.loadDraft().catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  app.workspace.enterRawRecovery(new Error('recovery'));
+  const outcome = await Promise.race([pending, new Promise((resolve) => setImmediate(() => resolve('unsettled')))]);
+  assert.equal(outcome.code, 'load_superseded');
+  app.workspace.dispose();
+});
+
+test('Import rejects oversized and wrong-extension files before reading and preserves identity', async () => {
+  const app = harness();
+  await app.workspace.loadDraft();
+  for (const file of [{ name: 'huge.py', size: 300_000 }, { name: 'source.txt', size: 2 }]) {
+    let reads = 0;
+    const before = app.workspace.state();
+    app.values.importInput.files = [{ ...file, arrayBuffer() { reads += 1; throw new Error('must not read'); } }];
+    await app.values.importInput.fire('change');
+    assert.equal(reads, 0);
+    for (const key of ['source', 'sourceHash', 'draftRevision', 'loadedSnapshot']) {
+      assert.deepEqual(app.workspace.state()[key], before[key]);
+    }
+  }
   app.workspace.dispose();
 });
 

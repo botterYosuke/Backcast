@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "release_id": "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d",
+  "entry_url": "/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs",
+  "identity": {
+    "schema_version": 1,
+    "files": [
+      {
+        "name": "strategy-assets.mjs",
+        "bytes": 974,
+        "sha256": "e3610fa23a87f5ee8215106b8ab8635185ea9ef03f15d0928c3e07ed1bc0f808"
+      },
+      {
+        "name": "strategy-controller.mjs",
+        "bytes": 30337,
+        "sha256": "0c5662920fca7ebfff8683820d5b2101466d5d359125de81bd198316c77553e8"
+      },
+      {
+        "name": "strategy-editor.mjs",
+        "bytes": 8925,
+        "sha256": "5c6294b48c7fc0e63887223409c90901ff7805e21a3a5d0cb4c010777e57d1ff"
+      },
+      {
+        "name": "strategy-protocol.mjs",
+        "bytes": 24959,
+        "sha256": "3b5e84092320a5fed7c866994630ad4a188e450686301518102a5bb74f35ac00"
+      },
+      {
+        "name": "strategy-release.mjs",
+        "bytes": 1527,
+        "sha256": "678255a57d4a4440e6faccdb3885c79e536657d85555e290ddb0a4b49f491bb9"
+      },
+      {
+        "name": "strategy-runner.py",
+        "bytes": 19398,
+        "sha256": "e52541d2f7d20279f6cd8941d54cbd7ad26155c5ad91eb9689a06831d708eb6d"
+      },
+      {
+        "name": "strategy-source-store.mjs",
+        "bytes": 12199,
+        "sha256": "efd73d57c41d86620da2377f09191fc93465ed82bae9a0096bf60245b493622d"
+      },
+      {
+        "name": "strategy-worker.mjs",
+        "bytes": 9733,
+        "sha256": "35a067ec05fe0e058f229df65ced82fd7614a545eae4f8b9d5442ab12c46735c"
+      },
+      {
+        "name": "strategy-workspace.mjs",
+        "bytes": 33444,
+        "sha256": "718a8d41a62d003adb5e7e3affbfa734fd7e8e337d8520a0fa67f73e6a6e54ce"
+      }
+    ],
+    "vendor": {
+      "codemirror": {
+        "asset_set_id": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+        "manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c"
+      },
+      "pyodide": {
+        "version": "0.27.6",
+        "asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
+        "manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e"
+      }
+    }
+  }
+}

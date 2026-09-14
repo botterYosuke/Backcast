@@ -2,6 +2,8 @@
 
 Status: planning only; no application implementation is included in this document. CodeMirror 6 was approved for the first user-facing strategy editor on 2026-09-10.
 
+Revision 2026-09-14: the original feature is implemented in commit `26cc86ec`; the historical proposal and Steps 0–14 below are retained for provenance. The user approved review remediation and implementation after adding the agreed invariants and acceptance criteria. The **Review remediation (2026-09-14)** section is the active work order and supersedes conflicting historical assumptions for this run. It retains the implemented Pyodide 0.27.6 / Python 3.12.7 pins and existing frozen fixtures/configuration; the earlier proposed 314.0.6 pin and already-resolved original Open Questions are not new prerequisites. This authorization covers local implementation and verification, not deployment or traffic changes.
+
 ### Purpose
 
 Enable a user to author a Python strategy in an embedded CodeMirror 6 editor, run it in the browser during TickReplay, receive host-provided market and account state only after it has occurred, and submit simulated order intents through the existing paper-trading rules. The design must keep the UI responsive, make successful in-budget callbacks independent of replay speed and Worker timing, preserve the existing manual-order behavior, and prevent stale or malformed Python results from mutating replay state. Because same-origin browser Python can call Web APIs itself, “host-provided past-only snapshots” is an API contract, not a technical guarantee that trusted user code cannot fetch other data.
@@ -570,6 +572,96 @@ This is a decision-only gate: record approved requirements and numeric values, b
 - [ ] On any feature canary/promotion failure, restore traffic and headers to the compatibility revision without deleting either generation. A supported-age feature page must continue to load new editor/Pyodide assets from that rollback target; only a page beyond the declared age may enter documented recovery. Fresh navigation must load the prior entry points. Older images that lack new assets are never direct rollback targets for this release.
 
 **Verification**: Documentation and a two-stage rollback rehearsal are complete before feature enforcement or traffic. The documented sample passes the real-browser golden fixture, protocol/ABI versions match, and an independent reviewer reproduces assets, deterministic checks, local smoke tests, compatibility-image publication, and rollback from a clean checkout. Production first runs fully on the verified compatibility revision; the enforced-policy feature canary and repeated primary fixture then pass with zero unexplained violations. Incremental promotion, supported-age delayed loads after rollback, beyond-window recovery, and fresh navigation match the runbook exactly, and no older asset-incomplete revision is selected as rollback target.
+
+### Review remediation (2026-09-14)
+
+This active revision incorporates [security S1–S2](../research/review-security-python-code-feature.md), [quality Q1–Q3](../research/review-quality-python-code-feature.md), and [coverage T1–T6](../research/review-tests-python-code-feature.md). Q1, Q2, and S1 are the three blocking Medium defects; T1–T3 are their regression obligations, not extra defects. T5 production integration is now a mandatory merge/promotion gate. S2/Q3/T4/T6 remain Low in severity but are included in this authorized completion run after the Medium fixes. Existing preflight repairs and unrelated worktree changes must be preserved.
+
+##### Active scope and ownership
+
+- Lifecycle: canonical `src/tickreplay/static/strategy/strategy-controller.mjs`, `strategy-workspace.mjs`, their `.test.mjs` suites, and `strategy-editor.mjs` only if the editor accessibility integration requires it.
+- Numeric transactions: `src/tickreplay/static/order-broker.mjs`, `replay-commit.mjs`, their tests, `paper-trading.mjs` only for minimal reusable pure helpers, and `app.js` for transactional replay integration. Keep protocol validation authoritative; change `strategy-protocol.mjs` only if sharing its validation prevents semantic drift.
+- Execution warning: `src/tickreplay/static/index.html`, minimal `styles.css`, `strategy-editor.mjs` and its test, `tests/test_tickreplay_server.py`, `tests/test_tickreplay_strategy_runner.py`, and `tests/browser/application-strategy.mjs`.
+- Source boundaries: canonical `strategy-source-store.mjs`, `strategy-workspace.mjs`, their tests, and protocol/native-runner parity tests.
+- Production bridge: canonical `strategy-worker.mjs` only when new error-path tests expose a defect, controller/Worker tests (create `strategy-worker.test.mjs` if separation improves ownership), and the actual-app browser tests/harness needed for deterministic fixtures.
+- Build safety: `scripts/fetch_pyodide_assets.py`, `scripts/build_strategy_images.py` only as required by failing negative tests; new focused `tests/test_fetch_pyodide_assets.py` and `tests/test_build_strategy_images.py`.
+- Integration-owned output: a new `src/tickreplay/static/strategy/releases/<content-id>/` closure, current references/configuration in `app.js` and `tests/browser/strategy-assets.mjs`, `cloud-run/strategy-spike-images.json`, and `docs/tick-replay.md`. One integrator generates the release after all canonical edits; no executor modifies retained release bytes.
+- No dependency upgrades, accounting redesign, new origin/security architecture, actual image publication, deployment, or traffic changes are part of remediation. The shared main-agent identity is unchanged.
+
+##### Required invariants
+
+1. **Load admission and ownership.** The last synchronously accepted Load wins. Both workspace admission (before controller acquisition or source hashing) and controller admission (before invalidation) reserve an identity before their first asynchronous operation. Stop/dispose advances the relevant generation even if hashing/controller acquisition is still pending. Each attempt owns its candidate Worker, pending request and settlement, interrupt buffer, timers, listeners, and finalization. A stale hash, response, error, timeout, or cleanup may only finalize its own resources: it cannot publish or clear a newer attempt's source/hash/revision/status/loaded/run state, interrupt a newer Worker, cancel a newer run's orders, or release a newer replay barrier. Superseded work settles deterministically without unhandled rejection. Each discarded Worker terminates exactly once; after final Stop/dispose every created Worker has terminated exactly once. The accepted active Worker remains alive until its own lifecycle ends.
+2. **Transactional numeric closure.** Every candidate state and complete Worker-bound snapshot has finite numeric values; ABI quantity, aggregate position, price level, cursor/ID/sequence fields, and minor-unit amounts are safe integers in their existing signed/positive ranges. Validate cash, realized P&L, unrealized P&L, equity, and any average-price conversion; also validate price-only/no-fill movement. Individual safe quantities are insufficient when their aggregate or price product exceeds the ABI. Validate candidate broker state plus the exact serialization/conversion used for Start/event/end before the authoritative swap or message send, without clamping, saturation, or silent rounding of invalid values. Existing documented minor-unit conversion semantics remain valid; a general manual-accounting rewrite is excluded. A typed range/representation error rejects the entire proposed transaction and sends no invalid ABI message. Portfolio, orders, fills, events, all allocation IDs, replay/delivery cursors, staged batch and intent ledgers remain byte/value-equivalent to their prior authoritative state at the rejection boundary. Subsequent terminal strategy cleanup is a separate existing lifecycle operation and must not be mistaken for partial transaction acceptance. If legacy manual-only state cannot be represented, Start must reject before starting a run; ordinary manual-only behavior remains characterized and compatible.
+3. **Visible execution boundary.** Persistent text next to Load states: load only trusted code; Load immediately executes top-level Python before Start; the Worker is not a security sandbox and code can use browser networking/same-origin capabilities. Preserve the plaintext-storage notice. Connect the warning to Load and the actual focused editor input using `aria-describedby`, merging existing descriptions. The warning remains visible and accessible in enhanced and degraded editor modes before execution; no repeated confirmation dialog is required.
+4. **Release identity.** Changes to canonical strategy modules require a newly generated content-addressed release and updated current entry/config/image-input references. Existing release identities and bytes are immutable. Reconstruction and retained-release integrity are blocking checks, not optional follow-up work.
+5. **Production integration.** A passing fake Worker or native Python runner alone is insufficient. The real production release Worker must run its actual bundled Python and return commands through the actual replay/broker commit path in a deterministic browser fixture. This test is required before merge/promotion and is separate from timing benchmarks.
+
+##### Ordered implementation steps
+
+R0. **Freeze this revision before implementation.** Record the invariants in DESIGN through the typed writer; validate this plan's shape/existence and obtain a read-only Codex adequacy assessment. The user's instruction already authorizes implementing this revision; no repeated approval is needed. A timeout is recorded as an unverified consultation, never PASS. The lead must make the remaining gate disposition explicit before proceeding.
+
+R1. **Q1/T1 lifecycle, Red → Green → regression.** Add deterministic deferred invalidation/hash/Worker/timer tests that fail on the reviewed controller/workspace. Then reserve Load synchronously and make ownership/finalization attempt-local with stale-publication guards. Re-run the matrix below plus existing start/end/interrupt/manual-order cleanup tests. Avoid using UI button disabling as the correctness boundary.
+
+R2. **Q2/T2 numeric closure, Red → Green → regression.** Add failed transaction snapshots for the reproduced MAX_SAFE_INTEGER buy at price 100, aggregate and derived-value overflow, both sides, and no-fill movement. Then compute and validate the complete candidate state/ABI before swap, including replay cursor ownership; keep the conversion used by validation identical to the outgoing snapshot. Re-run broker/replay/protocol/native-runner and manual characterization tests, proving valid boundaries pass and the next valid lifecycle message remains usable after rejection/reset as applicable.
+
+R3. **S1/T3 warning, Red → Green → regression.** First add the missing persistent/accessibility assertions and a harmless Load-only top-level execution fixture. Then add the copy and described-by wiring without losing current storage descriptions. Verify enhanced/degraded render paths and Load without Start through both native runner and production browser.
+
+R4. **S2/Q3/T4/T6 Low completion.** Add then satisfy import pre-read size/name rejection, decoder raw-byte bounds, source line parity, and temporary-tree build/fetch failure tests. Allow bounded BOM/CRLF canonicalization overhead rather than accidentally rejecting permitted canonical inputs. Assert failed imports preserve draft/hash/revision and build failures preserve existing destination bytes. Use mocked network/subprocess seams for negative tests. Lifecycle/numeric owners finish first where files overlap; coordinate `strategy-workspace.mjs` edits explicitly.
+
+R5. **T5 production bridge and immutable integration.** Add focused real Worker failure/cleanup tests and the production-app fixture below. Once canonical changes from R1–R4 and any Worker fixes are stable, generate a new release via `node scripts/build_strategy_release.mjs --write`; update references using existing builder outputs and regenerate image-input metadata with the existing script. Then run the real-browser fixture against that new immutable release. Any further canonical change requires regeneration and revalidation before final acceptance. Do not alter existing releases to obtain parity.
+
+R6. **Independent review and final gates.** Security, quality, and test reviewers inspect the complete final diff and new evidence. Resolve blocking findings, then run relevant verification again for changed areas. Record commands, first failures, retries, actual browser versions, unrun gates, and the final release ID. Update the runbook and working-state handoff. Existing pinned performance and deployment/browser compatibility gates remain explicit; local application completion does not imply production promotion.
+
+##### Acceptance matrix
+
+| Area | Cases | Required observable result / executable suite |
+| --- | --- | --- |
+| Load admission | Double Load from ready/loading; reversed deferred hash completion; Load → Stop; Load → Stop → Load; Stop/dispose before controller acquisition resolves | Only the last accepted source/hash/revision/status publishes; every Promise settles; no orphan Worker or unhandled rejection. `strategy-controller.test.mjs`, `strategy-workspace.test.mjs` |
+| Stale lifecycle | Old response, error, messageerror, progress/log and timer after replacement; delayed end/interrupt finalization; repeated Stop/dispose | Old callback cannot affect new Worker/run/barrier/order ownership; discarded Worker termination exactly once; all Workers exactly once after final shutdown; no retained pending request/timer/listener. Controller/Worker/workspace suites |
+| Numeric inputs and aggregates | Safe boundary and boundary+1 for quantity/position/price/minor amounts; positive/negative and buy/sell; accumulated positions, high prices, close/reversal, nonfinite derived values | Representable boundary passes; violation yields typed error before swap or postMessage. Broker/replay/protocol suites |
+| Portfolio closure | cash, realized/unrealized P&L, equity and serialized average price; no-fill price changes; Start from incompatible legacy manual state | Complete snapshot valid on every accepted Start/event/end; no invalid outgoing ABI; ordinary manual-only characterization remains unchanged. Broker/replay/protocol/native-runner suites |
+| Atomic rollback | Every numeric failure including multiple commands/fills in one candidate tick | Portfolio/orders/fills/events/IDs/cursor/staged and intent ledgers unchanged, no consumed replay tick or partial command acceptance; next valid operation behaves consistently. Broker/replay suites |
+| Trust and accessibility | Warning visible before Load; enhanced and degraded editor; actual input and Load accessible descriptions | All three trust/execution/capability statements present; original storage notice retained; `aria-describedby` IDs resolve and warning is perceivable. Server/editor/workspace and real app browser tests |
+| Load execution | Harmless top-level marker/print and valid `on_event`; issue Load without Start | Marker appears during Load and no Start/run callback was needed. Native runner and production app browser tests |
+| Real Worker causal path | Production immutable Worker + actual Python; submit at event i, two Steps, cancel pending order, Stop, restart | No fill at i; exact fill only at i+1; exact portfolio and cursor; cancellation affects only owned orders; Stop cleans up; restart processes fresh events without stale output. `tests/browser/application-strategy.mjs` |
+| Worker failures | Runner `ok=false`, loader/fetch/JSON conversion failure, messageerror/postMessage failure, stale/malformed identities, temporary proxy failure cleanup | Structured error identity propagated, bounded logs, pending settlement and complete proxy/Worker cleanup; no orders committed. Canonical Worker/controller tests; deterministic production Python error browser case |
+| Import bounds | Oversized/wrong-extension fake File whose `arrayBuffer` throws if called; raw decoder over-limit; BOM/CRLF permitted overhead | Reject before reading/decoding oversized input; preserve old draft/hash/revision; valid canonical source still accepted. Source-store/workspace suites |
+| Line parity | Exactly 8192/8193 physical lines with/without final LF; BOM and CRLF canonicalization | Store, protocol and Python runner agree; longest-line limit remains enforced. Source-store/protocol/native-runner suites |
+| Build/fetch failures | Byte-size/hash/allowlist mismatch; invalid manifest/Git OID/path; missing or ambiguous matching release; malformed response/subprocess failure | Explicit failure; existing destination tree/manifest unchanged; no network required for negative tests. New Python build/fetch tests |
+| Release closure | New canonical files and current references; all retained release manifests and bytes | New content ID reconstructs exactly, old release bytes unchanged, vendor closure/config/image input checks pass. Existing release/asset suites and five integrity commands below |
+
+##### Executable validation
+
+Run focused suites at each Red/Green step and preserve failure/exit evidence. Before completion, run:
+
+```sh
+.venv/bin/python .agents/skills/_shared/validate_doc.py --contract plan-doc --file .agents/docs/plans/pyodide-replay-strategy.md
+.venv/bin/python .agents/skills/_shared/workspace.py --skill plan --slug pyodide-replay-strategy --verify
+node --test src/tickreplay/static/*.test.mjs src/tickreplay/static/strategy/*.test.mjs tests/browser/*.test.mjs
+uv run pytest -q tests/test_tickreplay_strategy_runner.py tests/test_tickreplay_server.py tests/test_fetch_pyodide_assets.py tests/test_build_strategy_images.py
+node scripts/build_strategy_editor.mjs --check
+node scripts/build_strategy_release.mjs --check
+node scripts/build_strategy_release.mjs --check-config tests/browser/strategy-assets.mjs
+uv run python scripts/build_strategy_images.py --check
+uv run python scripts/fetch_pyodide_assets.py --check
+node_modules/.bin/playwright test --config tests/browser/playwright.config.mjs application-strategy.mjs --project=chromium --project=mobile-chromium
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check src/
+uv run pytest -q
+bash .agents/check.sh
+git diff --check
+```
+
+The pinned browser command is the promotion evidence. For available local Chrome, prefix it with `STRATEGY_SPIKE_USE_SYSTEM_CHROME=1 STRATEGY_SPIKE_PYTHON='.venv/bin/python'` and record the actual Chrome version; that result is local Chromium coverage, not locked CI/Firefox/WebKit/real-device proof. Run the existing benchmark/browser matrix under its existing thresholds when qualifying promotion, and report a prior failure even if a retry passes. Offline/mock negative tests are mandatory independently of the real fetch reconstruction check. No tests are weakened, deleted, or skipped to make these gates green.
+
+##### Active risks and open questions
+
+- Plan gate evidence (2026-09-14): document contract and workspace verification passed with no missing sections/artifacts or warnings; `git diff --check` passed. Typed DESIGN writer applied four decisions, three NFR rows, and one architecture addition with zero skipped duplicates. Mandatory read-only Codex step decomposition and adequacy calls both returned wrapper exit 3 after 180 seconds, `timed_out=true`, `response_chars=0` (durations 180.016s and 180.011s). Their logs are `.agents/logs/codex/20260913T211517Z-plan-pyodide-replay-strategy-remediation-steps.*` and `.agents/logs/codex/20260913T211841Z-plan-pyodide-replay-strategy-remediation-validate.*`. There is no independent Codex PASS; adequacy remains an explicitly unverified gate for the lead to disposition. The revision was independently checked against all three stored reports and narrow current source/harness paths; implementation acceptance tests have not been run by the plan editor.
+- No unresolved product choice blocks this remediation. Historical Step 0 choices remain governed by `tests/browser/step0-decisions.json`, `browser-lock.json`, frozen fixtures, and the implemented ABI; do not reopen them as dependency upgrades.
+- Numeric enforcement must protect strategy-active transactions and outgoing ABI without broadening changes into manual-only accounting. Inspect and test both boundaries explicitly.
+- This revision does not represent any unexecuted local/browser/pinned CI/production check as passed. Codex validation status and any inaccessible required gate must be reported separately from document-shape success and from the user's implementation authorization.
+- The original Risks section, Open Questions, and Steps 0–14 remain historical context except for continuing compatibility/security/deployment obligations; the active remediation work is R0–R6 above.
 
 ### Risks & Considerations
 

@@ -40,7 +40,10 @@ def sha256_file(path: Path) -> str:
 
 
 def read_json(path: Path) -> dict[str, object]:
-    return json.loads(path.read_text())
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object: {path}")
+    return value
 
 
 def one_directory(root: Path) -> Path:

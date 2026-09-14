@@ -3,6 +3,9 @@ import {
   classifyClick,
   createPortfolio,
   isFilled,
+  strategyPortfolioSnapshot,
+  assertStrategyInteger,
+  StrategyRepresentationError,
 } from './paper-trading.mjs';
 
 'use strict';
@@ -208,6 +211,7 @@ export function createOrderBroker(options = {}) {
     options[key] ?? DEFAULT_BROKER_LIMITS[key],
   ]));
   const priceForLevel = options.priceForLevel || ((level) => level);
+  const priceLevelForPrice = options.priceLevelForPrice || ((price) => Math.round(price));
   const faultInjector = options.faultInjector || (() => {});
   const state = {
     portfolio: createPortfolio(),
@@ -248,6 +252,41 @@ export function createOrderBroker(options = {}) {
 
   function exportState() {
     return JSON.stringify(snapshot());
+  }
+
+  function validateNumericRecord(record) {
+    for (const [field, value] of Object.entries(record)) {
+      if (typeof value !== 'number') continue;
+      if (!Number.isFinite(value)) throw new StrategyRepresentationError(field);
+      if (['price', 'pnl', 'time'].includes(field)) {
+        if (field === 'price' && value <= 0) throw new StrategyRepresentationError(field);
+        if (field === 'price') assertStrategyInteger(priceLevelForPrice(value), 'price_level', 1);
+        if (field === 'pnl') assertStrategyInteger(Math.round(value * 100), 'pnl_minor');
+      } else {
+        assertStrategyInteger(value, field, ['eligibleFromSessionTick'].includes(field) ? 0 : 1);
+      }
+    }
+  }
+
+  function validateCandidate(candidate, lastPrice, { history = false } = {}) {
+    strategyPortfolioSnapshot(candidate.portfolio, lastPrice, priceLevelForPrice);
+    for (const field of ['nextOrderId', 'nextFillId', 'nextSubmissionSequence']) {
+      assertStrategyInteger(candidate[field], field, 1);
+    }
+    candidate.orders.forEach(validateNumericRecord);
+    for (const ledger of candidate.runLedgers.values()) {
+      for (const field of ['acceptedCommandCount', 'lastAppliedSequence', 'fillCursor']) {
+        assertStrategyInteger(ledger[field], field, 0);
+      }
+    }
+    if (history) {
+      candidate.fills.forEach(validateNumericRecord);
+      candidate.events.forEach(validateNumericRecord);
+    }
+  }
+
+  function validateStrategyState(lastPrice = state.portfolio.avgPrice) {
+    validateCandidate(state, lastPrice, { history: true });
   }
 
   function appendFill(transaction, order, price, time, fillDeliverySequence = null) {
@@ -304,9 +343,11 @@ export function createOrderBroker(options = {}) {
       (order) => order.source === 'manual' && order.side === side && order.level === level,
     );
     if (existing) {
-      state.orders = state.orders.map((order) => (
+      const orders = state.orders.map((order) => (
         order === existing ? { ...order, qty: order.qty + quantity } : order
       ));
+      if (state.runLedgers.size) orders.forEach(validateNumericRecord);
+      state.orders = orders;
       return { kind: 'limit_aggregated', order: state.orders.find((order) => order.id === existing.id) };
     }
     const order = {
@@ -320,6 +361,11 @@ export function createOrderBroker(options = {}) {
       price,
       qty: quantity,
     };
+    if (state.runLedgers.size) {
+      validateNumericRecord(order);
+      assertStrategyInteger(state.nextOrderId + 1, 'nextOrderId', 1);
+      assertStrategyInteger(state.nextSubmissionSequence + 1, 'nextSubmissionSequence', 1);
+    }
     state.orders = [...state.orders, order];
     state.nextOrderId += 1;
     state.nextSubmissionSequence += 1;
@@ -347,6 +393,11 @@ export function createOrderBroker(options = {}) {
       qty: quantity,
     };
     const fill = appendFill(transaction, order, price, time);
+    if (state.runLedgers.size) {
+      validateCandidate({ ...state, ...transaction, nextSubmissionSequence: state.nextSubmissionSequence + 1 }, price);
+      validateNumericRecord(fill);
+      transaction.events.slice(state.events.length).forEach(validateNumericRecord);
+    }
     state.portfolio = transaction.portfolio;
     state.fills = transaction.fills;
     state.events = transaction.events;
@@ -395,6 +446,7 @@ export function createOrderBroker(options = {}) {
   function beginStrategyRun(identity) {
     const key = runKey(identity);
     if (state.orders.length > limits.maxLiveOrders) validationError('live_order_limit');
+    validateStrategyState();
     if (state.runLedgers.has(key)) return cloneLedger(state.runLedgers.get(key));
     const normalizedIdentity = {
       session: canonicalSession(identity.session),
@@ -428,6 +480,7 @@ export function createOrderBroker(options = {}) {
     if (batch.eligibleFromSessionTick !== batch.observedSessionTickIndex + 1) {
       validationError('invalid_eligibility');
     }
+    assertStrategyInteger(batch.eligibleFromSessionTick, 'eligibleFromSessionTick', 0);
     if (!Array.isArray(batch.commands)) validationError('invalid_commands');
     if (batch.commands.length > limits.maxCommandsPerEvent) validationError('event_command_limit');
     const key = runKey(batch);
@@ -540,6 +593,9 @@ export function createOrderBroker(options = {}) {
       lastAppliedSignature: signature,
     });
     faultInjector('prepare_ledger');
+    validateCandidate({
+      ...state, orders: nextOrders, nextOrderId, nextSubmissionSequence, runLedgers: nextRunLedgers,
+    }, state.portfolio.avgPrice);
     faultInjector('before_swap');
 
     state.orders = nextOrders;
@@ -609,6 +665,8 @@ export function createOrderBroker(options = {}) {
       deliveryLedger = state.runLedgers.get(deliveryKey);
       if (!deliveryLedger) validationError('unknown_strategy_run');
     }
+    const strict = Boolean(deliveryLedger || state.runLedgers.size);
+    if (strict) validateCandidate(state, tradePrice);
 
     const filledOrders = state.orders
       .filter((order) => (
@@ -639,7 +697,12 @@ export function createOrderBroker(options = {}) {
     const committedFills = filledOrders.map((order) => {
       const deliverySequence = capacityViolation || !deliveryLedger ? null : ++nextFillCursor;
       const fillPrice = order.kind === 'market' ? tradePrice : order.price;
-      return appendFill(transaction, order, fillPrice, time, deliverySequence);
+      const fill = appendFill(transaction, order, fillPrice, time, deliverySequence);
+      if (strict) {
+        strategyPortfolioSnapshot(transaction.portfolio, tradePrice, priceLevelForPrice);
+        validateNumericRecord(fill);
+      }
+      return fill;
     });
 
     if (deliveryLedger && !capacityViolation) {
@@ -648,6 +711,10 @@ export function createOrderBroker(options = {}) {
         ...cloneLedger(deliveryLedger),
         fillCursor: nextFillCursor,
       });
+    }
+    if (strict) {
+      validateCandidate({ ...state, ...transaction }, tradePrice);
+      transaction.events.slice(state.events.length).forEach(validateNumericRecord);
     }
     state.portfolio = transaction.portfolio;
     state.orders = transaction.orders;
@@ -683,6 +750,17 @@ export function createOrderBroker(options = {}) {
       fills.push(...result.fills);
     }
     return { kind: 'range_matched', fills };
+  }
+
+  /** Prepare a whole tick privately, including the prior event's command batch. */
+  function commitStrategyTick({ batch, beforePublish, ...tick }) {
+    const candidate = createOrderBroker(options);
+    Object.assign(candidate.state, state, { portfolio: clonePortfolio(state.portfolio) });
+    if (batch) candidate.commitStrategyBatch(batch, { sessionTickIndex: tick.sessionTickIndex });
+    const matched = candidate.matchTick(tick);
+    const prepared = beforePublish(candidate, matched);
+    Object.assign(state, candidate.state);
+    return { matched, prepared };
   }
 
   function truncateAt(targetTime) {
@@ -754,10 +832,12 @@ export function createOrderBroker(options = {}) {
     discardFinalStrategyBatch,
     cancelStrategyRunOrders,
     matchTick,
+    commitStrategyTick,
     matchRange,
     truncateAt,
     reset,
     strategyOpenOrders,
     portfolioSnapshot,
+    validateStrategyState,
   });
 }

@@ -19,18 +19,19 @@
     "immutable_overlay": {
       "codemirror_bundle_version": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
       "codemirror_manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c",
-      "overlay_payload_bytes": 15063529,
+      "overlay_payload_bytes": 15207507,
       "pyodide_asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
       "pyodide_manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e",
       "retained_strategy_release_ids": [
         "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
         "645a8821cbda8281794ccb7714806a80db04c40e7f4d2419eb55f2054e938514",
         "b82b5f75fd84822b19e28f5b581788af118c066c1ba9eb7e04f1ce32522b4cd9",
-        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37"
+        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37",
+        "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d"
       ],
-      "strategy_release_entry_url": "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs",
-      "strategy_release_id": "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
-      "strategy_release_manifest_sha256": "ab6afd52deb3b886096683859e492413021f3386a6878b72f5ac3d43b81b2146"
+      "strategy_release_entry_url": "/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs",
+      "strategy_release_id": "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d",
+      "strategy_release_manifest_sha256": "8fa95bd2b4ae540bf7e27dab4d1b9dd3be9b76d1b7e0abf59ecaa65bdbabe4a7"
     },
     "rollback_eligible": true
   },
@@ -38,36 +39,37 @@
     "base_revision": "working-tree-release-input",
     "entry_files": {
       "src/tickreplay/static/app.js": {
-        "bytes": 93798,
-        "sha256": "ac56d855913496ed2e42f9c9f36780d0288bb3b17f00660c096ef2abe5d9b55e"
+        "bytes": 93889,
+        "sha256": "85b1b2a4d38648cc1d10e3bbd2c06a60d7d6e0d540bc0124bfc82b93ebc78b97"
       },
       "src/tickreplay/static/index.html": {
-        "bytes": 12022,
-        "sha256": "1a22b8f83f2effe4589a873d7743d5f4109fa7de8e4bc00417264a427fa9fcf4"
+        "bytes": 12541,
+        "sha256": "cf1d52eae3af0dc3415d2b52792eb8c26e1dfe679a02ea92134a6259ee638327"
       },
       "src/tickreplay/static/styles.css": {
-        "bytes": 23331,
-        "sha256": "e9f5354dc3a7b82219892af6f64c65168e61e97da2488db67b0b2cd4a9b68a25"
+        "bytes": 23542,
+        "sha256": "1d22b14efa1e992b9fbc4d0e3cd7944e60101268d990ae9103fd2309f152a041"
       }
     },
     "feature_entry_points": [
-      "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs"
+      "/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs"
     ],
     "immutable_overlay": {
       "codemirror_bundle_version": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
       "codemirror_manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c",
-      "overlay_payload_bytes": 15063529,
+      "overlay_payload_bytes": 15207507,
       "pyodide_asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
       "pyodide_manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e",
       "retained_strategy_release_ids": [
         "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
         "645a8821cbda8281794ccb7714806a80db04c40e7f4d2419eb55f2054e938514",
         "b82b5f75fd84822b19e28f5b581788af118c066c1ba9eb7e04f1ce32522b4cd9",
-        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37"
+        "ef78d32fc3a4578d93d92e87857b406f29d89f545119fa7091c0175cbdddbd37",
+        "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d"
       ],
-      "strategy_release_entry_url": "/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs",
-      "strategy_release_id": "1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da",
-      "strategy_release_manifest_sha256": "ab6afd52deb3b886096683859e492413021f3386a6878b72f5ac3d43b81b2146"
+      "strategy_release_entry_url": "/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs",
+      "strategy_release_id": "fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d",
+      "strategy_release_manifest_sha256": "8fa95bd2b4ae540bf7e27dab4d1b9dd3be9b76d1b7e0abf59ecaa65bdbabe4a7"
     },
     "rollback_eligible": false
   },

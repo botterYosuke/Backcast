@@ -162,7 +162,7 @@
           class="strategy-source"
           data-strategy-source
           aria-labelledby="strategy-source-label"
-          aria-describedby="strategy-source-help"
+          aria-describedby="strategy-source-help strategy-execution-warning"
           aria-readonly="true"
           readonly
           spellcheck="false"
@@ -181,9 +181,13 @@ def on_end(summary):
 </textarea>
         <div class="strategy-editor" data-strategy-editor hidden></div>
 
+        <p id="strategy-execution-warning" class="strategy-execution-warning" role="note">
+          警告: 信頼できるコードだけを Load してください。Load を押すと Start より前にトップレベルの Python が直ちに実行されます。
+          Worker はセキュリティ sandbox ではなく、コードはネットワーク通信や同一オリジンのブラウザ機能を利用できます。
+        </p>
         <div class="strategy-actions" role="toolbar" aria-label="Python 戦略操作">
           <button type="button" data-strategy-action="save" disabled>Save Draft</button>
-          <button type="button" data-strategy-action="load" disabled>Load</button>
+          <button type="button" data-strategy-action="load" aria-describedby="strategy-execution-warning" disabled>Load</button>
           <button type="button" data-strategy-action="start" disabled>Start</button>
           <button type="button" data-strategy-action="stop" disabled>Stop</button>
           <button type="button" data-strategy-action="restart" disabled>Restart</button>

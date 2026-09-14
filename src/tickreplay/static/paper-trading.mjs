@@ -15,6 +15,50 @@ export function createPortfolio() {
   return { qty: 0, avgPrice: 0, realized: 0, entryCount: 0, exitCount: 0 };
 }
 
+export class StrategyRepresentationError extends RangeError {
+  constructor(field) {
+    super(`Strategy state cannot represent ${field}`);
+    this.name = 'StrategyRepresentationError';
+    this.code = 'strategy_representation_error';
+  }
+}
+
+export function assertStrategyInteger(value, field, minimum = Number.MIN_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new StrategyRepresentationError(field);
+  }
+  return value;
+}
+
+/** The same checked minor-unit projection is used before commit and dispatch. */
+export function strategyPortfolioSnapshot(portfolio, lastPrice, priceLevelForPrice = (price) => price) {
+  for (const field of ['qty', 'avgPrice', 'realized', 'entryCount', 'exitCount']) {
+    if (!Number.isFinite(portfolio[field])) throw new StrategyRepresentationError(field);
+  }
+  assertStrategyInteger(portfolio.qty, 'position_quantity');
+  assertStrategyInteger(portfolio.entryCount, 'entryCount', 0);
+  assertStrategyInteger(portfolio.exitCount, 'exitCount', 0);
+  if (portfolio.qty && (!Number.isFinite(lastPrice) || lastPrice <= 0 || portfolio.avgPrice <= 0)) {
+    throw new StrategyRepresentationError('valuation_price');
+  }
+  const unrealized = portfolio.qty ? (lastPrice - portfolio.avgPrice) * portfolio.qty : 0;
+  const cash = portfolio.realized - portfolio.qty * portfolio.avgPrice;
+  const projected = {
+    cash_minor: Math.round(cash * 100),
+    position_quantity: portfolio.qty,
+    average_price_level: portfolio.qty ? priceLevelForPrice(portfolio.avgPrice) : null,
+    realized_pnl_minor: Math.round(portfolio.realized * 100),
+    unrealized_pnl_minor: Math.round(unrealized * 100),
+    equity_minor: Math.round((portfolio.realized + unrealized) * 100),
+  };
+  for (const [field, value] of Object.entries(projected)) {
+    if (field === 'average_price_level') {
+      if (value !== null) assertStrategyInteger(value, field, 1);
+    } else assertStrategyInteger(value, field);
+  }
+  return projected;
+}
+
 /** 現在の建玉方向。'buy' / 'sell' / null（ノーポジ）。 */
 export function positionSide(portfolio) {
   if (portfolio.qty > 0) return 'buy';

@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { createRequestEnvelope } from './strategy-protocol.mjs';
+
+function validateSourceText(source) {
+  return createRequestEnvelope({ phase: 'load', requestId: 'parity',
+    session: { stem: '7203', code: '7203', actual_date: '2026-09-10', generation: 1 },
+    runId: null, source: { source_hash: 'a'.repeat(64), strategy_revision: 1, load_attempt_id: 'parity' },
+    sequence: 0, payload: { source, filename: 'strategy.py', assets: {
+      loader_url: '/loader.mjs', index_url: '/pyodide/', runner_url: '/runner.py',
+    } } });
+}
 
 import {
   AUTOSAVE_DELAY_MS,
@@ -226,4 +236,31 @@ test('Python import accepts one strict UTF-8 .py file and is non-destructive on 
     () => decodePythonFile('strategy.py', Uint8Array.from([0xc3, 0x28])),
     (error) => error.code === 'invalid_utf8',
   );
+});
+
+test('physical line boundaries match protocol with final LF, BOM and CRLF', () => {
+  for (const count of [8192, 8193]) {
+    for (const ending of ['', '\n']) {
+      const source = Array(count).fill('#').join('\n') + ending;
+      for (const raw of [source, `\ufeff${source.replaceAll('\n', '\r\n')}`]) {
+        const canonical = canonicalizeSource(raw);
+        if (count === 8192) {
+          assert.equal(validateCanonicalSource(canonical), canonical);
+          assert.doesNotThrow(() => validateSourceText(canonical));
+          assert.equal(decodePythonFile('source.py', new TextEncoder().encode(raw)), canonical);
+        } else {
+          assert.throws(() => validateCanonicalSource(canonical), { code: 'source_lines_limit' });
+          assert.throws(() => validateSourceText(canonical));
+        }
+      }
+    }
+  }
+});
+
+test('raw byte bound precedes decoding while bounded BOM and CRLF overhead is accepted', () => {
+  assert.throws(() => decodePythonFile('source.py', new Uint8Array(270_340).fill(255)),
+    { code: 'source_bytes_limit' });
+  const canonical = `${'x'.repeat(31)}\n`.repeat(8192);
+  assert.equal(new TextEncoder().encode(canonical).byteLength, SOURCE_LIMITS.utf8Bytes);
+  assert.equal(decodePythonFile('source.py', new TextEncoder().encode(`\ufeff${canonical.replaceAll('\n', '\r\n')}`)), canonical);
 });

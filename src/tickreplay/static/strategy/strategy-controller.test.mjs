@@ -17,6 +17,10 @@ class FakeWorker {
     this.listeners.set(type, [...listeners, listener]);
   }
 
+  removeEventListener(type, listener) {
+    this.listeners.set(type, (this.listeners.get(type) ?? []).filter((item) => item !== listener));
+  }
+
   postMessage(message) {
     this.messages.push(message);
   }
@@ -133,6 +137,160 @@ test('listeners exist before Load is posted and a successful load allocates a re
   assert.equal(controller.getState().tag, 'ready');
   assert.equal(states[0], 'loading');
   assert.equal(states.at(-1), 'ready');
+});
+
+for (const inFlight of [false, true]) {
+  for (const action of ['stop', 'load']) {
+    test(`loading notification inFlight=${inFlight} may ${action} without posting stale work`, async () => {
+      const workers = [];
+      const timers = new Map();
+      const input = (letter) => ({ source: 'def on_event(event): return []',
+        sourceHash: letter.repeat(64), draftRevision: 1, loadAttemptId: letter, session });
+      let armed = true;
+      let replacement;
+      let stopping;
+      const controller = new StrategyController({
+        createWorker() { const worker = new FakeWorker(); workers.push(worker); return worker; },
+        assets: { loaderUrl: '/loader.mjs', indexUrl: '/pyodide/', runnerUrl: '/runner.py' },
+        createInterruptBuffer: () => null,
+        setTimer(callback) { timers.set(callback, true); return callback; },
+        clearTimer: (timer) => timers.delete(timer),
+        onStateChange(state) {
+          if (!armed || state.tag !== 'loading' || state.inFlight !== inFlight) return;
+          armed = false;
+          if (action === 'stop') stopping = controller.stop();
+          else replacement = controller.load(input('b')).catch((error) => error);
+        },
+      });
+      const first = controller.load(input('a')).catch((error) => error);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(workers[0].messages.length, 0, 'no stale request is posted after the notification invalidates it');
+      const firstResult = await Promise.race([
+        first,
+        new Promise((resolve) => setImmediate(() => resolve({ code: 'unsettled' }))),
+      ]);
+      assert.equal(firstResult.code, 'invalidated');
+      if (action === 'stop') {
+        await stopping;
+        assert.equal(controller.getState().tag, 'idle');
+        assert.equal(controller.getState().inFlight, false);
+      } else {
+        assert.equal(workers.length, 2);
+        assert.equal(workers[1].messages.length, 1);
+        workers[1].respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+        assert.equal((await replacement).ok, true);
+        assert.equal(controller.getState().sourceHash, 'b'.repeat(64));
+        assert.equal(controller.getState().tag, 'ready');
+      }
+      await controller.stop();
+      assert.ok(workers.every(({ terminated }) => terminated === 1));
+      assert.equal(timers.size, 0);
+      assert.ok(workers.every((worker) => [...worker.listeners.values()].every((listeners) => listeners.length === 0)));
+    });
+  }
+}
+
+test('Start cannot publish starting after its manual-gate callback stops the owned run', async () => {
+  let activeController;
+  let stopping;
+  const statesAfterStop = [];
+  const { controller, workers } = await loadedController({
+    onManualGateChange(blocked) {
+      if (blocked) stopping = activeController.stop();
+    },
+    onStateChange(state) { if (stopping) statesAfterStop.push(state.tag); },
+  });
+  activeController = controller;
+  const result = await controller.start(startInput()).catch((error) => error);
+  await stopping;
+  assert.equal(result.code, 'invalidated');
+  assert.equal(statesAfterStop.includes('starting'), false);
+  assert.equal(workers[0].messages.filter(({ phase }) => phase === 'start').length, 0);
+  assert.equal(workers[0].terminated, 1);
+});
+
+for (const phase of ['load', 'start']) {
+  test(`${phase} success notification cannot return a stale success after synchronous Stop`, async () => {
+    let activeController;
+    let armed = false;
+    let stopping;
+    const { controller, workers } = await loadedController({ onStateChange({ tag }) {
+      if (armed && tag === (phase === 'load' ? 'ready' : 'paused')) {
+        armed = false;
+        stopping = activeController.stop();
+      }
+    } });
+    activeController = controller;
+    armed = true;
+    const pending = (phase === 'load' ? controller.load({ source: 'def on_event(event): return []',
+      sourceHash: 'b'.repeat(64), draftRevision: 1, loadAttemptId: 'success-callback', session })
+      : controller.start(startInput())).catch((error) => error);
+    await new Promise((resolve) => setImmediate(resolve));
+    workers.at(-1).respond(phase === 'load'
+      ? { result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } } : {});
+    const result = await pending;
+    await stopping;
+    assert.equal(result.code, 'invalidated');
+    assert.equal(controller.getState().tag, 'idle');
+    assert.equal(controller.getState().inFlight, false);
+    assert.ok(workers.every(({ terminated }) => terminated === 1));
+  });
+}
+
+test('end manual-gate callback may Load a replacement without completed overwriting loading', async (t) => {
+  let activeController;
+  let armed = false;
+  let replacement;
+  const { controller, workers } = await startedController({ onManualGateChange(blocked) {
+    if (armed && !blocked) {
+      armed = false;
+      replacement = activeController.load({ source: 'def on_event(event): return []',
+        sourceHash: 'b'.repeat(64), draftRevision: 1, loadAttemptId: 'end-replacement', session }).catch((error) => error);
+    }
+  } });
+  activeController = controller;
+  t.after(() => controller.stop());
+  armed = true;
+  const ending = controller.end({ reason: 'replay_end', final_session_tick_index: 9 }).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  workers[0].respond();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.getState().tag, 'loading');
+  assert.equal((await ending).code, 'invalidated');
+  assert.equal(workers[0].terminated, 1);
+  workers[1].respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  assert.equal((await replacement).ok, true);
+  await controller.stop();
+  assert.ok(workers.every(({ terminated }) => terminated === 1));
+});
+
+test('malformed-message settlement callback may Load without the old error invalidating its replacement', async (t) => {
+  let activeController;
+  let armed = false;
+  let replacement;
+  const { controller, workers } = await loadedController({ onStateChange({ tag, inFlight }) {
+    if (armed && tag === 'loading' && !inFlight) {
+      armed = false;
+      replacement = activeController.load({ source: 'def on_event(event): return []',
+        sourceHash: 'c'.repeat(64), draftRevision: 1, loadAttemptId: 'error-replacement', session }).catch((error) => error);
+    }
+  } });
+  activeController = controller;
+  t.after(() => controller.stop());
+  const first = controller.load({ source: 'def on_event(event): return []',
+    sourceHash: 'b'.repeat(64), draftRevision: 1, loadAttemptId: 'malformed', session }).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  armed = true;
+  workers.at(-1).emit('message', { kind: 'malformed' });
+  await new Promise((resolve) => setImmediate(resolve));
+  if (workers.at(-1).terminated === 0) {
+    workers.at(-1).respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  }
+  assert.equal((await replacement).ok, true);
+  assert.equal((await first).code, 'invalidated');
+  assert.equal(controller.getState().sourceHash, 'c'.repeat(64));
+  await controller.stop();
+  assert.ok(workers.every(({ terminated }) => terminated === 1));
 });
 
 test('Start at cursor zero exposes no future tick and settles paused', async () => {
@@ -370,6 +528,226 @@ test('load failure has no run cleanup and terminates only the candidate', async 
   await assert.rejects(loading, /invalid syntax/);
   assert.equal(cleanups.length, 0);
   assert.equal(worker.terminated, 1);
+});
+
+test('overlapping Loads reserve synchronously and never orphan candidates', async () => {
+  const { controller, workers } = await loadedController();
+  const input = (id) => ({ source: `# ${id}\ndef on_event(event): return []`,
+    sourceHash: id.repeat(64), draftRevision: 3, loadAttemptId: id, session });
+  const first = controller.load(input('b'));
+  const firstResult = first.catch((error) => error);
+  const second = controller.load(input('c'));
+  const secondResult = second.catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const worker of workers.slice(1)) {
+    if (worker.messages.some(({ kind }) => kind === 'strategy_request')) {
+      worker.respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+    }
+  }
+  const results = await Promise.all([firstResult, secondResult]);
+  assert.equal(results[0].code, 'invalidated');
+  assert.equal(results[1].ok, true);
+  assert.equal(controller.getState().sourceHash, 'c'.repeat(64));
+  assert.equal(controller.getState().tag, 'ready');
+  assert.equal(workers.filter((worker) => worker.terminated === 0).length, 1);
+  await controller.stop();
+  assert.ok(workers.every((worker) => worker.terminated === 1));
+  assert.ok(workers.every((worker) => [...worker.listeners.values()].every((items) => items.length === 0)));
+});
+
+test('Stop invalidates Load waiting for cleanup and late end cannot stop a replacement', async () => {
+  const cleanup = deferred();
+  const { controller, workers } = await startedController({ onCleanup: () => cleanup.promise });
+  const ending = controller.end({ reason: 'replay_end', final_session_tick_index: 9 });
+  const loading = controller.load({ source: 'def on_event(event): return []',
+    sourceHash: 'b'.repeat(64), draftRevision: 2, loadAttemptId: 'replacement', session });
+  const result = loading.catch((error) => error);
+  const stopping = controller.stop();
+  cleanup.resolve();
+  await Promise.allSettled([ending, stopping]);
+  assert.equal((await result).code, 'invalidated');
+  assert.ok(workers.every((worker) => worker.terminated === 1));
+  assert.equal(controller.getState().tag, 'idle');
+});
+
+test('replacement survives old response, error, progress, logs and cleared timers', async () => {
+  const timers = [];
+  const { controller, workers } = await loadedController({
+    setTimer: (callback) => { timers.push(callback); return callback; }, clearTimer: () => {},
+  });
+  const oldWorker = workers[0];
+  const oldListeners = new Map([...oldWorker.listeners].map(([type, list]) => [type, [...list]]));
+  const replacement = controller.load({ source: 'def on_event(event): return []',
+    sourceHash: 'c'.repeat(64), draftRevision: 3, loadAttemptId: 'new', session });
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const timer of timers.slice(0, -1)) timer();
+  for (const [type, listeners] of oldListeners) {
+    for (const listener of listeners) listener({ data: { kind: 'strategy_log', text: 'stale' }, message: type });
+  }
+  workers.at(-1).respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  await replacement;
+  assert.equal(controller.getState().tag, 'ready');
+  assert.equal(controller.logs().stdout, '');
+  await controller.stop();
+  await controller.stop();
+  assert.ok(workers.every((worker) => worker.terminated === 1));
+});
+
+test('Load during loading and Load Stop Load settle every request and retain only the last Worker', async () => {
+  const { controller, workers } = await loadedController();
+  const input = (letter) => ({ source: 'def on_event(event): return []',
+    sourceHash: letter.repeat(64), draftRevision: 2, loadAttemptId: letter, session });
+  const first = controller.load(input('b')).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  const candidate = workers.at(-1);
+  const second = controller.load(input('c')).catch((error) => error);
+  const stopping = controller.stop();
+  const last = controller.load(input('d'));
+  await new Promise((resolve) => setImmediate(resolve));
+  candidate.respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  workers.at(-1).respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  assert.equal((await first).code, 'invalidated');
+  assert.equal((await second).code, 'invalidated');
+  await Promise.all([stopping, last]);
+  assert.equal(controller.getState().sourceHash, 'd'.repeat(64));
+  assert.equal(controller.getState().loadedRevision, 2);
+  assert.equal(workers.filter(({ terminated }) => terminated === 0).length, 1);
+  await controller.stop();
+  assert.ok(workers.every(({ terminated }) => terminated === 1));
+});
+
+test('Stop waits for a failed candidate already inside interrupt grace', async () => {
+  const timers = [];
+  let worker;
+  const controller = new StrategyController({ createWorker: () => (worker = new FakeWorker()),
+    assets: { loaderUrl: '/loader.mjs', indexUrl: '/pyodide/', runnerUrl: '/runner.py' },
+    createInterruptBuffer: () => new Int32Array(new SharedArrayBuffer(4)),
+    setTimer: (callback, milliseconds) => { const timer = { callback, milliseconds }; timers.push(timer); return timer; },
+    clearTimer: () => {},
+  });
+  const loading = controller.load({ source: 'def on_event(event): return []',
+    sourceHash: 'a'.repeat(64), draftRevision: 1, loadAttemptId: 'failed', session }).catch((error) => error);
+  worker.emit('error');
+  await new Promise((resolve) => setImmediate(resolve));
+  let stopped = false;
+  const stopping = controller.stop().then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  timers.findLast(({ milliseconds }) => milliseconds === 250).callback();
+  await Promise.all([loading, stopping]);
+  assert.equal(worker.terminated, 1);
+  assert.equal(controller.getState().tag, 'idle');
+});
+
+test('Load reserves before invalidation callbacks can synchronously admit another Load', async () => {
+  let replacement;
+  let activeController;
+  let armed = false;
+  const input = (letter) => ({ source: 'def on_event(event): return []', sourceHash: letter.repeat(64),
+    draftRevision: 2, loadAttemptId: letter, session });
+  const { controller, workers } = await loadedController({ onStateChange: ({ tag }) => {
+    if (armed && tag === 'stopping') {
+      armed = false;
+      replacement = activeController.load(input('c')).catch((error) => error);
+    }
+  } });
+  activeController = controller;
+  armed = true;
+  const first = controller.load(input('b')).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  workers.at(-1).respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  assert.equal((await first).code, 'invalidated');
+  assert.equal((await replacement).ok, true);
+  assert.equal(controller.getState().sourceHash, 'c'.repeat(64));
+  await controller.stop();
+});
+
+test('pending rejection callbacks join the reserved cleanup job before creating a Worker', async () => {
+  const cleanup = deferred();
+  let activeController;
+  let armed = false;
+  let replacement;
+  const input = (letter) => ({ source: 'def on_event(event): return []', sourceHash: letter.repeat(64),
+    draftRevision: 2, loadAttemptId: letter, session });
+  const { controller, workers } = await startedController({ onCleanup: () => cleanup.promise,
+    onStateChange: ({ tag, inFlight }) => {
+      if (armed && tag === 'running' && !inFlight) {
+        armed = false;
+        replacement = activeController.load(input('d')).catch((error) => error);
+      }
+    },
+  });
+  activeController = controller;
+  controller.resume();
+  const event = controller.dispatchOneEvent(eventInput()).catch((error) => error);
+  armed = true;
+  const loading = controller.load(input('c')).catch((error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(workers.length, 1);
+  cleanup.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  workers.at(-1).respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  assert.equal((await loading).code, 'invalidated');
+  assert.equal((await replacement).ok, true);
+  assert.equal((await event).code, 'invalidated');
+  await controller.stop();
+  assert.ok(workers.every(({ terminated }) => terminated === 1));
+});
+
+test('snapshot validation is pure and matches outgoing event numeric validation', async () => {
+  const { controller, workers } = await startedController();
+  const before = controller.getState();
+  const messageCount = workers[0].messages.length;
+  const input = eventInput();
+  input.portfolio.equity_minor = Number.MAX_SAFE_INTEGER + 1;
+  assert.throws(() => controller.validateEventSnapshot(input), { code: 'invalid_integer' });
+  assert.deepEqual(controller.getState(), before);
+  assert.equal(workers[0].messages.length, messageCount);
+  assert.equal(controller.validateEventSnapshot(eventInput()).portfolio.equity_minor, 1_000_000);
+  controller.run.sequence = Number.MAX_SAFE_INTEGER;
+  assert.throws(() => controller.validateEventSnapshot(eventInput()), { code: 'invalid_integer' });
+  assert.equal(workers[0].messages.length, messageCount);
+  await controller.stop();
+});
+
+test('end sequence overflow still completes cleanup and terminates its owned Worker once', async () => {
+  const cleanups = [];
+  const { controller, workers } = await startedController({ onCleanup: (entry) => cleanups.push(entry) });
+  controller.run.sequence = Number.MAX_SAFE_INTEGER;
+  const messages = workers[0].messages.length;
+  let outcome;
+  await assert.doesNotReject(async () => {
+    outcome = await controller.end({ reason: 'replay_end', final_session_tick_index: 9 });
+  });
+  assert.equal(outcome.kind, 'completed');
+  assert.equal(controller.getState().tag, 'completed');
+  assert.equal(controller.getState().runId, null);
+  assert.equal(controller.getState().inFlight, false);
+  assert.equal(controller.manualEntryBlocked(), false);
+  assert.equal(workers[0].messages.length, messages);
+  assert.equal(workers[0].terminated, 1);
+  assert.equal(cleanups.length, 1);
+  assert.equal(controller.diagnosticHistory().some(({ category }) => category === 'invalid_integer'), true);
+  await controller.stop();
+  assert.equal(workers[0].terminated, 1);
+});
+
+test('stale progress identity cannot rearm the active Load deadline', async () => {
+  const timers = [];
+  let worker;
+  const controller = new StrategyController({ createWorker: () => (worker = new FakeWorker()),
+    assets: { loaderUrl: '/loader.mjs', indexUrl: '/pyodide/', runnerUrl: '/runner.py' },
+    setTimer: (callback) => { timers.push(callback); return callback; }, clearTimer: () => {},
+  });
+  const loading = controller.load({ source: 'def on_event(event): return []', sourceHash: 'a'.repeat(64),
+    draftRevision: 1, loadAttemptId: 'progress', session });
+  const request = worker.messages.at(-1);
+  worker.emit('message', { ...request, kind: 'strategy_progress', stage: 'runtime_ready',
+    source: { ...request.source, load_attempt_id: 'old' } });
+  assert.equal(timers.length, 1);
+  worker.respond({ result: { callbacks: ['on_event'], capabilities: { soft_interrupt: false } } });
+  await loading;
+  await controller.stop();
 });
 
 test('Worker seam owns Pyodide and destroys every temporary proxy exactly once', async () => {

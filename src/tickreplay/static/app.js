@@ -86,7 +86,7 @@ const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロー
 const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
 const SYMBOL_SEARCH_DEBOUNCE_MS = 200; // 銘柄候補検索: この間隔だけ入力が止まってからサーバーへ問い合わせる
-const STRATEGY_RELEASE_URL = '/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs';
+const STRATEGY_RELEASE_URL = '/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs';
 
 let strategyReleaseModule = null;
 let strategyWorkspace = null;
@@ -1275,7 +1275,7 @@ function applyTradesToBoard(fromIndex, toIndex) {
  * 返済しきった後は同じ日に何度でも建て直せる。
  */
 
-const orderBroker = createOrderBroker({ priceForLevel: priceOfLevel });
+const orderBroker = createOrderBroker({ priceForLevel: priceOfLevel, priceLevelForPrice: levelOf });
 const trading = orderBroker.state;
 let strategyController = null;
 let strategyCommitter = null;
@@ -1349,7 +1349,7 @@ function strategyControllerCallbacks(downstream = {}) {
 function attachStrategyController(controller) {
   const required = [
     'load', 'start', 'resume', 'dispatchOneEvent', 'pause', 'invalidate',
-    'stop', 'end', 'getState', 'isActive', 'manualEntryBlocked',
+    'stop', 'end', 'getState', 'isActive', 'manualEntryBlocked', 'validateEventSnapshot',
   ];
   if (!controller || required.some((name) => typeof controller[name] !== 'function')) {
     throw new TypeError('invalid_strategy_controller');
@@ -1385,6 +1385,7 @@ async function startStrategy() {
     throw new Error('host_capacity_violation');
   }
   const cursor = state.cursor;
+  orderBroker.validateStrategyState(state.last);
   const lastCommitted = cursor === 0 ? null : {
     sessionTickIndex: cursor - 1,
     replayTimeUs: Math.round(state.t[cursor - 1] * 1_000_000),
@@ -1414,7 +1415,7 @@ async function startStrategy() {
 
 function invalidateStrategyRuntime(cause) {
   if (strategyCommitter?.status().active) return strategyCommitter.invalidate(cause);
-  if (strategyController?.isActive()) return strategyController.invalidate(cause);
+  if (strategyController) return strategyController.invalidate(cause);
   return null;
 }
 

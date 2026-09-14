@@ -101,6 +101,8 @@ def fetch_asset(asset: UpstreamAsset) -> bytes:
     request = urllib.request.Request(asset.url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
         data = response.read()
+    if not isinstance(data, bytes):
+        raise ValueError(f"{asset.name}: response body must be bytes")
     if len(data) != asset.bytes:
         raise ValueError(
             f"{asset.name}: expected {asset.bytes} bytes, received {len(data)}"
@@ -119,7 +121,11 @@ def reconstruct(staging_directory: Path) -> tuple[str, dict[str, object]]:
         (staging_directory / asset.name).write_bytes(data)
 
     lock = json.loads(downloaded["pyodide-lock.json"])
+    if not isinstance(lock, dict):
+        raise ValueError("pyodide-lock.json must contain a JSON object")
     lock_info = lock.get("info", {})
+    if not isinstance(lock_info, dict):
+        raise ValueError("pyodide-lock.json info must contain a JSON object")
     if lock_info.get("version") != PYODIDE_VERSION:
         raise ValueError("pyodide-lock.json release does not match the frozen version")
     if lock_info.get("python") != PYTHON_VERSION:

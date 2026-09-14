@@ -765,7 +765,7 @@ tick i + 1 から有効**であり、過去へ遡って約定しない。
   CPU/Worker round trip次第で表示指定速度に達しないことがある。
 - source は browser localStorage に平文で保存される。秘密を入れず、不要になったら
   Clear Saved Source を使う。Import/Sample は draftを置換するだけで、Save/Load/Start
-  は暗黙実行しない。
+  は自動的に押されない。Load を押した時点で、Start より前に top-level Python が実行される。
 - CodeMirrorが使えない場合はeditable textareaへ縮退する。workspace自体を読み込めない
   場合は最新 source のread-only raw-copy面が残る。runtime failure時も編集・保存・
   Import/Export/Sampleは維持され、Loadで明示的に再試行できる。
@@ -776,11 +776,12 @@ tick i + 1 から有効**であり、過去へ遡って約定しない。
   ABI候補だけで、Python language serverやnetwork補完ではない。
 
 同一origin Pyodideはbrowser Web APIと同一origin APIへ到達できるため、現在の利用者が
-信頼するcodeだけを実行する。通常routeはnon-isolatedでhard stopのみである。timeout時は
+信頼するcodeだけを実行する。Workerはsecurity sandboxではなく、Loadの近くにこの実行境界を
+常時表示する。通常routeはnon-isolatedでhard stopのみである。timeout時は
 run identityを無効化してWorkerを破棄するため、再開にはRestartが必要になる。
 
 現在のbrowser entryは content-addressed release
-`1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da` に固定される。
+`fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d` に固定される。
 `app.js`、HTML、CSSなどmutable entryは`no-store`、release closureとversioned vendorは
 1年immutableで配信する。更新、二段階compatibility/feature image、24時間のopen-page
 互換、rollback、asset/license再構築手順は

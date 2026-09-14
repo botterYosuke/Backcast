@@ -7,6 +7,8 @@ export const SETTINGS_STORAGE_KEY = 'tickreplay.strategy.settings.v1';
 export const AUTOSAVE_DELAY_MS = 750;
 export const SOURCE_LIMITS = Object.freeze({
   utf8Bytes: 262_144,
+  // One UTF-8 BOM and one extra CR per permitted physical line.
+  rawFileBytes: 262_144 + 8_192 + 3,
   unicodeScalars: 262_144,
   lines: 8_192,
   longestLineScalars: 4_096,
@@ -63,7 +65,7 @@ export function validateCanonicalSource(source) {
     throw new SourceStoreError('source_scalars_limit', 'source exceeds 262144 Unicode scalars');
   }
   const lines = source.split('\n');
-  if (lines.length > SOURCE_LIMITS.lines) {
+  if (lines.length - (lines.at(-1) === '' ? 1 : 0) > SOURCE_LIMITS.lines) {
     throw new SourceStoreError('source_lines_limit', 'source exceeds 8192 lines');
   }
   if (lines.some((line) => Array.from(line).length > SOURCE_LIMITS.longestLineScalars)) {
@@ -336,10 +338,17 @@ export function createAutosaveScheduler({
   });
 }
 
-export function decodePythonFile(name, bytes) {
+export function validatePythonFileMetadata(name, size) {
   if (typeof name !== 'string' || name.includes('/') || name.includes('\\') || !/\.py$/i.test(name)) {
     throw new SourceStoreError('file_type', 'Import requires one .py file');
   }
+  if (size !== undefined && (!Number.isSafeInteger(size) || size < 0 || size > SOURCE_LIMITS.rawFileBytes)) {
+    throw new SourceStoreError('source_bytes_limit', 'Import exceeds the bounded raw file size');
+  }
+}
+
+export function decodePythonFile(name, bytes) {
+  validatePythonFileMetadata(name, bytes?.byteLength);
   let source;
   try {
     source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);

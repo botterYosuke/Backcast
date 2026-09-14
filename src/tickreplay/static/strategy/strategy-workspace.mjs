@@ -10,6 +10,7 @@ import {
   createStrategySourceStore,
   decodePythonFile,
   validateCanonicalSource,
+  validatePythonFileMetadata,
 } from './strategy-source-store.mjs';
 
 export const STRATEGY_WORKSPACE_SELECTORS = Object.freeze({
@@ -188,6 +189,7 @@ export function mountStrategyWorkspace({
   let controllerPromise = null;
   let loadedSnapshot = null;
   let loadAttempt = 0;
+  let pendingLoad = null;
   let composition = false;
   let beforeUnloadInstalled = false;
   let diagnosticsBytes = 0;
@@ -506,14 +508,15 @@ export function mountStrategyWorkspace({
       try {
         const callbacks = host.controllerCallbacks(workspaceCallbacks());
         const candidate = await release.loadController({ callbacks, performanceClass });
-        if (disposed || rawRecovery) {
+        if (disposed || rawRecovery || !pendingLoad) {
           await candidate?.stop?.('explicit_stop');
-          throw new StrategyWorkspaceError('workspace_disposed');
+          throw new StrategyWorkspaceError('load_superseded');
         }
         host.attachController(candidate);
         controller = candidate;
         return controller;
       } catch (error) {
+        if (disposed || rawRecovery || error.code === 'load_superseded') throw error;
         controllerFailure = error;
         appendDiagnostic({ phase: 'controller', category: error.code, message: error.message });
         emitStatus('戦略ランタイムを利用できません。ソース操作は継続できます。', 'error');
@@ -527,24 +530,58 @@ export function mountStrategyWorkspace({
   }
 
   async function loadDraft(snapshot = { source, draftRevision }) {
-    await ensureController();
-    const identified = await identity.identifySnapshot(snapshot.source, snapshot.draftRevision);
-    const request = {
-      source: identified.source,
-      sourceHash: identified.sourceHash,
-      draftRevision: identified.draftRevision,
-      loadAttemptId: `workspace-load-${++loadAttempt}`,
-      filename: 'strategy.py',
-      performanceClass,
+    cancelPendingLoad();
+    if (disposed || rawRecovery) throw new StrategyWorkspaceError('load_superseded');
+    const attemptId = ++loadAttempt;
+    let cancel;
+    const canceled = new Promise((resolve) => { cancel = resolve; });
+    const attempt = { cancel };
+    pendingLoad = attempt;
+    const assertCurrent = () => {
+      if (pendingLoad !== attempt || disposed || rawRecovery) {
+        throw new StrategyWorkspaceError('load_superseded');
+      }
     };
-    if (source === identified.source && draftRevision === identified.draftRevision) {
-      sourceHash = identified.sourceHash;
+    const wait = async (operation) => {
+      const result = await Promise.race([operation, canceled]);
+      assertCurrent();
+      return result;
+    };
+    try {
+      const invalidating = controller ? host.invalidate?.('explicit_load') : null;
+      await wait(ensureController());
+      await wait(invalidating);
+      const identified = await wait(identity.identifySnapshot(snapshot.source, snapshot.draftRevision));
+      const request = {
+        source: identified.source,
+        sourceHash: identified.sourceHash,
+        draftRevision: identified.draftRevision,
+        loadAttemptId: `workspace-load-${attemptId}`,
+        filename: 'strategy.py',
+        performanceClass,
+      };
+      if (source === identified.source && draftRevision === identified.draftRevision) {
+        sourceHash = identified.sourceHash;
+      }
+      const result = await wait(host.load(request));
+      loadedSnapshot = Object.freeze({ ...request, loadedRevision: result.loadedRevision });
+      emitStatus(`戦略を loaded revision ${result.loadedRevision} として読み込みました。`, 'success');
+      render();
+      return result;
+    } finally {
+      if (pendingLoad === attempt) pendingLoad = null;
     }
-    const result = await host.load(request);
-    loadedSnapshot = Object.freeze({ ...request, loadedRevision: result.loadedRevision });
-    emitStatus(`戦略を loaded revision ${result.loadedRevision} として読み込みました。`, 'success');
-    render();
-    return result;
+  }
+
+  function cancelPendingLoad() {
+    const previous = pendingLoad;
+    pendingLoad = null;
+    previous?.cancel();
+  }
+
+  function stopStrategy() {
+    cancelPendingLoad();
+    return host.stop();
   }
 
   async function startStrategy() {
@@ -649,6 +686,7 @@ export function mountStrategyWorkspace({
   function enterRawRecovery(error) {
     if (rawRecovery) return;
     rawRecovery = true;
+    cancelPendingLoad();
     sourceAutosave.dispose();
     settingsAutosave.dispose();
     editor?.dispose?.();
@@ -666,6 +704,7 @@ export function mountStrategyWorkspace({
 
   function invoke(label, operation, { fatal = false } = {}) {
     return safeCall(label, operation, (error) => {
+      if (error?.code === 'load_superseded') return null;
       appendDiagnostic({ phase: 'workspace', category: error?.code, message: error?.message ?? error });
       if (fatal) enterRawRecovery(error);
       else {
@@ -707,6 +746,7 @@ export function mountStrategyWorkspace({
   function dispose() {
     if (disposed) return;
     disposed = true;
+    cancelPendingLoad();
     sourceAutosave.dispose();
     settingsAutosave.dispose();
     for (const cleanup of cleanups.splice(0).reverse()) cleanup();
@@ -743,7 +783,7 @@ export function mountStrategyWorkspace({
     if (modifier && event.key.toLowerCase() === 's') action = () => saveSnapshot({ source, draftRevision });
     else if (modifier && event.key === 'Enter' && event.shiftKey) action = () => loadDraft();
     else if (modifier && event.key === 'Enter') action = startStrategy;
-    else if (modifier && event.key === '.' && ACTIVE_CONTROLLER_STATES.has(currentControllerState().tag)) action = () => host.stop();
+    else if (modifier && event.key === '.' && (pendingLoad || ACTIVE_CONTROLLER_STATES.has(currentControllerState().tag))) action = stopStrategy;
     else if (event.key === 'F8') action = () => navigateDiagnostic(event.shiftKey ? -1 : 1);
     if (!action) return;
     event.preventDefault();
@@ -753,7 +793,7 @@ export function mountStrategyWorkspace({
   listen(elements.save, 'click', 'Save Draft', () => saveSnapshot({ source, draftRevision }));
   listen(elements.load, 'click', 'Load', () => loadDraft());
   listen(elements.start, 'click', 'Start', startStrategy);
-  listen(elements.stop, 'click', 'Stop', () => host.stop());
+  listen(elements.stop, 'click', 'Stop', stopStrategy);
   listen(elements.restart, 'click', 'Restart', restartStrategy);
   listen(elements.reloadLatest, 'click', 'Reload latest', reloadLatest);
   listen(elements.overwrite, 'click', 'Overwrite', () => saveSnapshot({ source, draftRevision }, { overwrite: true }));
@@ -780,6 +820,7 @@ export function mountStrategyWorkspace({
   listen(elements.importInput, 'change', 'Import', async () => {
     const file = elements.importInput.files?.[0];
     if (!file) return;
+    validatePythonFileMetadata(file.name, file.size);
     if (dirty && !confirmAction('未保存の下書きを import で置き換えますか？')) return;
     const imported = decodePythonFile(file.name, new Uint8Array(await file.arrayBuffer()));
     acceptSource(imported, { origin: 'import' });
@@ -802,6 +843,7 @@ export function mountStrategyWorkspace({
     else checkExternalSource();
   });
   listen(windowObject, 'pagehide', 'pagehide persistence', () => {
+    cancelPendingLoad();
     void sourceAutosave.flush();
     try { void host.invalidate?.('explicit_stop'); } catch { /* app boundary also invalidates */ }
   });
@@ -817,7 +859,7 @@ export function mountStrategyWorkspace({
     saveDraft: () => saveSnapshot({ source, draftRevision }),
     loadDraft,
     start: startStrategy,
-    stop: () => host.stop(),
+    stop: stopStrategy,
     restart: restartStrategy,
     reloadLatest,
     overwrite: () => saveSnapshot({ source, draftRevision }, { overwrite: true }),

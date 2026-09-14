@@ -1,5 +1,8 @@
 'use strict';
 
+import { assertStrategyInteger, strategyPortfolioSnapshot } from './paper-trading.mjs';
+export { strategyPortfolioSnapshot } from './paper-trading.mjs';
+
 const DEFAULT_GAP_THRESHOLD = 5;
 const MAX_FRAME_ELAPSED_SECONDS = 0.5;
 
@@ -23,23 +26,16 @@ function defaultFillToStrategy(fill, sessionTickIndex, replayTimeUs, priceLevelF
   };
 }
 
-export function strategyPortfolioSnapshot(portfolio, lastPrice, priceLevelForPrice = (price) => price) {
-  const unrealized = portfolio.qty && Number.isFinite(lastPrice)
-    ? (lastPrice - portfolio.avgPrice) * portfolio.qty
-    : 0;
-  const cash = portfolio.realized - portfolio.qty * portfolio.avgPrice;
-  return {
-    cash_minor: Math.round(cash * 100),
-    position_quantity: portfolio.qty,
-    average_price_level: portfolio.qty ? priceLevelForPrice(portfolio.avgPrice) : null,
-    realized_pnl_minor: Math.round(portfolio.realized * 100),
-    unrealized_pnl_minor: Math.round(unrealized * 100),
-    equity_minor: Math.round((portfolio.realized + unrealized) * 100),
-  };
-}
-
 function defaultOpenOrdersToStrategy(broker) {
   return broker.strategyOpenOrders();
+}
+
+function validateSnapshotNumbers(value, path = 'event') {
+  if (typeof value === 'number') {
+    assertStrategyInteger(value, path);
+  } else if (value && typeof value === 'object') {
+    for (const [field, child] of Object.entries(value)) validateSnapshotNumbers(child, `${path}.${field}`);
+  }
 }
 
 /**
@@ -91,7 +87,7 @@ export function advanceStrategyClock(clock, {
 export function createReplayCommitter({
   broker,
   strategyPort,
-  priceLevelForPrice = (price) => price,
+  priceLevelForPrice = (price) => Math.round(price),
   fillToStrategy = defaultFillToStrategy,
   portfolioToStrategy = strategyPortfolioSnapshot,
   openOrdersToStrategy = defaultOpenOrdersToStrategy,
@@ -104,12 +100,13 @@ export function createReplayCommitter({
   let generation = 0;
 
   function beginRun(identity) {
+    const candidateIdentity = cloneRunIdentity(identity);
+    broker.beginStrategyRun(candidateIdentity);
     generation += 1;
-    runIdentity = cloneRunIdentity(identity);
+    runIdentity = candidateIdentity;
     stagedBatch = null;
     inFlight = null;
     paused = true;
-    broker.beginStrategyRun(runIdentity);
     return status();
   }
 
@@ -164,20 +161,34 @@ export function createReplayCommitter({
     if (!runIdentity) throw new Error('strategy_run_not_started');
     if (paused) throw new Error('strategy_replay_paused');
     if (inFlight) throw new Error('event_in_flight');
+    assertStrategyInteger(sessionTickIndex + 1, 'next_session_tick_index', 0);
     const admittedGeneration = generation;
 
     const work = (async () => {
-      if (stagedBatch) {
-        broker.commitStrategyBatch(stagedBatch, { sessionTickIndex });
-        stagedBatch = null;
-      }
-      applyTick(sessionTickIndex, tick);
-      const matched = broker.matchTick({
+      const { matched, prepared: event } = broker.commitStrategyTick({
+        batch: stagedBatch,
         sessionTickIndex,
         tradePrice,
         time,
         deliveryRun: runIdentity,
+        beforePublish(candidate, proposed) {
+          if (proposed.kind === 'host_capacity_violation') return null;
+          const outgoing = {
+            tick: { ...tick },
+            fills: proposed.fills.map((fill) => fillToStrategy(
+              fill, sessionTickIndex, tick.replay_time_us, priceLevelForPrice,
+            )),
+            fillCursor: proposed.fillCursor,
+            portfolio: portfolioToStrategy(candidate.portfolioSnapshot(), tradePrice, priceLevelForPrice),
+            ...openOrdersToStrategy(candidate, priceLevelForPrice),
+          };
+          validateSnapshotNumbers(outgoing);
+          strategyPort.validateEventSnapshot?.(outgoing);
+          return outgoing;
+        },
       });
+      stagedBatch = null;
+      applyTick(sessionTickIndex, tick);
       await afterTick({ matched, sessionTickIndex, tick });
       if (generation !== admittedGeneration || !runIdentity) {
         return { kind: 'stale_result', fills: matched.fills, fillCursor: matched.fillCursor };
@@ -191,25 +202,6 @@ export function createReplayCommitter({
         return { ...matched, strategyResult: { kind: 'host_capacity_violation' } };
       }
 
-      const replayTimeUs = tick.replay_time_us;
-      const fills = matched.fills.map((fill) => fillToStrategy(
-        fill,
-        sessionTickIndex,
-        replayTimeUs,
-        priceLevelForPrice,
-      ));
-      const openOrderSnapshot = openOrdersToStrategy(broker, priceLevelForPrice);
-      const event = {
-        tick: { ...tick },
-        fills,
-        fillCursor: matched.fillCursor,
-        portfolio: portfolioToStrategy(
-          broker.portfolioSnapshot(),
-          tradePrice,
-          priceLevelForPrice,
-        ),
-        ...openOrderSnapshot,
-      };
       const result = await strategyPort.dispatchOneEvent(event);
       if (generation !== admittedGeneration || !runIdentity) {
         return { kind: 'stale_result', fills: matched.fills, fillCursor: matched.fillCursor };
