@@ -9,11 +9,13 @@ from tickreplay.config import (
     CACHE_DIR_ENV_VAR,
     DEFAULT_SERVER_URL,
     LOCAL_AUTHORITATIVE_ENV_VAR,
+    NATIVE_ENABLED_ENV_VAR,
     SERVER_URL_ENV_VAR,
     CacheConfig,
     CacheConfigError,
     build_http_client,
     read_env_file,
+    resolve_bundled_rl_config,
     resolve_cache_config,
 )
 
@@ -229,3 +231,49 @@ def test_build_http_client_accepts_an_injected_transport_for_tests(tmp_path):
         assert calls == ["/api/stocks-trades"]
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------
+# repository-owned Bundled RL execution
+# --------------------------------------------------------------------------
+
+
+def test_bundled_rl_is_enabled_by_default_with_fixed_limits(tmp_path):
+    config = resolve_bundled_rl_config(
+        cache_dir=tmp_path, env={}, env_file=tmp_path / "absent.env"
+    )
+
+    assert config.enabled is True
+    assert config.artifact_dir == tmp_path / "bundled_rl_traces"
+    assert (config.max_concurrency, config.max_queue, config.timeout_seconds) == (
+        1,
+        4,
+        30.0,
+    )
+
+
+@pytest.mark.parametrize("value", ["false", "0", "off"])
+def test_bundled_rl_has_one_explicit_disable_switch(tmp_path, value):
+    config = resolve_bundled_rl_config(
+        cache_dir=tmp_path,
+        env={NATIVE_ENABLED_ENV_VAR: value},
+        env_file=tmp_path / "absent.env",
+    )
+    assert config.enabled is False
+
+
+def test_bundled_rl_rejects_invalid_disable_switch(tmp_path):
+    with pytest.raises(CacheConfigError, match=NATIVE_ENABLED_ENV_VAR):
+        resolve_bundled_rl_config(
+            cache_dir=tmp_path,
+            env={NATIVE_ENABLED_ENV_VAR: "maybe"},
+            env_file=tmp_path / "absent.env",
+        )
+
+
+def test_bundled_rl_rejects_non_directory_store(tmp_path):
+    (tmp_path / "bundled_rl_traces").write_text("not a directory")
+    with pytest.raises(CacheConfigError, match="artifact path"):
+        resolve_bundled_rl_config(
+            cache_dir=tmp_path, env={}, env_file=tmp_path / "absent.env"
+        )

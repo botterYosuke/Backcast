@@ -9,6 +9,11 @@ import {
   createStrategySourceStore,
 } from './strategy-source-store.mjs';
 import {
+  BUNDLED_RL_STRATEGY,
+  CUSTOM_PYTHON_STRATEGY,
+  STRATEGY_SELECTION_STORAGE_KEY,
+} from './strategy-selection-store.mjs';
+import {
   STRATEGY_WORKSPACE_SELECTORS,
   mountStrategyWorkspace,
 } from './strategy-workspace.mjs';
@@ -54,6 +59,9 @@ function workspaceDom(source = 'print(1)\n') {
   values.source.readOnly = true;
   values.panel.hidden = true;
   values.editor.hidden = true;
+  values.selection.value = BUNDLED_RL_STRATEGY;
+  values.customPanel.hidden = true;
+  values.bundledPanel.hidden = false;
   const root = eventTarget({
     querySelector(selector) {
       const name = Object.entries(STRATEGY_WORKSPACE_SELECTORS)
@@ -84,7 +92,16 @@ function nodeSubtle() {
   };
 }
 
-function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads = [], subtle = nodeSubtle() } = {}) {
+function harness({
+  source = 'print(1)\n', storage = memoryStorage(), downloads = [], subtle = nodeSubtle(),
+  nativeAvailable = true, strategySelection = CUSTOM_PYTHON_STRATEGY,
+} = {}) {
+  if (strategySelection !== null && !storage.values.has(STRATEGY_SELECTION_STORAGE_KEY)) {
+    storage.values.set(STRATEGY_SELECTION_STORAGE_KEY, JSON.stringify({
+      schemaVersion: 1,
+      selection: strategySelection,
+    }));
+  }
   const { root, values } = workspaceDom(source);
   const windowObject = eventTarget({ matchMedia: () => ({ matches: false }) });
   const documentObject = eventTarget({ visibilityState: 'visible' });
@@ -109,7 +126,13 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
       calls.push(['load', request]);
       controllerState = { tag: 'ready', loadedRevision: 1, runningRevision: null };
       downstream.onStateChange(controllerState);
-      return { ok: true, loadedRevision: 1, sourceHash: request.sourceHash };
+      return {
+        ok: true,
+        loadedRevision: 1,
+        sourceHash: request.sourceHash,
+        inputId: request.mode === BUNDLED_RL_STRATEGY ? 'a'.repeat(64) : null,
+        traceId: request.mode === BUNDLED_RL_STRATEGY ? 'b'.repeat(64) : null,
+      };
     },
     async start() {
       calls.push('start');
@@ -122,7 +145,13 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
       controllerState = { tag: 'idle', loadedRevision: 1, runningRevision: null };
       downstream?.onStateChange(controllerState);
     },
-    invalidate(cause) { calls.push(['invalidate', cause]); },
+    invalidate(cause) {
+      calls.push(['invalidate', cause]);
+      controllerState = { tag: 'stopping', phase: cause, loadedRevision: 0, runningRevision: null };
+      downstream?.onStateChange(controllerState);
+      controllerState = { tag: 'idle', phase: null, loadedRevision: 0, runningRevision: null };
+      downstream?.onStateChange(controllerState);
+    },
     getControllerState: () => controllerState,
     getDiagnostics: () => [],
     getLogs: () => null,
@@ -135,6 +164,18 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
     dispose() { calls.push('editorDispose'); },
   };
   const release = {
+    async loadCapability() {
+      calls.push('loadCapability');
+      return {
+        available: nativeAvailable,
+        contractVersion: 'bundled_rl_trace_v1',
+        preset: {
+          id: 'bundled_rl',
+          revision: 'rl_scalp_evolution_v1',
+          digest: '528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1',
+        },
+      };
+    },
     async loadEditor() {
       calls.push('loadEditor');
       return {
@@ -145,10 +186,10 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
         },
       };
     },
-    async loadController({ callbacks, performanceClass }) {
+    async loadController({ callbacks, performanceClass, mode }) {
       assert.equal(callbacks, downstream);
       assert.equal(performanceClass, 'desktop');
-      calls.push('loadController');
+      calls.push(['loadController', mode]);
       return controller;
     },
   };
@@ -172,7 +213,7 @@ function harness({ source = 'print(1)\n', storage = memoryStorage(), downloads =
   };
 }
 
-test('bootstrap restores source as revision zero and never loads editor or runtime', async () => {
+test('bootstrap restores source as revision zero without loading editor or runtime', async () => {
   const storage = memoryStorage();
   const store = createStrategySourceStore({
     storage,
@@ -189,28 +230,89 @@ test('bootstrap restores source as revision zero and never loads editor or runti
   assert.equal(app.workspace.state().source, 'saved = True\n');
   assert.equal(app.workspace.state().draftRevision, 0);
   assert.equal(app.values.source.readOnly, false);
-  assert.deepEqual(app.calls, []);
+  assert.deepEqual(app.calls, ['loadCapability']);
   assert.deepEqual(storage.writes, []);
   app.workspace.dispose();
 });
 
 test('first expansion loads only editor; first explicit Load constructs and attaches runtime', async () => {
   const app = harness();
+  await new Promise((resolve) => setImmediate(resolve));
   await app.values.toggle.fire('click');
-  assert.deepEqual(app.calls, ['loadEditor', ['createEditor', 'print(1)\n']]);
+  assert.deepEqual(app.calls, ['loadCapability', 'loadEditor', ['createEditor', 'print(1)\n']]);
   assert.equal(app.values.panel.hidden, false);
 
   await app.workspace.loadDraft();
-  assert.deepEqual(app.calls.slice(2, 5), [
-    'controllerCallbacks', 'loadController', 'attachController',
+  assert.deepEqual(app.calls.slice(3, 6), [
+    'controllerCallbacks', ['loadController', 'pyodide'], 'attachController',
   ]);
-  const loadCall = app.calls[5];
+  const loadCall = app.calls[6];
   assert.equal(loadCall[0], 'load');
   assert.equal(loadCall[1].source, 'print(1)\n');
   assert.match(loadCall[1].sourceHash, /^[0-9a-f]{64}$/);
   assert.equal(loadCall[1].draftRevision, 0);
   assert.equal(app.workspace.state().loadedSnapshot.loadedRevision, 1);
   app.workspace.dispose();
+});
+
+test('Bundled RL is the default/reset selection and capability failure never falls back', async () => {
+  for (const raw of [null, '{', JSON.stringify({ schemaVersion: 1, selection: 'native_trace_v1' })]) {
+    const storage = memoryStorage();
+    if (raw !== null) storage.values.set(STRATEGY_SELECTION_STORAGE_KEY, raw);
+    const app = harness({ storage, nativeAvailable: false, strategySelection: null });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(app.workspace.state().strategySelection, BUNDLED_RL_STRATEGY);
+    assert.equal(app.values.selection.value, BUNDLED_RL_STRATEGY);
+    assert.equal(app.values.customPanel.hidden, true);
+    assert.equal(app.values.load.disabled, true);
+    assert.equal(app.calls.some((entry) => Array.isArray(entry) && entry[0] === 'loadController'), false);
+    app.workspace.dispose();
+  }
+});
+
+test('Bundled RL Load is source-free and records immutable trace identity', async () => {
+  const app = harness({ strategySelection: BUNDLED_RL_STRATEGY });
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.workspace.loadDraft();
+  const loadCall = app.calls.find((entry) => Array.isArray(entry) && entry[0] === 'load');
+  assert.deepEqual(loadCall[1], { mode: BUNDLED_RL_STRATEGY });
+  assert.equal(JSON.stringify(loadCall[1]).includes('source'), false);
+  assert.equal(app.workspace.state().loadedSnapshot.traceId, 'b'.repeat(64));
+  assert.deepEqual(
+    app.calls.find((entry) => Array.isArray(entry) && entry[0] === 'loadController'),
+    ['loadController', BUNDLED_RL_STRATEGY],
+  );
+  assert.match(app.values.startTarget.textContent, /trace b{12}/);
+  app.workspace.dispose();
+});
+
+test('strategy choice change invalidates the prior runtime and prevents mixing', async () => {
+  const app = harness();
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.workspace.loadDraft();
+  app.calls.length = 0;
+  app.values.selection.value = BUNDLED_RL_STRATEGY;
+  await app.values.selection.fire('change');
+  assert.deepEqual(app.calls, [['invalidate', 'explicit_stop']]);
+  assert.equal(app.workspace.state().loadedSnapshot, null);
+  assert.equal(app.workspace.state().strategySelection, BUNDLED_RL_STRATEGY);
+  app.workspace.dispose();
+});
+
+test('seek or reset invalidation clears a loaded Bundled RL identity and disables Start', async () => {
+  for (const cause of ['seek', 'reset', 'session_change']) {
+    const app = harness({ strategySelection: BUNDLED_RL_STRATEGY });
+    await new Promise((resolve) => setImmediate(resolve));
+    await app.workspace.loadDraft();
+    assert.equal(app.workspace.state().loadedSnapshot.loadedRevision, 1);
+    assert.equal(app.values.start.disabled, false);
+
+    app.host.invalidate(cause);
+
+    assert.equal(app.workspace.state().loadedSnapshot, null);
+    assert.equal(app.values.start.disabled, true);
+    app.workspace.dispose();
+  }
 });
 
 test('every accepted source change mirrors raw textarea before editor side effects', () => {

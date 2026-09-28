@@ -22,6 +22,7 @@ import httpx
 SERVER_URL_ENV_VAR = "BACKCAST_DUCKDB_SERVER_URL"
 CACHE_DIR_ENV_VAR = "BACKCAST_DUCKDB_CACHE_DIR"
 LOCAL_AUTHORITATIVE_ENV_VAR = "BACKCAST_DUCKDB_LOCAL_AUTHORITATIVE"
+NATIVE_ENABLED_ENV_VAR = "BACKCAST_NATIVE_STRATEGY_ENABLED"
 DEFAULT_SERVER_URL = "http://backcast.i234.me:8080"
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -32,6 +33,40 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 class CacheConfigError(RuntimeError):
     """The DuckDB server-cache configuration could not be resolved."""
+
+
+@dataclass(frozen=True)
+class BundledRlConfig:
+    enabled: bool
+    artifact_dir: Path
+    max_concurrency: int = 1
+    max_queue: int = 4
+    timeout_seconds: float = 30.0
+
+
+def resolve_bundled_rl_config(
+    *,
+    cache_dir: Path,
+    env: dict[str, str] | None = None,
+    env_file: Path | None = None,
+) -> BundledRlConfig:
+    environ = os.environ if env is None else env
+    dotenv_path = REPO_ROOT / ".env" if env_file is None else env_file
+    file_values = read_env_file(dotenv_path)
+
+    def value(name: str, default: str = "") -> str:
+        if name in environ:
+            return environ[name].strip()
+        if name in file_values:
+            return file_values[name].strip()
+        return default
+
+    raw_enabled = value(NATIVE_ENABLED_ENV_VAR, "true")
+    enabled = _parse_bool_env(NATIVE_ENABLED_ENV_VAR, raw_enabled)
+    artifact_dir = cache_dir / "bundled_rl_traces"
+    if artifact_dir.exists() and not artifact_dir.is_dir():
+        raise CacheConfigError("Bundled RL artifact path is not a directory")
+    return BundledRlConfig(enabled=enabled, artifact_dir=artifact_dir)
 
 
 def read_env_file(env_path: Path) -> dict[str, str]:

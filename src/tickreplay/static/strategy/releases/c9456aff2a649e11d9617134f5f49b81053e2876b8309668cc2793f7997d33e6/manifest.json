@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "release_id": "c9456aff2a649e11d9617134f5f49b81053e2876b8309668cc2793f7997d33e6",
+  "entry_url": "/static/strategy/releases/c9456aff2a649e11d9617134f5f49b81053e2876b8309668cc2793f7997d33e6/strategy-release.mjs",
+  "identity": {
+    "schema_version": 1,
+    "files": [
+      {
+        "name": "strategy-assets.mjs",
+        "bytes": 974,
+        "sha256": "e3610fa23a87f5ee8215106b8ab8635185ea9ef03f15d0928c3e07ed1bc0f808"
+      },
+      {
+        "name": "strategy-controller.mjs",
+        "bytes": 30337,
+        "sha256": "0c5662920fca7ebfff8683820d5b2101466d5d359125de81bd198316c77553e8"
+      },
+      {
+        "name": "strategy-editor.mjs",
+        "bytes": 8925,
+        "sha256": "5c6294b48c7fc0e63887223409c90901ff7805e21a3a5d0cb4c010777e57d1ff"
+      },
+      {
+        "name": "strategy-protocol.mjs",
+        "bytes": 24959,
+        "sha256": "3b5e84092320a5fed7c866994630ad4a188e450686301518102a5bb74f35ac00"
+      },
+      {
+        "name": "strategy-release.mjs",
+        "bytes": 2244,
+        "sha256": "6c6c2b231c141eb774c3282f7e3529d4672dd543b9637ffc8b23ee560ae02cfd"
+      },
+      {
+        "name": "strategy-runner.py",
+        "bytes": 19398,
+        "sha256": "e52541d2f7d20279f6cd8941d54cbd7ad26155c5ad91eb9689a06831d708eb6d"
+      },
+      {
+        "name": "strategy-source-store.mjs",
+        "bytes": 12199,
+        "sha256": "efd73d57c41d86620da2377f09191fc93465ed82bae9a0096bf60245b493622d"
+      },
+      {
+        "name": "strategy-trace-controller.mjs",
+        "bytes": 22071,
+        "sha256": "4c466d7cb3b1098cc636fb21d05e86e378515ba99a5d59e02beae3186ebe837c"
+      },
+      {
+        "name": "strategy-trace-protocol.mjs",
+        "bytes": 12618,
+        "sha256": "fe9c4b0c973fec04f8f64819c523588747a7b06b304695ea251db0e86d7ac365"
+      },
+      {
+        "name": "strategy-worker.mjs",
+        "bytes": 9733,
+        "sha256": "35a067ec05fe0e058f229df65ced82fd7614a545eae4f8b9d5442ab12c46735c"
+      },
+      {
+        "name": "strategy-workspace.mjs",
+        "bytes": 37457,
+        "sha256": "1b7ac6be7fe544d1dea4b8d76a9f5efb2d2d1c03a6fe2eb9d412ff3dd3da61a5"
+      }
+    ],
+    "vendor": {
+      "codemirror": {
+        "asset_set_id": "86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56",
+        "manifest_sha256": "65e7257469ab641cf111994c54ff0ed00634138811ddf896f5137eb47605d91c"
+      },
+      "pyodide": {
+        "version": "0.27.6",
+        "asset_set_id": "1404bcc925dad5900b1205e9e7a127d85a654137554c6e76492eca5a2b80cff0",
+        "manifest_sha256": "c5c5e67cd0713b41980a9076ccccf189630da6dd092a9d7461cb93bd3714636e"
+      }
+    }
+  }
+}

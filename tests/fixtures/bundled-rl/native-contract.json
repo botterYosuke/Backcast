@@ -1,0 +1,74 @@
+{
+  "capability": {
+    "available": true,
+    "contractVersion": "bundled_rl_trace_v1",
+    "preset": {
+      "id": "bundled_rl",
+      "revision": "rl_scalp_evolution_v1",
+      "digest": "528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1"
+    }
+  },
+  "unavailableCapability": {
+    "available": false,
+    "contractVersion": "bundled_rl_trace_v1",
+    "preset": {
+      "id": "bundled_rl",
+      "revision": "rl_scalp_evolution_v1",
+      "digest": "528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1"
+    },
+    "unavailableReason": "Bundled RL is disabled by configuration."
+  },
+  "submit": {
+    "contractVersion": "bundled_rl_trace_v1",
+    "preset": {
+      "id": "bundled_rl",
+      "revision": "rl_scalp_evolution_v1",
+      "digest": "528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1"
+    },
+    "session": {
+      "stem": "1301",
+      "code": "13010",
+      "date": "2026-08-17",
+      "dataHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "jobResponse": {
+    "job": {
+      "jobId": "0123456789abcdef0123456789abcdef",
+      "inputId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "state": "ready",
+      "revision": 3,
+      "traceId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "error": null
+    }
+  },
+  "trace": {
+    "contractVersion": "bundled_rl_trace_v1",
+    "preset": {
+      "id": "bundled_rl",
+      "revision": "rl_scalp_evolution_v1",
+      "digest": "528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1"
+    },
+    "session": {
+      "stem": "1301",
+      "code": "13010",
+      "date": "2026-08-17",
+      "dataHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tickCount": 3
+    },
+    "inputId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "runtimeFingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "proposalContract": "backcast_position_target_v1",
+    "decisions": [
+      {
+        "observedSessionTickIndex": 0,
+        "eligibleFromSessionTick": 1,
+        "decisionTimeUs": 1786938060000000,
+        "positionBranches": [
+          {"positionQuantity": 0, "targetQuantity": 100},
+          {"positionQuantity": 100, "targetQuantity": 0}
+        ]
+      }
+    ]
+  }
+}

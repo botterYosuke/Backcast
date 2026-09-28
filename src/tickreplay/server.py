@@ -22,6 +22,8 @@ operation-start handshake, consumed by Step 8's frontend polling).
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import json
 import mimetypes
 import threading
 import uuid
@@ -31,21 +33,46 @@ from dataclasses import dataclass, replace
 from datetime import date as Date
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 import anyio
 import anyio.to_thread
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import cache, cache_commit, daily_context, minute_context
-from .config import build_http_client, resolve_cache_config
+from .bundled_rl_runtime import (
+    BundledRlProcess,
+    BundledRlRuntimeError,
+    self_check,
+)
+from .bundled_rl_service import (
+    BundledRlJobNotFoundError,
+    BundledRlManager,
+    BundledRlManagerClosedError,
+    BundledRlQueueFullError,
+    BundledRlUnavailableError,
+)
+from .config import (
+    build_http_client,
+    resolve_bundled_rl_config,
+    resolve_cache_config,
+)
 from .repository import (
     SymbolAvailabilityUnknownError,
     SymbolNotFoundError,
     SymbolUnavailableError,
     TickRepository,
+)
+from .strategy_trace import (
+    CONTRACT_VERSION,
+    PRESET,
+    STEM_RE,
+    TraceStore,
+    TraceStoreError,
+    TraceValidationError,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -53,6 +80,7 @@ DAILY_CONTEXT_IO_CONCURRENCY = 4
 _DAILY_CONTEXT_LIMITER = anyio.CapacityLimiter(DAILY_CONTEXT_IO_CONCURRENCY)
 IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 MUTABLE_CACHE_CONTROL = "no-store"
+MAX_NATIVE_REQUEST_BYTES = 16 * 1024
 STRATEGY_REPORT_ONLY_CSP = (
     "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
     "style-src 'self' 'unsafe-inline'; worker-src 'self'; connect-src 'self'; "
@@ -273,8 +301,47 @@ class OperationTracker:
 
 _construction_lock = threading.Lock()
 _repository: TickRepository | None = None
+_native_manager: BundledRlManager | None = None
 _lifespan_users = 0
 _tracker = OperationTracker()
+
+
+def _build_native_manager(cache_dir: Path) -> BundledRlManager:
+    config = resolve_bundled_rl_config(cache_dir=cache_dir)
+    if not config.enabled:
+        return BundledRlManager(
+            available=False,
+            unavailable_reason="Bundled RL is disabled by configuration.",
+            process=None,
+            store=None,
+            runtime_manifest=None,
+            runtime_fingerprint=None,
+        )
+    process = BundledRlProcess()
+    try:
+        manifest, fingerprint = self_check(
+            process, timeout_seconds=config.timeout_seconds
+        )
+    except (BundledRlRuntimeError, TimeoutError):
+        return BundledRlManager(
+            available=False,
+            unavailable_reason="Bundled RL runtime self-check failed.",
+            process=None,
+            store=None,
+            runtime_manifest=None,
+            runtime_fingerprint=None,
+        )
+    return BundledRlManager(
+        available=True,
+        unavailable_reason=None,
+        process=process,
+        store=TraceStore(config.artifact_dir),
+        runtime_manifest=manifest,
+        runtime_fingerprint=fingerprint,
+        max_concurrency=config.max_concurrency,
+        max_queue=config.max_queue,
+        timeout_seconds=config.timeout_seconds,
+    )
 
 
 def _acquire_repository_for_lifespan() -> TickRepository:
@@ -285,7 +352,7 @@ def _acquire_repository_for_lifespan() -> TickRepository:
     reference count prevents one lifespan exit from closing the instance
     while another re-entrant lifespan still owns it.
     """
-    global _lifespan_users, _repository
+    global _lifespan_users, _native_manager, _repository
     with _construction_lock:
         if _repository is None:
             config = resolve_cache_config()
@@ -298,27 +365,36 @@ def _acquire_repository_for_lifespan() -> TickRepository:
             try:
                 cache.discard_orphaned_part_files(repository.cache_dir)
                 cache_commit.reconcile_all_at_startup(repository.cache_dir, repository)
+                native_manager = _build_native_manager(repository.cache_dir)
             except BaseException:
                 repository.close()
                 repository.http_client.close()
                 raise
             _repository = repository
+            _native_manager = native_manager
+        elif _native_manager is None:
+            raise RuntimeError("native strategy manager ownership is inconsistent")
         _lifespan_users += 1
         return _repository
 
 
 def _release_repository_from_lifespan(repository: TickRepository) -> None:
     """Release one lifespan owner and close the last owner's repository."""
-    global _lifespan_users, _repository
+    global _lifespan_users, _native_manager, _repository
     to_close: TickRepository | None = None
+    native_to_close: BundledRlManager | None = None
     with _construction_lock:
         if _repository is not repository or _lifespan_users <= 0:
             raise RuntimeError("lifespan repository ownership is inconsistent")
         _lifespan_users -= 1
         if _lifespan_users == 0:
             _repository = None
+            native_to_close = _native_manager
+            _native_manager = None
             to_close = repository
 
+    if native_to_close is not None:
+        native_to_close.shutdown()
     if to_close is not None:
         try:
             to_close.close()
@@ -345,17 +421,32 @@ def get_tracker() -> OperationTracker:
         return _tracker
 
 
+def get_native_manager() -> BundledRlManager:
+    """Return the lifespan-owned native manager without constructing it."""
+    with _construction_lock:
+        if _native_manager is None:
+            raise RuntimeError(
+                "native strategy manager is unavailable outside the app lifespan"
+            )
+        return _native_manager
+
+
 def reset_for_tests() -> None:
     """Test-only: close detached state and reset the in-memory tracker."""
-    global _repository, _tracker
+    global _native_manager, _repository, _tracker
     to_close: TickRepository | None = None
+    native_to_close: BundledRlManager | None = None
     with _construction_lock:
         if _lifespan_users:
             raise RuntimeError("cannot reset while an app lifespan is active")
         to_close = _repository
+        native_to_close = _native_manager
         _repository = None
+        _native_manager = None
         _tracker = OperationTracker()
         daily_context.reset_for_tests()
+    if native_to_close is not None:
+        native_to_close.shutdown()
     if to_close is not None:
         try:
             to_close.close()
@@ -554,6 +645,251 @@ def read_session(
             detail=f"{symbol}: {date} 付近に約定データが見つかりません",
         )
     return {"pending": False, "operationId": None, **session.as_dict()}
+
+
+def _native_job_request(payload: object) -> dict[str, str]:
+    """Reject every non-preset field before touching repository or job state."""
+    if not isinstance(payload, dict) or set(payload) != {
+        "contractVersion",
+        "preset",
+        "session",
+    }:
+        raise HTTPException(status_code=400, detail="invalid Bundled RL request")
+    request = cast(dict[str, object], payload)
+    if request["contractVersion"] != CONTRACT_VERSION or request["preset"] != PRESET:
+        raise HTTPException(status_code=400, detail="unsupported Bundled RL preset")
+    session = request["session"]
+    if not isinstance(session, dict) or set(session) != {
+        "stem",
+        "code",
+        "date",
+        "dataHash",
+    }:
+        raise HTTPException(status_code=400, detail="invalid session identity")
+    session_value = cast(dict[str, object], session)
+    if not all(isinstance(session_value[key], str) for key in session_value):
+        raise HTTPException(status_code=400, detail="invalid session identity")
+    normalized = cast(dict[str, str], session_value)
+    code = normalized["code"]
+    if (
+        STEM_RE.fullmatch(normalized["stem"]) is None
+        or not code
+        or "\x00" in code
+        or len(code.encode("utf-8")) > 128
+        or not _is_hex_identifier(normalized["dataHash"])
+    ):
+        raise HTTPException(status_code=400, detail="invalid session identity")
+    day = _parse_date(normalized["date"])
+    if day.isoformat() != normalized["date"]:
+        raise HTTPException(status_code=400, detail="invalid session identity")
+    return normalized
+
+
+def _local_host_authority(value: str) -> str | None:
+    authority = value.lower()
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing == -1 or authority[: closing + 1] != "[::1]":
+            return None
+        suffix = authority[closing + 1 :]
+        if suffix and not suffix.startswith(":"):
+            return None
+        port = suffix[1:] if suffix else ""
+    else:
+        host, separator, port = authority.partition(":")
+        if host not in {"localhost", "127.0.0.1"}:
+            return None
+        if separator and ":" in port:
+            return None
+    if port:
+        if not port.isascii() or not port.isdigit() or len(port) > 5:
+            return None
+        if not 1 <= int(port) <= 65535:
+            return None
+    return authority
+
+
+def _require_native_local(request: Request) -> None:
+    peer = request.client.host if request.client is not None else ""
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        address = None
+    host_values = request.headers.getlist("host")
+    authority = _local_host_authority(host_values[0]) if len(host_values) == 1 else None
+    if address is None or not address.is_loopback or authority is None:
+        raise HTTPException(status_code=403, detail="native strategy access denied")
+    origins = request.headers.getlist("origin")
+    if len(origins) > 1 or (
+        origins and origins[0] != f"{request.url.scheme}://{authority}"
+    ):
+        raise HTTPException(status_code=403, detail="native strategy access denied")
+
+
+async def _read_native_json(request: Request) -> object:
+    _require_native_local(request)
+    content_lengths = request.headers.getlist("content-length")
+    if len(content_lengths) > 1:
+        raise HTTPException(status_code=400, detail="invalid content length")
+    raw_length = content_lengths[0] if content_lengths else None
+    if raw_length is not None:
+        if not raw_length.isascii() or not raw_length.isdigit():
+            raise HTTPException(status_code=400, detail="invalid content length")
+        if len(raw_length) > len(str(MAX_NATIVE_REQUEST_BYTES)):
+            raise HTTPException(
+                status_code=413, detail="native strategy request too large"
+            )
+        if int(raw_length) > MAX_NATIVE_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413, detail="native strategy request too large"
+            )
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_NATIVE_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413, detail="native strategy request too large"
+            )
+        body.extend(chunk)
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("non-finite JSON number")
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            body.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicates,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="invalid native strategy request"
+        ) from None
+
+
+@app.get("/api/strategies/bundled-rl/capability")
+def read_native_strategy_capability(request: Request) -> dict[str, object]:
+    _require_native_local(request)
+    return get_native_manager().capability()
+
+
+@app.post("/api/strategies/bundled-rl/jobs")
+def create_native_strategy_job(
+    request: Request, payload: object = Depends(_read_native_json)
+) -> JSONResponse:
+    _require_native_local(request)
+    requested = _native_job_request(payload)
+    manager = get_native_manager()
+    if not manager.available:
+        raise HTTPException(
+            status_code=503, detail="native strategy execution is unavailable"
+        )
+    repository = get_repository()
+    tracker = get_tracker()
+    symbol = requested["stem"].upper()
+    pending = _ensure_ready_or_pending(repository, tracker, symbol)
+    if pending is not None:
+        raise HTTPException(
+            status_code=409, detail="authoritative session is not ready"
+        )
+    day = _parse_date(requested["date"])
+    try:
+        session = repository.resolve_and_load_session(symbol, day, 0)
+    except (
+        SymbolNotFoundError,
+        SymbolAvailabilityUnknownError,
+        SymbolUnavailableError,
+    ) as error:
+        _reraise_as_http(error)
+        raise AssertionError("unreachable") from error
+    if session is None:
+        raise HTTPException(
+            status_code=404, detail="authoritative session was not found"
+        )
+    if (
+        requested["stem"] != session.stem
+        or requested["code"] != session.code
+        or requested["date"] != session.date
+        or requested["dataHash"] != session.data_hash
+    ):
+        raise HTTPException(status_code=409, detail="session identity mismatch")
+    observable_session = {
+        "stem": session.stem,
+        "code": session.code,
+        "date": session.date,
+        "count": len(session.us),
+        "us": session.us,
+        "price": session.price,
+        "qty": session.qty,
+        "type": session.trade_type,
+    }
+    try:
+        job = manager.submit(session=observable_session)
+    except TraceValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except BundledRlQueueFullError:
+        raise HTTPException(
+            status_code=429, detail="native strategy execution queue is full"
+        ) from None
+    except (BundledRlUnavailableError, BundledRlManagerClosedError):
+        raise HTTPException(
+            status_code=503, detail="native strategy execution is unavailable"
+        ) from None
+    status_code = 200 if job.state == "ready" else 202
+    return JSONResponse({"job": job.as_dict()}, status_code=status_code)
+
+
+@app.get("/api/strategies/bundled-rl/jobs/{job_id}")
+def read_native_strategy_job(job_id: str, request: Request) -> dict[str, object]:
+    _require_native_local(request)
+    try:
+        return get_native_manager().snapshot(job_id).as_dict()
+    except BundledRlJobNotFoundError:
+        raise HTTPException(
+            status_code=404, detail="native strategy job was not found"
+        ) from None
+
+
+@app.delete("/api/strategies/bundled-rl/jobs/{job_id}")
+def cancel_native_strategy_job(job_id: str, request: Request) -> dict[str, object]:
+    _require_native_local(request)
+    try:
+        return {"job": get_native_manager().cancel(job_id).as_dict()}
+    except BundledRlJobNotFoundError:
+        raise HTTPException(
+            status_code=404, detail="Bundled RL job was not found"
+        ) from None
+
+
+@app.get("/api/strategies/bundled-rl/traces/{trace_id}")
+def read_native_strategy_trace(trace_id: str, request: Request) -> Response:
+    _require_native_local(request)
+    manager = get_native_manager()
+    if not manager.available or manager.store is None:
+        raise HTTPException(
+            status_code=404, detail="native strategy trace was not found"
+        )
+    try:
+        data = manager.store.read_bytes(trace_id)
+    except (FileNotFoundError, TraceStoreError):
+        raise HTTPException(
+            status_code=404, detail="native strategy trace was not found"
+        ) from None
+    return Response(
+        content=data,
+        media_type="application/json",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "ETag": f'"{trace_id}"',
+        },
+    )
 
 
 @app.get("/api/minute-context")

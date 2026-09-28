@@ -58,6 +58,7 @@ import httpx
 
 from . import cache
 from .cache_commit import CommitCoordinator
+from .strategy_trace import session_data_hash
 
 # Symbol files are 4-5 character alphanumeric codes. Anything else in a
 # listing is a sync artifact (e.g. "130A_ADMIN_..._Conflict.duckdb"). The
@@ -160,7 +161,7 @@ class SessionTicks:
     qty: list[int]
     trade_type: list[str]
 
-    def as_dict(self) -> dict[str, object]:
+    def _observable_dict(self) -> dict[str, object]:
         return {
             "stem": self.stem,
             "code": self.code,
@@ -171,6 +172,14 @@ class SessionTicks:
             "qty": self.qty,
             "type": self.trade_type,
         }
+
+    @property
+    def data_hash(self) -> str:
+        """SHA-256 of the exact ordered fields exposed to strategy execution."""
+        return session_data_hash(self._observable_dict())
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self._observable_dict(), "dataHash": self.data_hash}
 
 
 class _ConnectionPool:
@@ -722,19 +731,14 @@ class TickRepository:
         price: list[float] = []
         qty: list[int] = []
         trade_type: list[str] = []
-        previous_us = -1
         for row_us, row_price, row_qty, row_type in rows:
             # An unparseable timestamp cannot be placed on a time axis; a null
             # price cannot be drawn. Both are dropped rather than guessed.
             if row_us is None or row_price is None:
                 continue
-            # Executions can share a microsecond. Lightweight Charts needs a
-            # strictly increasing time axis, so collisions are nudged forward
-            # by one microsecond instead of being collapsed.
             value = int(row_us)
-            if value <= previous_us:
-                value = previous_us + 1
-            previous_us = value
+            # Preserve equal-timestamp prints in authoritative query order.
+            # The bundled policy deliberately observes the full timestamp block.
             us.append(value)
             price.append(float(row_price))
             qty.append(int(row_qty or 0))

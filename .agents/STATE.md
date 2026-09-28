@@ -329,3 +329,94 @@ Rolling progress summary (latest 5 checkpoints): [PROGRESS.md](../PROGRESS.md)
 - The independent full preflight passed: Ruff check, Ruff format, Ty, and 1275 pytest tests; one pre-existing Starlette/httpx deprecation warning remains.
 - The native contract checker passed 8/8 checks, including the three restored relative symlinks. Focused portability and safety tests passed under the project runtime, and the resolver protocol also passed a system Python 3.9.6 smoke test.
 - Security review found no findings. Quality review found no blocking findings after correcting this block's wording about the retained sed durability limits. Test review found three nonblocking regression-test gaps; GNU/Linux execution remains unverified.
+
+---
+
+## Current Feature: Native Python strategy decision traces
+<!-- orchestra:block-id: native-python-strategy-decision-traces -->
+
+### Context
+
+- Goal: Execute approved trusted Python source in a configured native batch worker, publish a verified immutable sparse proposal trace, and replay it through the existing paper broker.
+- Key files: new `src/tickreplay/strategy_trace.py`, `native_strategy.py`, `native_strategy_worker.py`, trace `.mjs` modules/tests, plus targeted server/config/repository/workspace/app/UI/release/tests/docs changes.
+- Dependencies: existing TickRepository, FastAPI lifespan, strategy workspace/controller port, replay-commit/order-broker, content-addressed release builder; no new web-process ML dependency.
+- Complexity: COMPLEX
+
+### Architecture
+
+- Native Trace is explicit and default-off. FastAPI never executes source; a fixed-argv trusted/local external worker consumes causal tick snapshots and emits sparse proposals.
+- Canonical source/session/runtime/config/contract identities drive single-flight jobs and content-addressed atomic trace storage.
+- Browser fetches a verified immutable trace before replay; replay-time proposals pass only through existing next-tick staging and atomic paper broker.
+
+### Codex Validation
+
+- Scope classification: COMPLEX, approximately 20-35 files and 2,000-4,000 LOC including tests.
+- Initial plan validation returned NEEDS_REVISION for abstract paths, destructive fetch, every-tick rows, and incomplete identity detail.
+- Revised plan `.agents/docs/plans/native-python-strategy-traces.md` uses actual repository paths, idempotent immutable GET, sparse rows, complete identity, and passed re-validation.
+
+### Integration Points
+
+- Backend: TickRepository session snapshot/hash, bounded native job manager, FastAPI capability/job/status/cancel/trace routes.
+- Frontend: explicit Pyodide/native mode, strategy workspace lifecycle, trace controller/protocol, Stop/seek/reset invalidation.
+- Broker: existing replay-commit and order-broker remain authoritative for all validation, fills, and portfolio mutation.
+- Release: generate a new immutable strategy release; retained releases remain byte-identical.
+
+### Decisions
+
+- V1 is trusted/local-only, cursor-zero-only, mutually exclusive with manual/Pyodide execution, unavailable on Cloud Run, and excludes live trading.
+- Trace rows are sparse proposal batches and contain no source, fills, cash, positions, portfolio, absolute paths, or raw stderr.
+- Immutable trace GET is repeatable so Restart/reload can recover the same verified artifact.
+
+---
+
+## Current Feature: Bundled RL default strategy
+<!-- orchestra:block-id: bundled-rl-default-strategy -->
+
+### Context
+
+- Goal: copy the selected `_moomoo` RL checkpoint and the minimal inference semantics into this repository so `uv run python run.py` can offer the RL strategy without runtime access to `_moomoo`.
+- Key artifacts: `.agents/docs/research/bundled-rl-model-inventory.md`, `.agents/docs/research/bundled-rl-default-source-scan.md`, and `.agents/docs/plans/bundled-rl-default-strategy.md`.
+- Complexity: COMPLEX; implementation route is `team-execute`.
+
+### Architecture
+
+- Bundle the unchanged 11,932-byte JSON checkpoint and pin NumPy 2.4.5; only a fixed child imports NumPy and evaluates the model.
+- Add bundled-only `native_trace_v2` with flat/long target branches selected from the actual committed browser portfolio; preserve custom `native_trace_v1` unchanged.
+- Default the UI selection to a read-only Bundled RL Native preset while preserving the existing saved source record and requiring explicit Load then Start.
+
+### Validation
+
+- Codex scope classified the feature as COMPLEX.
+- Architecture and implementation planning completed. Three strict revision rounds closed ownership, dirty-worktree, retained-release, `.env` isolation, real-process, and exact next-tick browser gates.
+- Final validation `.agents/logs/codex/20260928T040144Z-bundled-rl-pass-validation.md` returned PASS with no remaining blockers.
+
+### Approval Gate
+
+- No application source, model asset, dependency, or release has been changed for this feature yet. Await explicit user approval of the implementation plan before running the bootstrap snapshot and `team-execute`.
+
+---
+
+## Current Feature: Bundled RL final form
+<!-- orchestra:block-id: bundled-rl-final-form -->
+
+### Context
+
+- The user explicitly waived backward compatibility and requested the ideal final implementation.
+- The earlier compatibility-preserving Bundled RL plan and its PASS are superseded.
+- Complexity remains COMPLEX and implementation route remains `team-execute`.
+
+### Architecture
+
+- Product strategies are exactly `Bundled RL` (default fixed Native) and `Custom Python` (explicit browser Pyodide).
+- Native uses only `bundled_rl_trace_v1`, accepts exact preset identity and session identity, and never accepts submitted source or custom executor configuration.
+- The browser selects flat/long target branches from actual post-commit portfolio state and stages at most one order for the exact next tick.
+
+### Superseded Decisions
+
+- Do not preserve custom Native v1, planned native_trace_v2 dual dispatch, executor argv/trust environment settings, old selection schemas, or custom-Native E2E compatibility.
+- Keep Custom Python source/editor only because it remains an explicit current feature, not for migration compatibility.
+
+### Implementation Gate
+
+- The revised plan is `.agents/docs/plans/bundled-rl-default-strategy.md`.
+- Before delegation, update this canonical state/design, obtain fresh plan validation, fingerprint/capture the dirty worktree, and preflight exact ownership.

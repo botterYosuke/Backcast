@@ -43,6 +43,11 @@
 | FR-TICKREPLAY-8 | Render daily history strictly before the actual replay session date and derive the selected-day candle only from ticks already replayed. | High | Use raw point-in-time OHLCV across legacy/current Code partitions; never expose the stored selected-day final OHLC. |
 | FR-TICKREPLAY-9 | Display SMA25 and SMA200 in daily mode using valid raw daily closes, including a non-empty partial day as one observation. | High | Emit the first point only at 25 or 200 observations; insufficient history produces no premature line. |
 | FR-TICKREPLAY-10 | Show Daily mode initially with the newest 90 bars and 5 logical bars of right padding, then load older daily bars when the user pans or zooms near the oldest loaded bar. | High | Use user-armed single-flight paging, stale-response rejection, deduplication, exhaustion/cooldown, and exact logical-range compensation after prepend. |
+| FR-NATIVE-TRACE-1 | Execute explicitly selected trusted Python strategy source in a configured native executor and return an immutable sparse decision trace for browser replay. | High | Default off; cursor-zero; no per-tick network; proposals only; existing paper broker remains authoritative. |
+| FR-NATIVE-TRACE-2 | Preserve existing Pyodide strategy execution and ordinary replay when native execution is disabled, unavailable, cancelled, or fails. | High | No implicit mode fallback within an active run. |
+| FR-BUNDLED-RL-1 | Run the selected _moomoo RL policy from assets and runtime code contained entirely in this repository. | High | No runtime read/import from _moomoo; exact checkpoint bytes and NumPy version are pinned and verified. |
+| FR-BUNDLED-RL-2 | Select the bundled RL Native strategy by default without overwriting or automatically executing the user's saved custom strategy. | High | The user still performs explicit Load and Start; saved source remains available as Saved strategy. |
+| FR-BUNDLED-RL-3 | Expose only an exact-preset, source-free fixed Native API for Bundled RL and reset obsolete strategy selections to Bundled RL. | High | This supersedes custom Native v1/v2 compatibility requirements; Custom Python remains browser-Pyodide only. |
 
 ## 非機能要件 (Non-Functional Requirements)
 
@@ -53,7 +58,7 @@
 |----------|-------------|-----------------|
 | Performance | Bound daily history and avoid whole-history application materialization. | At most 500 completed sessions; LIMIT in DuckDB; replay updates only the partial candle and terminal SMA points. |
 | Availability | | |
-| Security | | |
+| Security | The FastAPI process never imports, compiles, evaluates, or executes submitted source; v1 native execution is trusted/local-only and is not represented as a sandbox. | Default-off and Cloud Run-disabled configuration; direct worker contract tests are the only normal tests that execute harmless fixture source. |
 | Maintainability | | |
 | Correctness | Reject stale daily data and preserve all minute/replay side effects during chart-mode changes. | Generation, full session identity, and request token checked before commits; mode gates apply only to leaf chart writes. |
 | Replay performance | Precompute historical SMA25/SMA200 series and rolling-window state when daily history loads; never rebuild full SMA arrays per replay tick. | Historical SMA calculation once per accepted daily payload; at most one O(1) terminal-point update per animation frame and once after seek/reset completion. |
@@ -61,6 +66,9 @@
 | Browser Python lifecycle correctness | No stale Load publication, unresolved superseded request, or orphan runtime across concurrent Load/Stop/dispose. | Deferred admission/hash/invalidation and stale response/error/timer matrix; all promises settle; each discarded Worker terminates once and every created Worker terminates exactly once after final shutdown. |
 | Browser Python transactional correctness | Accepted state remains finite and representable by every Worker ABI integer/price/minor-unit field, including no-fill valuation changes. | Boundary and boundary+1 tests for both sides and aggregates; typed rejection before swap/postMessage leaves portfolio, orders, fills, events, IDs, cursor, and ledgers unchanged. |
 | Browser Python release verification | Qualify actual production Worker/Python/replay/broker behavior and preserve immutable release identities. | Real browser fixture proves event-i order fills only at i+1 with exact portfolio/cursor, cancellation, Stop/restart, Load-only execution, and Python error handling; retained-release byte integrity and new canonical reconstruction pass before merge/promotion. |
+| Correctness | Trace identity, lifecycle, sparse decision ordering, and next-tick causality remain deterministic across cancellation, reload, and cache reuse. | Canonical SHA-256 identities; atomic verified publish; repeated byte-identical GET; observed tick i is eligible only at i+1. |
+| Bundled RL correctness | Use actual committed broker position to select a causal next-tick target and fail closed for unsafe portfolio, order, runtime, or artifact state. | Only positions/targets 0 or 100; at most one market command; proposal at tick i can fill only at i+1; retained releases remain byte-identical. |
+| Bundled RL contract simplicity | Maintain one Native trace schema and reject source, executor, mode, stale preset, and unknown fields before any repository, cache, job, lease, child, or artifact side effect. | No native_trace_v1/v2 dual dispatch or custom Native executor settings remain in active code; exact-preset negative tests are side-effect-zero. |
 
 ## アーキテクチャ (Architecture)
 
@@ -85,6 +93,12 @@
 
 - Browser Python review remediation: workspace and controller reserve Load generations synchronously and keep candidate Worker/request/interrupt/finalization resources owned by each attempt. The broker/replay boundary validates the complete candidate portfolio and exact Worker snapshot before atomic state publication, including no-fill valuation. The UI describes immediate trusted-code execution at Load. Canonical runtime changes produce a new immutable release; actual production Worker integration is a required acceptance gate. The active implementation order and acceptance matrix are recorded in `.agents/docs/plans/pyodide-replay-strategy.md`, Review remediation (2026-09-14).
 
+- Native Python strategy traces: the browser submits an immutable source/session identity once, FastAPI schedules a configured external worker without executing source, the worker consumes causal tick snapshots and emits a sparse proposal trace, and the browser replays the verified trace through the existing next-tick transactional paper broker.
+
+- Bundled RL default strategy: a versioned read-only browser preset requests a content-addressed native_trace_v2 artifact. A fixed child process loads the repository-owned JSON checkpoint, computes causal position-target branches for flat and long states, and returns proposals only. After each broker commit, the browser selects the branch for the actual position and stages any target delta for the next tick. Custom Native v1 remains a separate unchanged compatibility path.
+
+- Bundled RL final form (supersedes the earlier compatibility paragraph): the product selector is `Bundled RL | Custom Python`. Bundled RL is the default fixed Native strategy and uses the sole `bundled_rl_trace_v1` exact-preset API with no source submission. Custom Python is explicitly selected and remains entirely in browser Pyodide. The earlier custom Native v1 preservation and native_trace_v2 dual-path statements are historical and no longer apply.
+
 ## 技術選定 (Tech Stack & Rationale)
 
 <!-- Chosen technologies and why. Record alternatives considered. -->
@@ -96,6 +110,8 @@
 | TickReplay daily chart and indicators | FastAPI plus bounded DuckDB query, RequestCoordinator, a DOM-free native ES module, and a separate Lightweight Charts instance | Matches existing repository patterns while keeping data validation, request state, SMA math, and chart ownership testable and isolated. | New dependencies; client-side full-history aggregation; shared minute/daily chart series. |
 | TickReplay Daily history paging | Existing /api/daily-context strict-before requests plus DailyChartSession paging state and Lightweight Charts logical ranges | The endpoint already supports arbitrary cutoffs and bounded limits; logical-range +N compensation preserves a user-selected viewport after prepend. | New backend pagination schema; eager full-history loading; reuse MinuteChartSession directly. |
 | Browser Python strategy editor | CodeMirror 6 with Python language support | Provides the line numbers, syntax highlighting, indentation, search, diagnostics integration, and keyboard editing needed for a usable single-file strategy workflow while keeping the editor modular and independent from the Pyodide execution Worker. | Plain textarea for a technical spike; Monaco Editor for a future multi-file or language-server-backed IDE; external editor plus Python file import/export only |
+| Native strategy execution | Fixed-argv native Python worker with framed JSON plus content-addressed trace store | Keeps NumPy/model dependencies outside the web process and supports bounded cancellation, parent validation, and deterministic cache reuse. | Browser Pyodide adapter; ONNX Runtime Web; per-tick inference service |
+| Bundled RL inference | Pinned NumPy 2.4.5, unchanged JSON MLP checkpoint, and a fixed-argv native_trace_v2 child worker | Matches the selected upstream model exactly while remaining small, deterministic, and independent of _moomoo at runtime. | Pyodide inference; ONNX conversion; Torch/SB3; per-tick HTTP inference. |
 
 ## 制約 (Constraints)
 
@@ -108,6 +124,10 @@
 - Daily history is limited to 500 completed sessions, uses no paging or daily trade markers, reads no adjustment columns, and adds no dependency, migration, or existing API-contract change.
 
 - The previous no-paging limit for Daily history is superseded by FR-TICKREPLAY-10: each request remains bounded (500 initial, 200 older), uses the unchanged strict-before API, and adds no dependency or migration.
+
+- Native Trace v1 is trusted/local-only, disabled by default, unavailable on Cloud Run, cursor-zero-only, mutually exclusive with manual/Pyodide execution, and does not support live brokerage or untrusted multi-tenant code.
+
+- Superseding constraint (2026-09-28): Native Trace v1 compatibility, custom executor argv/trust configuration, and source-bearing Native requests are intentionally removed. Retained release directories remain immutable for integrity, not compatibility.
 
 ## Key Decisions
 
@@ -135,6 +155,14 @@
 | Validate complete candidate portfolio and Worker ABI numeric closure before strategy transaction swap or message dispatch. | Individually valid orders can overflow aggregate position or derived minor-unit cash/P&L/equity. Price-only movement also needs validation. Reject with typed error and full transaction rollback, retaining manual-only accounting behavior and refusing invalid Start snapshots. | Validate only input quantities; clamp values; detect invalid portfolio after committing a fill; rewrite all legacy accounting. | 2026-09-13 |
 | Make trusted-code and immediate Load execution warnings persistent and accessible at the execution controls. | Top-level Python executes before Start in a same-origin Worker with browser capabilities. Load and the active editor input must describe the trust boundary in enhanced and degraded modes while preserving plaintext-storage disclosure. | Runbook-only warning, storage-only notice, repeated confirmation dialogs, or representing a Worker as a security sandbox. | 2026-09-13 |
 | Require new immutable release reconstruction and actual production Worker event-to-fill integration for Python remediation acceptance. | Canonical changes must generate a new content-addressed closure without modifying retained releases. Fake Worker and native Python checks cannot prove production Python serialization, host commit, and next-tick eligibility work together. | Edit retained release bytes; rely only on mocked Worker tests or positive asset hash checks. | 2026-09-13 |
+| Use cache-first session batch execution and immutable sparse traces rather than per-tick HTTP or WebSocket inference. | Replay input is already complete; batch execution improves determinism, seek/reset handling, throughput, and auditability. | Pyodide-only inference; per-tick native RPC; server-owned broker simulation | 2026-09-28 |
+| Keep fills, cash, positions, and portfolio mutation out of trace artifacts and retain replay-commit/order-broker as the sole execution authority. | A trace records proposals, while existing validated host transactions preserve next-tick eligibility and atomic rollback. | Replay recorded fills; let executor mutate portfolio; duplicate broker semantics in Python | 2026-09-28 |
+| Ship native_trace_v1 as default-off trusted/local-only execution with a separately configured external executor. | A child process provides lifecycle isolation but is not a security sandbox; public or multi-tenant arbitrary-code execution requires a future isolation boundary. | Exec inside FastAPI; claim subprocess sandboxing; enable on Cloud Run | 2026-09-28 |
+| Bundle the selected _moomoo NumPy checkpoint and run it only in a fixed native child process, while keeping FastAPI free of NumPy, model parsing, and submitted-source execution. | The selected checkpoint is a small JSON MLP and can be made repository-self-contained without Pyodide or the upstream training repository; the child boundary preserves the existing web-process trust boundary. | Load _moomoo at runtime; execute inference in Pyodide; import NumPy and the model in FastAPI. | 2026-09-28 |
+| Add bundled-only native_trace_v2 position-target branches while preserving the complete custom native_trace_v1 path unchanged. | The RL policy depends on the broker-committed position, so the immutable trace must provide both valid branches and let the existing browser broker remain the sole fill and portfolio authority. | Record assumed fills in Python; wrap custom v1 commands in v2; duplicate broker semantics in the worker. | 2026-09-28 |
+| Default fresh and unselected profiles to a read-only Bundled RL preset in Native mode while preserving saved custom source bytes and retaining explicit Load then Start actions. | The application should present RL by default without silently executing code on mount or overwriting the user's existing strategy source. | Replace the saved source record; auto-run on page load; silently fall back to Pyodide when native capability is unavailable. | 2026-09-28 |
+| Supersede the custom Native v1/v2 compatibility design with one fixed bundled_rl_trace_v1 server contract; Native accepts exact preset identity and never accepts source, executor argv, or a client runtime fingerprint. | The user explicitly waived backward compatibility. A single fixed contract is safer and simpler, while Custom Python remains an explicit browser-Pyodide product strategy. | Preserve custom Native v1; maintain v1/v2 dual dispatch; keep source-bearing Native requests. | 2026-09-28 |
+| Use a single strategy selector with Bundled RL as the reset/default and Custom Python as the explicit alternative; obsolete or malformed selection records reset instead of migrating. | Strategy and runtime are one product choice in the final form, and compatibility-only state machinery no longer adds value. | Separate strategy/runtime selectors; preserve every old selection record; overwrite the Custom Python source store. | 2026-09-28 |
 
 ## TODO / Open Questions
 

@@ -472,6 +472,44 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   line-height: 1.55;
 }
 
+.strategy-native-warning {
+  border-left-color: #7c4d9e;
+  background: #f7effc;
+  color: #59366f;
+}
+
+.strategy-execution-mode {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.strategy-execution-mode select {
+  min-height: 34px;
+  padding: 5px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+[data-strategy-workspace][data-strategy-selection="bundled_rl"]:not([data-strategy-mode="raw-recovery"]) .strategy-custom-control {
+  display: none;
+}
+
+.strategy-bundled-summary {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent));
+}
+
 .strategy-source-label {
   color: var(--ink-soft);
   font-size: 12px;
@@ -1060,6 +1098,7 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .strategy-editor { min-height: 55vh; max-height: none; white-space: pre-wrap; }
   .strategy-editor .cm-editor { min-height: 55vh; }
   .strategy-actions button,
+  .strategy-execution-mode select,
   .strategy-file-button,
   .strategy-conflict-actions button { min-height: 44px; }
   .strategy-output-grid { grid-template-columns: 1fr; }

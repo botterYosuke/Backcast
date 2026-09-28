@@ -150,6 +150,22 @@
         >戦略を開く</button>
       </div>
       <div id="strategy-panel" class="strategy-panel" data-strategy-panel hidden>
+        <label class="strategy-execution-mode">
+          <span>戦略</span>
+          <select data-strategy-selection aria-describedby="strategy-selection-help">
+            <option value="bundled_rl">Bundled RL</option>
+            <option value="custom_python">Custom Python</option>
+          </select>
+        </label>
+        <p id="strategy-selection-help" class="strategy-help">
+          Bundled RL は同梱モデルの判断を再生前に準備します。Load だけでは注文せず、Start 後の次 tick から売買します。
+        </p>
+        <div data-strategy-bundled-panel>
+          <p class="strategy-bundled-summary">
+            RL Scalp Evolution v1 · 0株または100株 · 実際の保有数に応じて提案を選択
+          </p>
+        </div>
+        <div data-strategy-custom-panel hidden>
         <p id="strategy-source-help" class="strategy-help">
           初期化できない場合も、この欄からソースを選択・コピーできます。戦略ソースは
           ブラウザの localStorage に平文で保存されます。
@@ -185,25 +201,26 @@ def on_end(summary):
           警告: 信頼できるコードだけを Load してください。Load を押すと Start より前にトップレベルの Python が直ちに実行されます。
           Worker はセキュリティ sandbox ではなく、コードはネットワーク通信や同一オリジンのブラウザ機能を利用できます。
         </p>
+        </div>
         <div class="strategy-actions" role="toolbar" aria-label="Python 戦略操作">
-          <button type="button" data-strategy-action="save" disabled>Save Draft</button>
+          <button class="strategy-custom-control" type="button" data-strategy-action="save" disabled>Save Draft</button>
           <button type="button" data-strategy-action="load" aria-describedby="strategy-execution-warning" disabled>Load</button>
           <button type="button" data-strategy-action="start" disabled>Start</button>
           <button type="button" data-strategy-action="stop" disabled>Stop</button>
           <button type="button" data-strategy-action="restart" disabled>Restart</button>
-          <label class="strategy-file-button">
+          <label class="strategy-file-button strategy-custom-control">
             Import .py
             <input type="file" accept=".py,text/x-python" data-strategy-import disabled />
           </label>
-          <button type="button" data-strategy-action="export" disabled>Export .py</button>
-          <button type="button" data-strategy-action="sample" disabled>Sample</button>
-          <button type="button" data-strategy-action="clear-source" disabled>Clear Saved Source</button>
+          <button class="strategy-custom-control" type="button" data-strategy-action="export" disabled>Export .py</button>
+          <button class="strategy-custom-control" type="button" data-strategy-action="sample" disabled>Sample</button>
+          <button class="strategy-custom-control" type="button" data-strategy-action="clear-source" disabled>Clear Saved Source</button>
           <button type="button" data-strategy-action="download-diagnostics" disabled>
             Download Run Diagnostics
           </button>
         </div>
 
-        <div class="strategy-conflict-actions" aria-label="保存競合の解決">
+        <div class="strategy-conflict-actions strategy-custom-control" aria-label="保存競合の解決">
           <button type="button" data-strategy-action="reload-latest" disabled>Reload Latest</button>
           <button type="button" data-strategy-action="overwrite" disabled>Overwrite with This Draft</button>
         </div>

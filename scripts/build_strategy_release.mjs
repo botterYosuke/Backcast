@@ -28,8 +28,11 @@ const AUTHORED_FILES = Object.freeze([
   ['strategy-workspace.mjs', 'src/tickreplay/static/strategy/strategy-workspace.mjs'],
   ['strategy-editor.mjs', 'src/tickreplay/static/strategy/strategy-editor.mjs'],
   ['strategy-source-store.mjs', 'src/tickreplay/static/strategy/strategy-source-store.mjs'],
+  ['strategy-selection-store.mjs', 'src/tickreplay/static/strategy/strategy-selection-store.mjs'],
   ['strategy-controller.mjs', 'src/tickreplay/static/strategy/strategy-controller.mjs'],
   ['strategy-protocol.mjs', 'src/tickreplay/static/strategy/strategy-protocol.mjs'],
+  ['strategy-trace-protocol.mjs', 'src/tickreplay/static/strategy/strategy-trace-protocol.mjs'],
+  ['strategy-trace-controller.mjs', 'src/tickreplay/static/strategy/strategy-trace-controller.mjs'],
   ['strategy-worker.mjs', 'src/tickreplay/static/strategy/strategy-worker.mjs'],
   ['strategy-runner.py', 'src/tickreplay/static/strategy/strategy-runner.py'],
 ]);
@@ -94,6 +97,8 @@ import { mountStrategyWorkspace } from './strategy-workspace.mjs';
 let assetsPromise = null;
 let editorPromise = null;
 let controllerModulePromise = null;
+let traceControllerModulePromise = null;
+let traceTransport = null;
 
 function loadAssets() {
   assetsPromise ??= import('./strategy-assets.mjs').then(({ strategyAssets }) => strategyAssets);
@@ -101,6 +106,12 @@ function loadAssets() {
 }
 
 const release = Object.freeze({
+  async loadCapability() {
+    const module = await (traceControllerModulePromise ??= import('./strategy-trace-controller.mjs'));
+    traceTransport ??= module.createBundledRlTraceHttpTransport();
+    return traceTransport.capability();
+  },
+
   async loadEditor() {
     editorPromise ??= Promise.all([
       import('./strategy-editor.mjs'),
@@ -112,7 +123,13 @@ const release = Object.freeze({
     return editorPromise;
   },
 
-  async loadController({ callbacks, performanceClass }) {
+  async loadController({ callbacks, performanceClass, mode = 'bundled_rl' }) {
+    if (mode === 'bundled_rl') {
+      const module = await (traceControllerModulePromise ??= import('./strategy-trace-controller.mjs'));
+      traceTransport ??= module.createBundledRlTraceHttpTransport();
+      return new module.BundledRlTraceController({ transport: traceTransport, ...callbacks });
+    }
+    if (mode !== 'pyodide') throw new TypeError('unknown strategy execution mode');
     const [assets, controllerModule] = await Promise.all([
       loadAssets(),
       controllerModulePromise ??= import('./strategy-controller.mjs'),
@@ -219,6 +236,8 @@ function scanClosure(closure) {
   for (const required of [
     'strategy-release.mjs', 'strategy-workspace.mjs', 'strategy-editor.mjs',
     'strategy-source-store.mjs', 'strategy-controller.mjs', 'strategy-protocol.mjs',
+    'strategy-selection-store.mjs',
+    'strategy-trace-controller.mjs', 'strategy-trace-protocol.mjs',
     'strategy-worker.mjs', 'strategy-runner.py', 'strategy-assets.mjs',
   ]) {
     if (!names.has(required)) throw new Error(`release closure is missing ${required}`);
@@ -300,6 +319,23 @@ async function main() {
     if (!bytes.equals(second.files.get(name))) throw new Error(`repeat construction changed ${name}`);
   }
   const edges = scanClosure(first);
+  if (process.argv.includes('--prepare')) {
+    const destinationRoot = resolve(argumentValue('--prepare'));
+    const firstDestination = writeClosure(join(destinationRoot, 'first'), first);
+    const secondDestination = writeClosure(join(destinationRoot, 'second'), second);
+    compareDirectory(firstDestination, second);
+    compareDirectory(secondDestination, first);
+    process.stdout.write(prettyJson({
+      ok: true,
+      mode: 'prepare',
+      releaseId: first.releaseId,
+      entryUrl: first.manifest.entry_url,
+      files: first.files.size,
+      edges: edges.length,
+      destinations: [firstDestination, secondDestination],
+    }));
+    return;
+  }
   if (process.argv.includes('--write')) {
     const destination = writeClosure(RELEASES_ROOT, first);
     process.stdout.write(prettyJson({
@@ -314,7 +350,7 @@ async function main() {
     return;
   }
   if (!process.argv.includes('--check')) {
-    throw new Error('use --write, --check, or --check-config <path>');
+    throw new Error('use --prepare <path>, --write, --check, or --check-config <path>');
   }
   const releaseDirectories = existsSync(RELEASES_ROOT)
     ? readdirSync(RELEASES_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory())

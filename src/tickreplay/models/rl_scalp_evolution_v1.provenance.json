@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "asset": {
+    "path": "models/rl_scalp_evolution_v1.json",
+    "bytes": 11932,
+    "sha256": "528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1"
+  },
+  "copyBasis": "local_user_authorized",
+  "copiedOn": "2026-09-28",
+  "publicRedistributionRights": "unconfirmed",
+  "sourceRepository": "_moomoo",
+  "sourceRepositoryCommit": "2166235559e31357d1cf8e84b7c6305ece06667e",
+  "sourceFiles": {
+    "src/moomoo/rl_scalp_evolution.py": "3219e76904eced142eec05a66116598ae730b81f5781e70b2610248d30f3ffb3",
+    "src/moomoo/rl_scalp_full_benchmark.py": "0349e150b38a71ca206e3011dc6ee0c367aebc7c03cba1b5941beea2e8d41ad8",
+    "src/moomoo/rl_scalp_sample.py": "04d8376d926201ea1c8654da64fc3aa2b63d5754eaba744e9707af8e9999af8a"
+  },
+  "researchEvidence": {
+    "evidenceTier": "OBSERVATION",
+    "modelDigestWithoutTrailingNewline": "304a0293e04300835b30c7bef864149ce4d944f8696562b968e21e39805536b0",
+    "status": "VALIDATION_RESEARCH_ONLY",
+    "validationReportSha256": "635ccffa9c51b58d5f43c53bc0d2f8a62cec1651d3e811705174efdb550899b1",
+    "validationSpecSha256": "b19a989e9c5d94f6094494495c44d0c4a8ea5616eff22d975895968e385daa15"
+  },
+  "notice": "This checkpoint was copied for local use at the repository owner's request. No public redistribution license was identified, and the recorded research result is not a performance guarantee."
+}

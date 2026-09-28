@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { createOrderBroker } from './order-broker.mjs';
+import { BrokerValidationError, createOrderBroker } from './order-broker.mjs';
 import {
   advanceStrategyClock,
   createReplayCommitter,
@@ -10,6 +11,8 @@ import {
 } from './replay-commit.mjs';
 import { validateEventPayload } from './strategy/strategy-protocol.mjs';
 import { StrategyController } from './strategy/strategy-controller.mjs';
+import { BundledRlTraceController } from './strategy/strategy-trace-controller.mjs';
+import { BUNDLED_RL_PRESET, BUNDLED_RL_TRACE_CONTRACT } from './strategy/strategy-trace-protocol.mjs';
 
 const SESSION = Object.freeze({
   stem: '285A', code: '285A', actual_date: '2026-09-10', generation: 1,
@@ -227,6 +230,119 @@ test('numeric rejection rolls back staged commands, intent ledger, broker state,
   assert.equal(broker.exportState(), before, 'batch IDs, intents and first fill are not accepted');
   assert.deepEqual(committer.status(), statusBefore, 'the staged batch is retained');
   assert.equal(strategyPort.events.length, 1, 'no invalid event is dispatched');
+});
+
+test('Bundled RL broker rejection rolls back and app invalidation stops the run without retry', async () => {
+  const session = { ...SESSION, dataHash: 'd'.repeat(64) };
+  const inputId = 'e'.repeat(64), jobId = '1'.repeat(32);
+  const artifact = JSON.stringify({
+    contractVersion: BUNDLED_RL_TRACE_CONTRACT,
+    preset: BUNDLED_RL_PRESET,
+    session: { stem: session.stem, code: session.code, date: session.actual_date, dataHash: session.dataHash, tickCount: 4 },
+    inputId,
+    runtimeFingerprint: 'a'.repeat(64),
+    proposalContract: 'backcast_position_target_v1',
+    decisions: [{
+      observedSessionTickIndex: 0, eligibleFromSessionTick: 1, decisionTimeUs: 1_000_000,
+      positionBranches: [{ positionQuantity: 0, targetQuantity: 100 }, { positionQuantity: 100, targetQuantity: 0 }],
+    }],
+  });
+  const hashText = (text) => createHash('sha256').update(text).digest('hex');
+  const traceId = hashText(artifact);
+  const state = { cursor: 0, playing: false, lastFrame: 0, vt: 1, t: [1, 2, 3, 4], price: [100, 101, 102, 103] };
+  const cancellations = [], cleanupCalls = [], pauseCalls = [], statuses = [];
+  let brokerDispatches = 0, strategyDispatches = 0, rejections = 0, rollbackAtCleanup;
+  const broker = createOrderBroker({ faultInjector(stage) {
+    if (stage === 'prepare_ledger') { rejections += 1; throw new BrokerValidationError('injected_broker_rejection'); }
+  } });
+  const controller = new BundledRlTraceController({
+    transport: {
+      async submit() { return { job: { jobId, inputId, state: 'ready', revision: 0, traceId, error: null } }; },
+      async status() { assert.fail('loaded replay must not poll'); },
+      async fetchTrace() { return artifact; },
+      async cancel(id) { cancellations.push(id); return { cancelled: true }; },
+    },
+    hashText,
+    makeId: () => 'bundled-rejection-run',
+    onPauseReplay(detail) { pauseCalls.push(detail); state.playing = false; },
+    onCleanup(identity) {
+      rollbackAtCleanup = broker.exportState();
+      cleanupCalls.push(identity);
+      return broker.cancelStrategyRunOrders(identity);
+    },
+  });
+  const dispatch = controller.dispatchOneEvent.bind(controller);
+  controller.dispatchOneEvent = (event) => { strategyDispatches += 1; return dispatch(event); };
+  const committer = createReplayCommitter({ broker: {
+    ...broker,
+    commitStrategyTick(request) { brokerDispatches += 1; return broker.commitStrategyTick(request); },
+  }, strategyPort: controller });
+  const beforeLoad = broker.exportState();
+  await controller.load({ session, tickCount: 4 });
+  assert.equal(broker.exportState(), beforeLoad);
+  assert.equal(state.cursor, 0);
+  const started = await controller.start({
+    session, cursor: 0, tickCount: 4, lastCommitted: null, replayPaused: true,
+    portfolio: strategyPortfolioSnapshot(broker.portfolioSnapshot(), 100), ...broker.strategyOpenOrders(),
+  });
+  committer.beginRun({ session, runId: started.runId, strategyRevision: started.runningRevision });
+  committer.resume(); state.playing = true;
+  await committer.commitTick({ sessionTickIndex: 0, tick: tick(0, 1_000_000, 100), applyTick() { state.cursor += 1; } });
+  assert.equal(committer.status().hasStagedBatch, true);
+  assert.equal(strategyDispatches, 1);
+  assert.equal(broker.state.orders.length, 0, 'the real RL proposal has not become eligible at tick 0');
+  const beforeReject = broker.exportState();
+  const statusBeforeReject = committer.status();
+  let invalidation;
+  const host = hostLifecycle(controller, committer);
+  const appCommitSource = APP_SOURCE.match(/async function commitStrategyTick\(index\) \{[\s\S]*?\n\}/)[0];
+  const appCommit = new Function('strategyCommitter', 'strategyController', 'state', 'strategyTickPayload', 'invalidateStrategyRuntime', 'setPlaying', 'setStatus', `
+    ${appCommitSource}
+    return commitStrategyTick;
+  `)(committer, controller, state, (index) => tick(index, (index + 1) * 1_000_000, state.price[index]),
+    (cause) => { invalidation = host.invalidate(cause); return invalidation; },
+    (playing) => { state.playing = playing; }, (message, kind) => statuses.push({ message, kind }));
+  await appCommit(1);
+  assert.equal(rollbackAtCleanup, beforeReject, 'the eligible broker rejection rolls back every authoritative field');
+  assert.equal(state.cursor, 1, 'the rejected tick is never consumed');
+  assert.equal(state.playing, false);
+  assert.equal(committer.status().active, false, 'the application must retire the active strategy run');
+  await invalidation;
+  assert.equal(rollbackAtCleanup, beforeReject, 'rollback precedes strategy cleanup, including IDs and run ledgers');
+  const expectedAfterCleanup = { ...JSON.parse(beforeReject), runLedgers: [] };
+  assert.deepEqual(JSON.parse(broker.exportState()), expectedAfterCleanup);
+  assert.equal(controller.isActive(), false);
+  assert.equal(controller.getState().tag, 'idle');
+  assert.equal(controller.getState().runId, null);
+  assert.equal(controller.manualEntryBlocked(), false);
+  assert.deepEqual(committer.status(), { ...statusBeforeReject, active: false, paused: true, hasStagedBatch: false, generation: statusBeforeReject.generation + 1 });
+  assert.equal(cleanupCalls.length, 1);
+  assert.equal(cleanupCalls[0].cause, 'worker_or_protocol_error');
+  assert.equal(pauseCalls.length, 1);
+  assert.deepEqual(cancellations, [jobId]);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].kind, 'error');
+  assert.match(statuses[0].message, /injected_broker_rejection/);
+  const terminalBroker = broker.exportState(), terminalController = controller.getState(), terminalCommitter = committer.status();
+  const stepSource = APP_SOURCE.match(/function step\(timestamp\) \{[\s\S]*?\n\}/)[0];
+  const frame = new Function('state', 'requestAnimationFrame', `${stepSource}\nreturn step;`)(state, () => {});
+  for (const timestamp of [100, 500, 1000]) frame(timestamp);
+  for (const index of [1, 2, 3]) {
+    await assert.rejects(committer.commitTick({ sessionTickIndex: index, tick: tick(index, index + 1, 100), applyTick() { assert.fail('terminal replay cannot apply a tick'); } }), /strategy_run_not_started/);
+    assert.throws(() => committer.resume(), /strategy_run_not_started/);
+    assert.throws(() => controller.resume(), { code: 'invalid_state' });
+    await assert.rejects(controller.start({}), { code: 'not_ready' });
+  }
+  assert.equal(brokerDispatches, 2, 'only tick 0 and the rejected eligible tick reach the broker');
+  assert.equal(strategyDispatches, 1, 'no rejected or later tick reaches the strategy');
+  assert.equal(rejections, 1, 'the rejected RL proposal is never implicitly retried');
+  assert.equal(broker.exportState(), terminalBroker);
+  assert.deepEqual(controller.getState(), terminalController);
+  assert.deepEqual(committer.status(), terminalCommitter);
+  assert.equal(state.cursor, 1);
+  assert.equal(state.vt, 1);
+  assert.equal(state.playing, false);
+  assert.equal(cleanupCalls.length, 1);
 });
 
 test('exact outgoing event preflight happens before broker and replay publication', async () => {
@@ -767,7 +883,10 @@ test('app owns one controller port, lifecycle invalidation, and the manual gate'
   assert.match(APP_SOURCE, /function placeMobileMarketOrder[\s\S]*manualEntryBlocked\(\)/);
   assert.match(APP_SOURCE, /function cancelOrders[\s\S]*manualEntryBlocked\(\)/);
   assert.match(APP_SOURCE, /async function loadSession[\s\S]*invalidateStrategyRuntime\('session_change'\)/);
-  assert.match(APP_SOURCE, /function seekTo[\s\S]*invalidateStrategyRuntime\('seek'\)/);
+  assert.match(
+    APP_SOURCE,
+    /function seekTo[\s\S]*strategyController\?\.getState\(\)\.loadedRevision[\s\S]*invalidateStrategyRuntime\('seek'\)/,
+  );
   assert.match(APP_SOURCE, /resetButton[\s\S]*invalidateStrategyRuntime\('reset'\)/);
   assert.match(APP_SOURCE, /addEventListener\('pagehide'[\s\S]*invalidateStrategyRuntime\('explicit_stop'\)/);
   assert.match(APP_SOURCE, /addEventListener\('pageshow'[\s\S]*event\.persisted/);
@@ -775,7 +894,7 @@ test('app owns one controller port, lifecycle invalidation, and the manual gate'
 
 test('app bootstraps the immutable strategy release and isolates raw recovery failures', () => {
   const releaseUrl = '/static/strategy/releases/' +
-    'fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/' +
+    '51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5/' +
     'strategy-release.mjs';
   const capturedUrl = `const STRATEGY_RELEASE_URL = '${releaseUrl}';`;
   assert.equal(APP_SOURCE.includes(capturedUrl), true);

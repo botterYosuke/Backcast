@@ -1,5 +1,17 @@
 # 歩み値リプレイ
 
+## Strategy choices
+
+The strategy workspace has two current choices:
+
+- **Bundled RL** is the default. Load prepares a fixed, source-free native
+  proposal trace; Start admits it to the replay broker.
+- **Custom Python** is explicit and uses the browser Pyodide editor/runtime.
+
+Opening the page may probe Bundled RL availability but never loads or starts a
+strategy and never changes replay or broker state. See
+[`bundled-rl-strategy.md`](bundled-rl-strategy.md) for the fixed model contract.
+
 J-Quants のティックデータ（歩み値）を、その日の時間の流れのまま再生する
 ローカル Web アプリ。ティックチャート・分足チャート・歩み値テープ・板が
 同じ仮想時刻で同時に進む。
@@ -780,8 +792,39 @@ tick i + 1 から有効**であり、過去へ遡って約定しない。
 常時表示する。通常routeはnon-isolatedでhard stopのみである。timeout時は
 run identityを無効化してWorkerを破棄するため、再開にはRestartが必要になる。
 
+### Bundled RL Trace v1
+
+既定の `Bundled RL` はrepository同梱の固定presetだけを実行する。Loadはsourceを送らず、
+`contractVersion`、固定`preset`、authoritative sessionの`stem/code/date/dataHash`だけを
+`/api/strategies/bundled-rl/jobs`へ送る。Custom Pythonのeditor、source store、Pyodideは
+明示的に`Custom Python`を選んだ場合だけ使う。workspace mount時のcapability probeは
+job作成、source実行、cursor・注文・約定・portfolioの変更を行わない。
+
+browserは `queued → running → validating → ready` の単調なrevisionだけを受理し、ready後に
+immutable artifactを一度取得する。artifactは`inputId`、固定preset、sessionの
+`stem/code/date/dataHash/tickCount`を照合する。各sparse decisionは
+`observedSessionTickIndex`のstrict昇順、`eligibleFromSessionTick = observed + 1`、safe integerの
+`decisionTimeUs`、順序固定のposition branch（0株、100株）だけを持つ。source、command、fill、
+portfolio、cash、execution price、stderrをtraceに含めない。
+
+Startはcursor 0だけを許可し、実際のpost-commit positionが0株または100株、かつopen-order
+snapshotが完全で空の場合だけrunを開始する。各dispatchでも同じauthoritative stateを再検証し、
+実positionに対応するbranchから最大1件の100株market deltaを作る。proposalはtick `i`では
+約定できず、tick `i + 1`からだけeligibleになる。最終tickのproposalは次tickが存在しないため
+artifact検証で拒否する。
+
+replay中はnetwork requestを行わない。traceはproposalだけで、約定・cash・position・portfolioを
+直接変更せず、既存`replay-commit.mjs`と`order-broker.mjs`がtransactional authorityを維持する。
+broker/protocol failureはrunをterminalに停止し、失敗tickをretryしない。Stop、superseding Load、
+seek、reset、session changeはoperation identityを先に無効化し、late responseを拒否する。
+job cancellationは`DELETE /api/strategies/bundled-rl/jobs/{jobId}`で行い、leaseは公開contractにない。
+
+上限はdecision 10,000件、artifact 4,194,304 bytesである。trace GETは`Cache-Control`を
+case-insensitiveに解釈し、OWSを許容した上で`private`、`immutable`、
+`max-age=31536000` とtrace SHA-256のquoted ETagを必須とする。
+
 現在のbrowser entryは content-addressed release
-`fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d` に固定される。
+`51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5` に固定される。
 `app.js`、HTML、CSSなどmutable entryは`no-store`、release closureとversioned vendorは
 1年immutableで配信する。更新、二段階compatibility/feature image、24時間のopen-page
 互換、rollback、asset/license再構築手順は

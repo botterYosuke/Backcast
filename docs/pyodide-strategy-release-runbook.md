@@ -1,5 +1,10 @@
 # Pyodide strategy release and rollback runbook
 
+> This runbook applies only to the explicit **Custom Python** choice. Bundled
+> RL is the default strategy and uses the fixed server-side proposal service;
+> it neither loads Pyodide nor submits user source. See
+> [`bundled-rl-strategy.md`](bundled-rl-strategy.md).
+
 This runbook is the executable release contract for browser Python strategy v1.
 It does not itself authorize a deployment. Fill every `<...>` value from the
 builder or Cloud Run response, attach the command output to the release record,
@@ -8,11 +13,11 @@ and stop when any gate fails.
 ## Frozen release inputs
 
 - Current strategy release ID:
-  `1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da`
+  `51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5`
 - Current entry URL:
-  `/static/strategy/releases/1a45c99b4a6b884fbfc17240ae65759f20601dc86267df3d2b9a160de63a45da/strategy-release.mjs`
+  `/static/strategy/releases/51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5/strategy-release.mjs`
 - Current release manifest SHA-256:
-  `ab6afd52deb3b886096683859e492413021f3386a6878b72f5ac3d43b81b2146`
+  `ffd2de55a7d1279da995570adfff7e13531c0bce44780df5a15e7877f062b5cd`
 - CodeMirror bundle ID:
   `86539626cbc6254b2a37368d3a957a91a2c5f15de951779567207f76d6878d56`
 - CodeMirror manifest SHA-256:
@@ -31,6 +36,17 @@ Never replace bytes below an existing content-addressed URL. A module, runner,
 vendor ID, dependency, license, selected Pyodide file, or build recipe change
 creates a new release ID. Keep old directories intact until the deletion gate is
 satisfied.
+
+This closure also contains `strategy-trace-protocol.mjs` and
+`strategy-trace-controller.mjs`. Native Trace remains default-off and trusted/local
+only. Its HTTP artifacts are private immutable data, not public static release
+assets: parse Cache-Control case-insensitively with optional whitespace and require
+`private`, `max-age=31536000`, and `immutable`, plus a quoted trace-ID ETag. Verify
+one artifact fetch per accepted Load, zero native-strategy requests during replay,
+cursor-zero admission, per-submitter lease release, error-bearing cancelled
+snapshots, final-tick proposal rejection, Stop/seek/reset races, causal tick `i+1`
+fills, and Pyodide regression coverage. Do not enable native execution on Cloud Run; a future hosted
+deployment requires a separately reviewed isolation and durable coordination design.
 
 ## Clean reconstruction gate
 

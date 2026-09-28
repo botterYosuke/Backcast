@@ -126,6 +126,41 @@ def test_resolve_and_load_session_returns_only_that_day(repository):
     assert session.trade_type == ["1", "2", "1"]
 
 
+def test_session_exposes_stable_hash_of_exact_ordered_observable_ticks(repository):
+    session = repository.resolve_and_load_session("1301", date(2026, 8, 17), 0)
+
+    assert session is not None
+    assert len(session.data_hash) == 64
+    assert session.as_dict()["dataHash"] == session.data_hash
+    changed = type(session)(
+        stem=session.stem,
+        code=session.code,
+        date=session.date,
+        us=session.us,
+        price=[*session.price[:-1], session.price[-1] + 0.1],
+        qty=session.qty,
+        trade_type=session.trade_type,
+    )
+    assert changed.data_hash != session.data_hash
+
+
+def test_session_hash_accepts_repository_normalized_null_trade_type(
+    repository, tick_db_factory
+):
+    rows = [
+        ("2026-08-17 09:00:00.000000", 102.0, 300, None, "13010"),
+    ]
+    tick_db_factory("1301", rows)
+
+    session = repository.resolve_and_load_session("1301", date(2026, 8, 17), 0)
+
+    assert session is not None
+    assert session.trade_type == [""]
+    payload = session.as_dict()
+    assert payload["type"] == [""]
+    assert payload["dataHash"] == session.data_hash
+
+
 def test_timestamps_are_epoch_microseconds_read_as_wall_clock(repository):
     session = repository.resolve_and_load_session("1301", date(2026, 8, 17), 0)
 
@@ -159,9 +194,7 @@ def test_unparseable_timestamps_and_null_prices_are_dropped(
     assert session.price == [100.0]
 
 
-def test_identical_timestamps_are_nudged_to_stay_strictly_increasing(
-    tick_db_factory, repository
-):
+def test_identical_timestamps_preserve_authoritative_order(tick_db_factory, repository):
     stamp = "2026-08-17 09:00:00.000000"
     rows = [(stamp, 100.0 + index, 100, "1", "13010") for index in range(3)]
     tick_db_factory("1301", rows, metadata=[("13010", stamp, stamp, 3)])
@@ -169,10 +202,9 @@ def test_identical_timestamps_are_nudged_to_stay_strictly_increasing(
     session = repository.resolve_and_load_session("1301", date(2026, 8, 17), 0)
 
     assert session is not None
-    # 同一マイクロ秒の約定を捨てず、1 マイクロ秒ずつずらして全件残す。
     assert len(session.us) == 3
-    assert session.us == sorted(set(session.us))
-    assert session.us[2] - session.us[0] == 2
+    assert session.us == [session.us[0]] * 3
+    assert session.price == [100.0, 101.0, 102.0]
 
 
 def test_resolve_and_load_session_returns_the_day_itself_when_it_has_data(repository):

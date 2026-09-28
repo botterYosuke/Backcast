@@ -7,7 +7,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const RELEASES_ROOT = join(ROOT, 'src/tickreplay/static/strategy/releases');
-const CURRENT_RELEASE_ID = 'fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d';
+const APP_SOURCE = readFileSync(join(ROOT, 'src/tickreplay/static/app.js'), 'utf8');
+const CURRENT_RELEASE_ID = APP_SOURCE.match(/strategy\/releases\/([0-9a-f]{64})\/strategy-release\.mjs/)?.[1];
+assert.match(CURRENT_RELEASE_ID, /^[0-9a-f]{64}$/);
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -57,7 +59,10 @@ test('current release has an immutable relative closure and fixed vendor URLs', 
     'strategy-protocol.mjs',
     'strategy-release.mjs',
     'strategy-runner.py',
+    'strategy-selection-store.mjs',
     'strategy-source-store.mjs',
+    'strategy-trace-controller.mjs',
+    'strategy-trace-protocol.mjs',
     'strategy-worker.mjs',
     'strategy-workspace.mjs',
   ]);
@@ -66,6 +71,7 @@ test('current release has an immutable relative closure and fixed vendor URLs', 
   assert.match(entry, /import \{ mountStrategyWorkspace \} from '\.\/strategy-workspace\.mjs'/);
   assert.match(entry, /import\('\.\/strategy-editor\.mjs'\)/);
   assert.match(entry, /import\('\.\/strategy-controller\.mjs'\)/);
+  assert.match(entry, /import\('\.\/strategy-trace-controller\.mjs'\)/);
   assert.match(entry, /new URL\('\.\/strategy-worker\.mjs', import\.meta\.url\)/);
   assert.match(entry, /new URL\('\.\/strategy-runner\.py', import\.meta\.url\)/);
   assert.doesNotMatch(entry, /node_modules|https?:\/\/|\/static\/strategy\/(?!releases\/)/);
@@ -81,8 +87,9 @@ test('release copies are byte-identical to their current authored inputs', () =>
   const directory = join(RELEASES_ROOT, CURRENT_RELEASE_ID);
   for (const name of [
     'strategy-workspace.mjs', 'strategy-editor.mjs', 'strategy-source-store.mjs',
+    'strategy-selection-store.mjs',
     'strategy-controller.mjs', 'strategy-protocol.mjs', 'strategy-worker.mjs',
-    'strategy-runner.py',
+    'strategy-runner.py', 'strategy-trace-controller.mjs', 'strategy-trace-protocol.mjs',
   ]) {
     assert.deepEqual(
       readFileSync(join(directory, name)),

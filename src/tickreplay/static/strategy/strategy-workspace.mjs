@@ -12,6 +12,12 @@ import {
   validateCanonicalSource,
   validatePythonFileMetadata,
 } from './strategy-source-store.mjs';
+import {
+  BUNDLED_RL_STRATEGY,
+  CUSTOM_PYTHON_STRATEGY,
+  STRATEGY_SELECTION_STORAGE_KEY,
+  createStrategySelectionStore,
+} from './strategy-selection-store.mjs';
 
 export const STRATEGY_WORKSPACE_SELECTORS = Object.freeze({
   panel: '[data-strategy-panel]',
@@ -21,6 +27,9 @@ export const STRATEGY_WORKSPACE_SELECTORS = Object.freeze({
   status: '[data-strategy-status]',
   revision: '[data-strategy-revision]',
   startTarget: '[data-strategy-start-target]',
+  selection: '[data-strategy-selection]',
+  customPanel: '[data-strategy-custom-panel]',
+  bundledPanel: '[data-strategy-bundled-panel]',
   diagnostics: '[data-strategy-diagnostics]',
   logs: '[data-strategy-logs]',
   importInput: '[data-strategy-import]',
@@ -49,7 +58,9 @@ def on_end(summary):
 `;
 
 const DIAGNOSTIC_LIMITS = Object.freeze({ entries: 200, bytes: 262_144, messageBytes: 2_048 });
-const ACTIVE_CONTROLLER_STATES = new Set(['loading', 'starting', 'running', 'paused', 'stopping']);
+const ACTIVE_CONTROLLER_STATES = new Set([
+  'loading', 'queued', 'validating', 'starting', 'running', 'paused', 'stopping',
+]);
 
 export class StrategyWorkspaceError extends Error {
   constructor(code, message = code, detail = null) {
@@ -86,7 +97,10 @@ function requireElements(root) {
   for (const [name, selector] of Object.entries(STRATEGY_WORKSPACE_SELECTORS)) {
     elements[name] = root.querySelector?.(selector) ?? null;
   }
-  for (const required of ['panel', 'toggle', 'source', 'editor', 'status', 'revision', 'startTarget']) {
+  for (const required of [
+    'panel', 'toggle', 'source', 'editor', 'status', 'revision', 'startTarget',
+    'selection', 'customPanel', 'bundledPanel',
+  ]) {
     if (!elements[required]) throw new StrategyWorkspaceError('missing_dom', `missing ${required}`);
   }
   return elements;
@@ -167,6 +181,7 @@ export function mountStrategyWorkspace({
   if (makeId) storeOptions.makeId = makeId;
   if (now) storeOptions.now = now;
   let store = null;
+  let selectionStore = null;
   let source = canonicalizeSource(elements.source.value || SAMPLE_STRATEGY_SOURCE);
   validateCanonicalSource(source);
   let draftRevision = 0;
@@ -188,6 +203,10 @@ export function mountStrategyWorkspace({
   let controller = null;
   let controllerPromise = null;
   let loadedSnapshot = null;
+  let strategySelection = BUNDLED_RL_STRATEGY;
+  let nativeCapability = null;
+  let capabilityFailure = null;
+  let capabilityPromise = null;
   let loadAttempt = 0;
   let pendingLoad = null;
   let composition = false;
@@ -274,12 +293,20 @@ export function mountStrategyWorkspace({
     setText(
       elements.startTarget,
       loadedSnapshot
-        ? `Start target: loaded r${loadedSnapshot.loadedRevision} (${loadedSnapshot.sourceHash.slice(0, 12)})`
+        ? `Start target: loaded r${loadedSnapshot.loadedRevision}${loadedSnapshot.sourceHash ? ` (${loadedSnapshot.sourceHash.slice(0, 12)})` : ' (Bundled RL)'}${
+          loadedSnapshot.traceId ? `; trace ${loadedSnapshot.traceId.slice(0, 12)}` : ''
+        }`
         : 'Start target: none',
     );
+    const customPython = strategySelection === CUSTOM_PYTHON_STRATEGY;
+    elements.selection.value = strategySelection;
+    elements.selection.disabled = disposed || rawRecovery || active || Boolean(pendingLoad);
+    elements.customPanel.hidden = !customPython;
+    elements.bundledPanel.hidden = customPython;
+    if (root.dataset) root.dataset.strategySelection = strategySelection;
     const disableAll = disposed || rawRecovery;
     for (const name of ['save', 'exportSource', 'sample', 'clearSource', 'reloadLatest', 'overwrite']) {
-      if (elements[name]) elements[name].disabled = disableAll;
+      if (elements[name]) elements[name].disabled = disableAll || !customPython;
     }
     if (futureSourceSchema) {
       for (const name of ['save', 'sample', 'reloadLatest', 'overwrite']) {
@@ -293,13 +320,17 @@ export function mountStrategyWorkspace({
       elements.overwrite.disabled = disableAll || futureSourceSchema || !superseded;
     }
     if (elements.load) {
-      elements.load.disabled = disableAll || futureSourceSchema || Boolean(controllerFailure)
+      elements.load.disabled = disableAll || (customPython && futureSourceSchema)
+        || (!customPython && !nativeCapability?.available) || Boolean(controllerFailure)
         || ['loading', 'starting', 'stopping'].includes(state.tag);
     }
     if (elements.start) elements.start.disabled = disableAll || state.tag !== 'ready';
-    if (elements.stop) elements.stop.disabled = disableAll || !active;
+    if (elements.stop) {
+      const bundledReady = !customPython && state.tag === 'ready';
+      elements.stop.disabled = disableAll || (!active && !bundledReady);
+    }
     if (elements.restart) elements.restart.disabled = disableAll || !loadedSnapshot || active;
-    if (elements.importInput) elements.importInput.disabled = disableAll || futureSourceSchema;
+    if (elements.importInput) elements.importInput.disabled = disableAll || futureSourceSchema || !customPython;
     if (elements.downloadDiagnostics) {
       elements.downloadDiagnostics.disabled = disableAll || (
         diagnostics.length === 0 && !(host.getDiagnostics?.().length) && !host.getLogs?.()
@@ -399,6 +430,8 @@ export function mountStrategyWorkspace({
   function restoreStoredState() {
     try {
       store = createStrategySourceStore(storeOptions);
+      selectionStore = createStrategySelectionStore({ storage });
+      strategySelection = selectionStore.read();
       const savedSource = store.readSource();
       if (savedSource.status === 'available') {
         source = savedSource.record.source;
@@ -440,6 +473,19 @@ export function mountStrategyWorkspace({
     return {
       onStateChange(controllerState) {
         if (disposed || rawRecovery) return;
+        if (
+          strategySelection === BUNDLED_RL_STRATEGY
+          && controllerState.tag === 'stopping'
+          && ['seek', 'reset', 'session_change'].includes(controllerState.phase)
+        ) {
+          loadedSnapshot = null;
+        }
+        const nativeProgress = {
+          queued: 'ネイティブ戦略をキューに追加しました。',
+          running: 'ネイティブ戦略を実行しています。',
+          validating: 'ネイティブ戦略トレースを検証しています。',
+        };
+        if (nativeProgress[controllerState.tag]) emitStatus(nativeProgress[controllerState.tag], 'info');
         if (controllerState.tag === 'errored') emitStatus('戦略ランタイムが停止しました。診断を確認してください。', 'error');
         render();
       },
@@ -459,7 +505,10 @@ export function mountStrategyWorkspace({
   }
 
   async function ensureEditor() {
-    if (editor || editorFailure || rawRecovery || futureSourceSchema) return editor;
+    if (
+      strategySelection !== CUSTOM_PYTHON_STRATEGY
+      || editor || editorFailure || rawRecovery || futureSourceSchema
+    ) return editor;
     if (editorPromise) return editorPromise;
     editorPromise = (async () => {
       try {
@@ -500,6 +549,27 @@ export function mountStrategyWorkspace({
     return editorPromise;
   }
 
+  async function ensureCapability() {
+    if (nativeCapability || capabilityFailure || typeof release.loadCapability !== 'function') {
+      return nativeCapability;
+    }
+    if (capabilityPromise) return capabilityPromise;
+    capabilityPromise = Promise.resolve(release.loadCapability()).then((value) => {
+      if (disposed || rawRecovery) return null;
+      nativeCapability = value;
+      render();
+      return value;
+    }).catch((error) => {
+      capabilityFailure = error;
+      if (!disposed && !rawRecovery) {
+        appendDiagnostic({ phase: 'capability', category: error.code, message: error.message });
+        render();
+      }
+      return null;
+    }).finally(() => { capabilityPromise = null; });
+    return capabilityPromise;
+  }
+
   async function ensureController() {
     if (controller) return controller;
     if (controllerFailure) throw controllerFailure;
@@ -507,7 +577,10 @@ export function mountStrategyWorkspace({
     controllerPromise = (async () => {
       try {
         const callbacks = host.controllerCallbacks(workspaceCallbacks());
-        const candidate = await release.loadController({ callbacks, performanceClass });
+        const mode = strategySelection === BUNDLED_RL_STRATEGY
+          ? BUNDLED_RL_STRATEGY
+          : 'pyodide';
+        const candidate = await release.loadController({ callbacks, performanceClass, mode });
         if (disposed || rawRecovery || !pendingLoad) {
           await candidate?.stop?.('explicit_stop');
           throw new StrategyWorkspaceError('load_superseded');
@@ -551,21 +624,38 @@ export function mountStrategyWorkspace({
       const invalidating = controller ? host.invalidate?.('explicit_load') : null;
       await wait(ensureController());
       await wait(invalidating);
-      const identified = await wait(identity.identifySnapshot(snapshot.source, snapshot.draftRevision));
-      const request = {
-        source: identified.source,
-        sourceHash: identified.sourceHash,
-        draftRevision: identified.draftRevision,
-        loadAttemptId: `workspace-load-${attemptId}`,
-        filename: 'strategy.py',
-        performanceClass,
-      };
-      if (source === identified.source && draftRevision === identified.draftRevision) {
-        sourceHash = identified.sourceHash;
+      let request;
+      if (strategySelection === BUNDLED_RL_STRATEGY) {
+        if (!nativeCapability?.available) throw new StrategyWorkspaceError('bundled_rl_unavailable');
+        request = { mode: BUNDLED_RL_STRATEGY };
+      } else {
+        const identified = await wait(identity.identifySnapshot(snapshot.source, snapshot.draftRevision));
+        request = {
+          source: identified.source,
+          sourceHash: identified.sourceHash,
+          draftRevision: identified.draftRevision,
+          loadAttemptId: `workspace-load-${attemptId}`,
+          filename: 'strategy.py',
+          performanceClass,
+          mode: 'pyodide',
+        };
+        if (source === identified.source && draftRevision === identified.draftRevision) {
+          sourceHash = identified.sourceHash;
+        }
       }
       const result = await wait(host.load(request));
-      loadedSnapshot = Object.freeze({ ...request, loadedRevision: result.loadedRevision });
-      emitStatus(`戦略を loaded revision ${result.loadedRevision} として読み込みました。`, 'success');
+      loadedSnapshot = Object.freeze({
+        ...request,
+        loadedRevision: result.loadedRevision,
+        inputId: result.inputId ?? null,
+        traceId: result.traceId ?? null,
+      });
+      emitStatus(
+        strategySelection === BUNDLED_RL_STRATEGY
+          ? `Bundled RL トレースを loaded revision ${result.loadedRevision} として読み込みました。`
+          : `戦略を loaded revision ${result.loadedRevision} として読み込みました。`,
+        'success',
+      );
       render();
       return result;
     } finally {
@@ -584,6 +674,41 @@ export function mountStrategyWorkspace({
     return host.stop();
   }
 
+  async function changeStrategySelection() {
+    const requested = elements.selection.value;
+    if (![BUNDLED_RL_STRATEGY, CUSTOM_PYTHON_STRATEGY].includes(requested)) {
+      elements.selection.value = strategySelection;
+      throw new StrategyWorkspaceError('invalid_strategy_selection');
+    }
+    if (requested === BUNDLED_RL_STRATEGY) {
+      await ensureCapability();
+      if (!nativeCapability?.available) {
+        elements.selection.value = strategySelection;
+        emitStatus('Bundled RL はこのサーバーでは利用できません。', 'error');
+        render();
+        return false;
+      }
+    }
+    if (requested === strategySelection) return true;
+    cancelPendingLoad();
+    await host.invalidate?.('explicit_stop');
+    controller = null;
+    controllerFailure = null;
+    controllerPromise = null;
+    loadedSnapshot = null;
+    strategySelection = requested;
+    selectionStore?.write(requested);
+    emitStatus(
+      requested === BUNDLED_RL_STRATEGY
+        ? 'Bundled RL を選択しました。Load で固定モデルの提案を準備します。'
+        : 'Custom Python を選択しました。ブラウザ Pyodide で実行します。',
+      'info',
+    );
+    if (requested === CUSTOM_PYTHON_STRATEGY && expanded) await ensureEditor();
+    render();
+    return true;
+  }
+
   async function startStrategy() {
     const result = await host.start();
     emitStatus(`戦略 run ${result.runId} を開始しました。`, 'success');
@@ -593,7 +718,9 @@ export function mountStrategyWorkspace({
 
   async function restartStrategy() {
     if (!loadedSnapshot) throw new StrategyWorkspaceError('no_loaded_source');
-    const snapshot = { source: loadedSnapshot.source, draftRevision: loadedSnapshot.draftRevision };
+    const snapshot = strategySelection === CUSTOM_PYTHON_STRATEGY
+      ? { source: loadedSnapshot.source, draftRevision: loadedSnapshot.draftRevision }
+      : undefined;
     await loadDraft(snapshot);
     return startStrategy();
   }
@@ -737,6 +864,9 @@ export function mountStrategyWorkspace({
       editorMode: editor?.mode?.() ?? (editorFailure ? 'degraded' : 'uninitialized'),
       controllerUnavailable: Boolean(controllerFailure),
       loadedSnapshot,
+      strategySelection,
+      executionMode: strategySelection === BUNDLED_RL_STRATEGY ? BUNDLED_RL_STRATEGY : 'pyodide',
+      nativeAvailable: Boolean(nativeCapability?.available),
       rawRecovery,
       diagnosticsCount: diagnostics.length,
       diagnosticsTruncated,
@@ -759,6 +889,7 @@ export function mountStrategyWorkspace({
   restoreStoredState();
   setExpanded(elements, expanded);
   if (root.dataset) root.dataset.strategyMode = 'degraded';
+  void ensureCapability();
 
   listen(elements.toggle, 'click', 'panel toggle', async () => {
     expanded = !expanded;
@@ -776,11 +907,14 @@ export function mountStrategyWorkspace({
   });
   listen(elements.source, 'compositionstart', 'composition start', () => { composition = true; });
   listen(elements.source, 'compositionend', 'composition end', () => { composition = false; });
+  listen(elements.selection, 'change', 'strategy selection', changeStrategySelection);
   listen(root, 'keydown', 'strategy shortcut', (event) => {
     if (composition || event.isComposing || event.keyCode === 229) return;
     const modifier = event.ctrlKey || event.metaKey;
     let action = null;
-    if (modifier && event.key.toLowerCase() === 's') action = () => saveSnapshot({ source, draftRevision });
+    if (modifier && event.key.toLowerCase() === 's' && strategySelection === CUSTOM_PYTHON_STRATEGY) {
+      action = () => saveSnapshot({ source, draftRevision });
+    }
     else if (modifier && event.key === 'Enter' && event.shiftKey) action = () => loadDraft();
     else if (modifier && event.key === 'Enter') action = startStrategy;
     else if (modifier && event.key === '.' && (pendingLoad || ACTIVE_CONTROLLER_STATES.has(currentControllerState().tag))) action = stopStrategy;
@@ -828,6 +962,17 @@ export function mountStrategyWorkspace({
   });
   listen(windowObject, 'storage', 'storage recheck', (event) => {
     if (event.key === SOURCE_STORAGE_KEY) checkExternalSource();
+    if (event.key === STRATEGY_SELECTION_STORAGE_KEY && selectionStore) {
+      const next = selectionStore.read();
+      if (next !== strategySelection) {
+        strategySelection = next;
+        loadedSnapshot = null;
+        controller = null;
+        controllerFailure = null;
+        void host.invalidate?.('explicit_stop');
+        render();
+      }
+    }
     if (event.key === SETTINGS_STORAGE_KEY && store) {
       const current = store.readSettings();
       if (current.status === 'available') {

@@ -1,7 +1,13 @@
 import { expect, test } from '@playwright/test';
+import { createHash } from 'node:crypto';
 
-const RELEASE_ID = 'fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d';
+const RELEASE_ID = '51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5';
 const RELEASE_ENTRY = `/static/strategy/releases/${RELEASE_ID}/strategy-release.mjs`;
+const PRESET = Object.freeze({
+  id: 'bundled_rl',
+  revision: 'rl_scalp_evolution_v1',
+  digest: '528b9dc44928984c471731bb64ef82fa4a299a2ffd5707d1ce2a482223d28ef1',
+});
 const LOAD_MARKER_SOURCE = `print("LOAD_ONLY_MARKER")
 def on_event(event):
     return []
@@ -31,11 +37,17 @@ def on_event(event):
     return []
 `;
 
-async function openApplication(page) {
+async function openApplication(page, { customPython = true } = {}) {
   await page.goto('/app/');
   const workspace = page.locator('[data-strategy-workspace]');
-  await expect(workspace).toHaveAttribute('data-strategy-mode', 'degraded');
-  await expect(page.locator('[data-strategy-source]')).not.toHaveAttribute('readonly', '');
+  const selection = page.locator('select[data-strategy-selection]');
+  await expect(selection).toHaveValue('bundled_rl');
+  if (customPython) {
+    await page.getByRole('button', { name: '戦略を開く' }).click();
+    await selection.selectOption('custom_python');
+    await expect(page.locator('[data-strategy-custom-panel]')).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Python 戦略ソース' })).toBeEditable();
+  }
   return workspace;
 }
 
@@ -54,11 +66,98 @@ async function expectExecutionWarning(page) {
   await expect(warning).toContainText('Start より前にトップレベルの Python が直ちに実行');
   await expect(warning).toContainText('Worker はセキュリティ sandbox ではなく');
   await expect(warning).toContainText('ネットワーク通信や同一オリジン');
-  await expect(page.getByRole('button', { name: 'Load', exact: true }))
-    .toHaveAttribute('aria-describedby', 'strategy-execution-warning');
   const editor = page.getByRole('textbox', { name: 'Python 戦略ソース' });
   await expect(editor).toHaveAttribute('aria-describedby', /(?:^|\s)strategy-execution-warning(?:\s|$)/);
 }
+
+test('Bundled RL default Load is inert and replay uses actual-position branches on the next tick', async ({ page }) => {
+  const dataHash = 'd'.repeat(64);
+  const inputId = 'e'.repeat(64);
+  const jobId = '1'.repeat(32);
+  const requests = [];
+  const trace = {
+    contractVersion: 'bundled_rl_trace_v1',
+    preset: PRESET,
+    session: { stem: '285A', code: '285A0', date: '2026-09-10', dataHash, tickCount: 5 },
+    inputId,
+    runtimeFingerprint: 'a'.repeat(64),
+    proposalContract: 'backcast_position_target_v1',
+    decisions: [0, 1].map((observedSessionTickIndex) => ({
+      observedSessionTickIndex,
+      eligibleFromSessionTick: observedSessionTickIndex + 1,
+      decisionTimeUs: 1789002000000000 + observedSessionTickIndex * 1_000_000,
+      positionBranches: [
+        { positionQuantity: 0, targetQuantity: 100 },
+        { positionQuantity: 100, targetQuantity: 0 },
+      ],
+    })),
+  };
+  const traceText = JSON.stringify(trace);
+  const traceId = createHash('sha256').update(traceText).digest('hex');
+  await page.route('**/api/session?**', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      pending: false, operationId: null, stem: '285A', code: '285A0', date: '2026-09-10',
+      dataHash, count: 5,
+      us: [1789002000000000, 1789002001000000, 1789002002000000, 1789002003000000, 1789002004000000],
+      price: [100, 101, 102, 103, 104], qty: [100, 200, 100, 50, 150], type: ['1', '2', '1', '2', '1'],
+    }),
+  }));
+  await page.route('**/api/strategies/bundled-rl/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    requests.push(`${request.method()} ${path}`);
+    if (path.endsWith('/capability')) {
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+        available: true, contractVersion: 'bundled_rl_trace_v1', preset: PRESET,
+      }) });
+    }
+    if (request.method() === 'POST' && path.endsWith('/jobs')) {
+      const body = request.postDataJSON();
+      expect(Object.keys(body).sort()).toEqual(['contractVersion', 'preset', 'session']);
+      expect(JSON.stringify(body)).not.toContain('source');
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job: {
+        jobId, inputId, state: 'ready', revision: 0, traceId, error: null,
+      } }) });
+    }
+    if (request.method() === 'GET' && path.endsWith(`/traces/${traceId}`)) {
+      return route.fulfill({
+        contentType: 'application/json',
+        headers: { 'Cache-Control': 'private, max-age=31536000, immutable', ETag: `"${traceId}"` },
+        body: traceText,
+      });
+    }
+    if (request.method() === 'DELETE' && path.endsWith(`/jobs/${jobId}`)) {
+      return route.fulfill({ contentType: 'application/json', body: '{}' });
+    }
+    return route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+  await openApplication(page, { customPython: false });
+  await page.getByRole('button', { name: '戦略を開く' }).click();
+  const before = await page.evaluate(() => ({
+    tape: document.querySelectorAll('#tape > li').length,
+    position: document.querySelector('#pos-qty')?.textContent,
+    fills: document.querySelector('#pnl-fills')?.textContent,
+  }));
+  await page.getByRole('button', { name: 'Load', exact: true }).click();
+  await expect(page.locator('[data-strategy-status]')).toContainText('Bundled RL トレースを loaded revision');
+  expect(await page.evaluate(() => ({
+    tape: document.querySelectorAll('#tape > li').length,
+    position: document.querySelector('#pos-qty')?.textContent,
+    fills: document.querySelector('#pnl-fills')?.textContent,
+  }))).toEqual(before);
+  const afterLoad = requests.length;
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  const play = page.locator('#play-button');
+  await play.click();
+  await expect(page.locator('#tape > li')).toHaveCount(1);
+  await expect(page.locator('#pos-qty')).toHaveText('—');
+  await expect(page.locator('#tape > li')).toHaveCount(2);
+  await expect(page.locator('#pos-qty')).toHaveText('買 100 株');
+  await expect(page.locator('#tape > li')).toHaveCount(3);
+  await expect(page.locator('#pos-qty')).toHaveText('—');
+  expect(requests.length).toBe(afterLoad);
+});
 
 test('production closure preserves lazy boundaries and runs Load/Start/lifecycle recovery', async ({ page }) => {
   const requests = [];
@@ -71,13 +170,15 @@ test('production closure preserves lazy boundaries and runs Load/Start/lifecycle
       violatedDirective: event.violatedDirective,
     });
   }));
-  const workspace = await openApplication(page);
+  const workspace = await openApplication(page, { customPython: false });
 
   expect(requests.some((url) => url.endsWith(RELEASE_ENTRY))).toBe(true);
   expect(requests.some((url) => url.includes('/vendor/codemirror/'))).toBe(false);
   expect(requests.some((url) => url.includes('/vendor/pyodide/'))).toBe(false);
 
   await page.getByRole('button', { name: '戦略を開く' }).click();
+  await page.locator('select[data-strategy-selection]').selectOption('custom_python');
+  await expect(page.locator('[data-strategy-custom-panel]')).toBeVisible();
   await expect(workspace).toHaveAttribute('data-strategy-mode', 'enhanced');
   await expect(page.locator('.strategy-editor .cm-editor')).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Python 戦略ソース' })).toHaveCount(1);
@@ -115,7 +216,6 @@ test('production closure preserves lazy boundaries and runs Load/Start/lifecycle
 test('production Worker preserves causal fills, cancellation, Stop, and restart', async ({ page }) => {
   test.setTimeout(90000);
   const workspace = await openApplication(page);
-  await page.getByRole('button', { name: '戦略を開く' }).click();
   await expect(workspace).toHaveAttribute('data-strategy-mode', 'enhanced');
   await replaceStrategySource(page, BRIDGE_SOURCE);
   await page.getByRole('button', { name: 'Load', exact: true }).click();
@@ -202,7 +302,6 @@ test('production Worker preserves causal fills, cancellation, Stop, and restart'
 
 test('production Worker converts a Python callback error and commits no order', async ({ page }) => {
   const workspace = await openApplication(page);
-  await page.getByRole('button', { name: '戦略を開く' }).click();
   await expect(workspace).toHaveAttribute('data-strategy-mode', 'enhanced');
   await replaceStrategySource(page, `def on_event(event):
     raise RuntimeError("deterministic production bridge error")
@@ -222,7 +321,6 @@ test('production Worker converts a Python callback error and commits no order', 
 test('CodeMirror and Pyodide failures stay narrower than raw-copy recovery', async ({ page }) => {
   await page.route('**/vendor/codemirror/**/strategy-editor.mjs', (route) => route.abort());
   const workspace = await openApplication(page);
-  await page.getByRole('button', { name: '戦略を開く' }).click();
   await expect(workspace).toHaveAttribute('data-strategy-mode', 'degraded');
   await expect(page.locator('[data-strategy-source]')).not.toHaveAttribute('readonly', '');
   await expect(page.getByRole('button', { name: 'Save Draft' })).toBeEnabled();
@@ -257,7 +355,6 @@ test('release bootstrap failure leaves raw-copy recovery without breaking replay
 test('narrow workspace keeps one named editor, touch targets, and bounded width', async ({ page }, testInfo) => {
   test.skip(!testInfo.project.name.startsWith('mobile'), 'mobile-only layout evidence');
   const workspace = await openApplication(page);
-  await page.getByRole('button', { name: '戦略を開く' }).click();
   await expect(workspace).toHaveAttribute('data-strategy-mode', 'enhanced');
   await expect(page.locator('.strategy-editor .cm-editor')).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Python 戦略ソース' })).toHaveCount(1);

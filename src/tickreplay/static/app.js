@@ -86,7 +86,7 @@ const MINUTE_CONTEXT_BARS = 30;       // セッション開始前にプリロー
 const MINUTE_HISTORY_EDGE_BARS = 10;  // 最古の足からこの本数以内に入ったら次のページを取る
 
 const SYMBOL_SEARCH_DEBOUNCE_MS = 200; // 銘柄候補検索: この間隔だけ入力が止まってからサーバーへ問い合わせる
-const STRATEGY_RELEASE_URL = '/static/strategy/releases/fde82a53f12e81c6fbac68d116c2afc3fd8e0254907dd7b6e93cb9750a63f14d/strategy-release.mjs';
+const STRATEGY_RELEASE_URL = '/static/strategy/releases/51a39c13a038b423cffdab52cc4185bb1614a0ff6b5b44152c442cf7853b61e5/strategy-release.mjs';
 
 let strategyReleaseModule = null;
 let strategyWorkspace = null;
@@ -1371,6 +1371,11 @@ async function loadStrategy(request) {
   const session = strategySessionIdentity();
   if (!session) throw new Error('strategy_session_unavailable');
   if (strategyCommitter?.status().active) strategyCommitter.invalidate('explicit_load');
+  request = {
+    ...request,
+    sessionDataHash: state.meta.dataHash,
+    tickCount: state.t?.length ?? 0,
+  };
   return strategyController.load({ ...request, session });
 }
 
@@ -1398,6 +1403,8 @@ async function startStrategy() {
     lastCommitted,
     portfolio: strategyPortfolio(),
     openOrders: openOrderSnapshot.openOrders,
+    openOrdersTotal: openOrderSnapshot.openOrdersTotal,
+    openOrdersTruncated: openOrderSnapshot.openOrdersTruncated,
     replayPaused: !state.playing,
   });
   strategyCommitter.beginRun({
@@ -1914,7 +1921,12 @@ function redrawAll() {
 
 /** vt を targetVt に移し、そこまでの状態を作り直す（描画は最後に一度）。 */
 function seekTo(targetVt) {
-  if (strategyController?.isActive()) void invalidateStrategyRuntime('seek');
+  if (
+    strategyController?.isActive()
+    || (strategyController?.getState().loadedRevision ?? 0) > 0
+  ) {
+    void invalidateStrategyRuntime('seek');
+  }
   state.bars = state.contextBars.slice();
   state.cursor = 0;
   state.last = null;
@@ -2272,6 +2284,7 @@ async function loadSession(stem, date, direction) {
       code: session.code,
       date: session.date,
       count: session.count,
+      dataHash: session.dataHash,
     };
     if (!state.daily.stageActualSession(dailyGeneration, nextMeta)) return;
     if (chartMode === 'daily') void loadDailyContext();
@@ -2367,10 +2380,14 @@ function enterStrategyRawRecovery(root) {
   const toggle = root.querySelector('[data-strategy-action="toggle"]');
   const source = root.querySelector('[data-strategy-source]');
   const editor = root.querySelector('[data-strategy-editor]');
+  const customPanel = root.querySelector('[data-strategy-custom-panel]');
+  const bundledPanel = root.querySelector('[data-strategy-bundled-panel]');
   const importInput = root.querySelector('[data-strategy-import]');
   const status = root.querySelector('[data-strategy-status]');
   if (panel) panel.hidden = false;
   if (toggle) toggle.setAttribute('aria-expanded', 'true');
+  if (customPanel) customPanel.hidden = false;
+  if (bundledPanel) bundledPanel.hidden = true;
   if (editor) editor.hidden = true;
   if (source) {
     source.hidden = false;

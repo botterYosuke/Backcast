@@ -16,11 +16,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tickreplay import server
+from tickreplay.bundled_rl_runtime import runtime_fingerprint, runtime_manifest
+from tickreplay.bundled_rl_service import BundledRlManager
+from tickreplay.bundled_rl_worker import handle as handle_bundled_rl_request
 from tickreplay.config import (
     CACHE_DIR_ENV_VAR,
     LOCAL_AUTHORITATIVE_ENV_VAR,
+    NATIVE_ENABLED_ENV_VAR,
     CacheConfigError,
 )
+from tickreplay.strategy_trace import PRESET, TraceStore
 
 ROWS = [
     ("2026-08-14 09:00:00.100000", 100.0, 100, "1", "13010"),
@@ -49,6 +54,7 @@ def _expected_headers_after_strategy_serving(expected):
 def isolate_local_authoritative_setting(monkeypatch):
     """Server tests must not inherit a developer's ignored root ``.env``."""
     monkeypatch.setenv(LOCAL_AUTHORITATIVE_ENV_VAR, "false")
+    monkeypatch.setenv(NATIVE_ENABLED_ENV_VAR, "false")
 
 
 @pytest.fixture
@@ -60,7 +66,11 @@ def client(cache_dir, http_client, tick_db_factory, monkeypatch):
     # it construct a real one against the (default) production server URL.
     monkeypatch.setattr(server, "build_http_client", lambda config: http_client)
     server.reset_for_tests()
-    with TestClient(server.app) as test_client:
+    with TestClient(
+        server.app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 50000),
+    ) as test_client:
         # Pre-warm "1301" synchronously so ordinary endpoint tests below
         # aren't about the async pending/operationId path (Step 7) — that
         # path has its own dedicated tests further down.
@@ -284,6 +294,7 @@ def test_session_returns_columnar_ticks(client):
     assert body["price"] == [102.0, 103.0]
     assert body["qty"] == [300, 400]
     assert len(body["us"]) == len(body["type"]) == 2
+    assert len(body["dataHash"]) == 64
 
 
 def test_session_can_snap_backwards_to_the_nearest_trading_day(client):
@@ -1004,5 +1015,313 @@ def test_failed_revalidation_serves_existing_cache_as_stale_once_per_process(
                 "/api/session", params={"stem": "1301", "date": "2026-08-17"}
             )
             assert calls["file"] == server.cache.MAX_DOWNLOAD_ATTEMPTS
+    finally:
+        server.reset_for_tests()
+
+
+class FakeBundledRlProcess:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, request, *, cancel_event, timeout_seconds):
+        self.calls += 1
+        return handle_bundled_rl_request(request)
+
+
+def _bundled_manager(cache_dir, process=None):
+    manifest = runtime_manifest()
+    return BundledRlManager(
+        available=True,
+        unavailable_reason=None,
+        process=process or FakeBundledRlProcess(),
+        store=TraceStore(cache_dir / "bundled_rl_traces"),
+        runtime_manifest=manifest,
+        runtime_fingerprint=runtime_fingerprint(manifest),
+    )
+
+
+def _bundled_request(session):
+    return {
+        "contractVersion": "bundled_rl_trace_v1",
+        "preset": dict(PRESET),
+        "session": {
+            "stem": session["stem"],
+            "code": session["code"],
+            "date": session["date"],
+            "dataHash": session["dataHash"],
+        },
+    }
+
+
+def _malformed_bundled_requests():
+    session = {
+        "stem": "1301",
+        "code": "13010",
+        "date": "2026-08-17",
+        "dataHash": "a" * 64,
+    }
+    valid = {
+        "contractVersion": "bundled_rl_trace_v1",
+        "preset": dict(PRESET),
+        "session": session,
+    }
+
+    def encoded(value):
+        return json.dumps(value, separators=(",", ":")).encode()
+
+    wrong_preset = {**valid, "preset": {**PRESET, "digest": "0" * 64}}
+    unknown_session = {**valid, "session": {**session, "unexpected": True}}
+    unknown_preset = {**valid, "preset": {**PRESET, "unexpected": True}}
+    invalid_date = {**valid, "session": {**session, "date": "not-a-date"}}
+    invalid_stem = {**valid, "session": {**session, "stem": "../../cache"}}
+    invalid_hash = {**valid, "session": {**session, "dataHash": "not-a-hash"}}
+    preset_bytes = encoded(PRESET)
+    session_bytes = encoded(session)
+    duplicate_preset = (
+        b'{"contractVersion":"bundled_rl_trace_v1","preset":'
+        + preset_bytes
+        + b',"preset":'
+        + preset_bytes
+        + b',"session":'
+        + session_bytes
+        + b"}"
+    )
+    return [
+        pytest.param(
+            encoded({key: value for key, value in valid.items() if key != "preset"}),
+            id="missing-preset",
+        ),
+        pytest.param(encoded(wrong_preset), id="wrong-preset"),
+        pytest.param(encoded({**valid, "sourceHash": "0" * 64}), id="source-hash"),
+        pytest.param(encoded({**valid, "source": "forbidden"}), id="source"),
+        pytest.param(encoded({**valid, "unexpected": True}), id="unknown-top-level"),
+        pytest.param(encoded(unknown_session), id="unknown-session-field"),
+        pytest.param(encoded(unknown_preset), id="unknown-preset-field"),
+        pytest.param(duplicate_preset, id="duplicate-json-key"),
+        pytest.param(b'{"contractVersion":"\xff"}', id="invalid-utf8"),
+        pytest.param(encoded({**valid, "unexpected": float("nan")}), id="non-finite"),
+        pytest.param(encoded(valid)[:-1], id="truncated-json"),
+        pytest.param(encoded(invalid_date), id="invalid-session-date"),
+        pytest.param(encoded(invalid_stem), id="invalid-session-stem"),
+        pytest.param(encoded(invalid_hash), id="invalid-session-hash"),
+    ]
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, str | None]]:
+    snapshot: dict[str, tuple[str, str | None]] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_dir():
+            snapshot[relative] = ("directory", None)
+        else:
+            snapshot[relative] = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+    return snapshot
+
+
+def _poll_bundled_job(client, job_id):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/strategies/bundled-rl/jobs/{job_id}")
+        assert response.status_code == 200
+        body = response.json()
+        if body["state"] in {"ready", "failed", "cancelled", "timed_out"}:
+            return body
+        time.sleep(0.01)
+    raise AssertionError("Bundled RL job did not finish")
+
+
+def test_bundled_rl_disabled_capability_and_body_guard(client):
+    capability = client.get("/api/strategies/bundled-rl/capability")
+    assert capability.status_code == 200
+    assert capability.json()["available"] is False
+    oversized = client.post(
+        "/api/strategies/bundled-rl/jobs",
+        content=b"{}",
+        headers={"Content-Length": str(server.MAX_NATIVE_REQUEST_BYTES + 1)},
+    )
+    assert oversized.status_code == 413
+
+
+def test_bundled_rl_self_check_timeout_degrades_to_unavailable_capability(
+    cache_dir, http_client, monkeypatch
+):
+    monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(cache_dir))
+    monkeypatch.setenv(NATIVE_ENABLED_ENV_VAR, "true")
+    monkeypatch.setattr(server, "build_http_client", lambda config: http_client)
+
+    def time_out(*args, **kwargs):
+        raise TimeoutError("handshake timed out")
+
+    monkeypatch.setattr(server, "self_check", time_out)
+    server.reset_for_tests()
+    try:
+        with TestClient(
+            server.app,
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        ) as test_client:
+            capability = test_client.get("/api/strategies/bundled-rl/capability")
+            assert capability.status_code == 200
+            assert capability.json()["available"] is False
+            assert (
+                test_client.get("/api/status", params={"stem": "1301"}).status_code
+                == 200
+            )
+    finally:
+        server.reset_for_tests()
+
+
+def test_bundled_rl_exact_preset_job_and_trace(
+    cache_dir, http_client, tick_db_factory, monkeypatch
+):
+    tick_db_factory("1301", ROWS)
+    monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(cache_dir))
+    monkeypatch.setattr(server, "build_http_client", lambda config: http_client)
+    manager = _bundled_manager(cache_dir)
+    monkeypatch.setattr(server, "_build_native_manager", lambda cache_dir: manager)
+    server.reset_for_tests()
+    try:
+        with TestClient(
+            server.app,
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        ) as test_client:
+            server.get_repository().symbol_info("1301")
+            session = test_client.get(
+                "/api/session", params={"stem": "1301", "date": "2026-08-17"}
+            ).json()
+            request = _bundled_request(session)
+            request["preset"] = {
+                "digest": PRESET["digest"],
+                "revision": PRESET["revision"],
+                "id": PRESET["id"],
+            }
+            submitted = test_client.post(
+                "/api/strategies/bundled-rl/jobs", json=request
+            )
+            assert submitted.status_code in {200, 202}
+            assert set(submitted.json()) == {"job"}
+            ready = _poll_bundled_job(test_client, submitted.json()["job"]["jobId"])
+            assert ready["state"] == "ready"
+            trace = test_client.get(
+                f"/api/strategies/bundled-rl/traces/{ready['traceId']}"
+            )
+            assert trace.status_code == 200
+            assert trace.json()["proposalContract"] == "backcast_position_target_v1"
+            assert "source" not in trace.text and "q_values" not in trace.text
+    finally:
+        server.reset_for_tests()
+
+
+def test_bundled_rl_source_rejects_before_repository_or_manager(client, monkeypatch):
+    def touched(*args, **kwargs):
+        raise AssertionError("validation must precede all side effects")
+
+    monkeypatch.setattr(server, "get_repository", touched)
+    monkeypatch.setattr(server, "get_native_manager", touched)
+    payload = {
+        "contractVersion": "bundled_rl_trace_v1",
+        "preset": dict(PRESET),
+        "session": {
+            "stem": "1301",
+            "code": "13010",
+            "date": "2026-08-17",
+            "dataHash": "a" * 64,
+        },
+        "source": "forbidden",
+    }
+    response = client.post("/api/strategies/bundled-rl/jobs", json=payload)
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize("raw_request", _malformed_bundled_requests())
+def test_bundled_rl_malformed_requests_reject_before_every_side_effect(
+    client, cache_dir, monkeypatch, raw_request
+):
+    side_effects: list[str] = []
+
+    def forbidden(name):
+        def record(*args, **kwargs):
+            side_effects.append(name)
+            raise AssertionError(f"{name} must not run for malformed input")
+
+        return record
+
+    monkeypatch.setattr(server, "get_repository", forbidden("repository"))
+    monkeypatch.setattr(server, "get_tracker", forbidden("cache-tracker"))
+    monkeypatch.setattr(server, "get_native_manager", forbidden("job-manager"))
+    monkeypatch.setattr(server.BundledRlManager, "submit", forbidden("job-allocation"))
+    monkeypatch.setattr(server.BundledRlProcess, "execute", forbidden("child-process"))
+    monkeypatch.setattr(server.TraceStore, "prepare", forbidden("artifact-prepare"))
+    before = _tree_snapshot(cache_dir)
+    artifact_root = cache_dir / "bundled_rl_traces"
+    assert not artifact_root.exists()
+
+    response = client.post(
+        "/api/strategies/bundled-rl/jobs",
+        content=raw_request,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert side_effects == []
+    assert _tree_snapshot(cache_dir) == before
+    assert not artifact_root.exists()
+
+
+def test_bundled_rl_streamed_overflow_rejects_before_every_side_effect(
+    client, cache_dir, monkeypatch
+):
+    side_effects: list[str] = []
+
+    def touched(*args, **kwargs):
+        side_effects.append("backend")
+        raise AssertionError("oversized input must not reach backend state")
+
+    monkeypatch.setattr(server, "get_repository", touched)
+    monkeypatch.setattr(server, "get_tracker", touched)
+    monkeypatch.setattr(server, "get_native_manager", touched)
+    before = _tree_snapshot(cache_dir)
+    response = client.post(
+        "/api/strategies/bundled-rl/jobs",
+        content=b"{" + b" " * server.MAX_NATIVE_REQUEST_BYTES + b"}",
+        headers={"Content-Length": "2", "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert side_effects == []
+    assert _tree_snapshot(cache_dir) == before
+
+
+def test_bundled_rl_routes_keep_loopback_host_origin_guards(client):
+    path = "/api/strategies/bundled-rl/capability"
+    assert client.get(path, headers={"Host": "evil.example"}).status_code == 403
+    assert client.get(path, headers={"Origin": "https://127.0.0.1"}).status_code == 403
+    assert client.get(path, headers={"Origin": "http://127.0.0.1"}).status_code == 200
+
+
+def test_session_hash_accepts_null_trade_type(
+    cache_dir, http_client, tick_db_factory, monkeypatch
+):
+    tick_db_factory(
+        "1301",
+        [("2026-08-17 09:00:00.000000", 102.0, 300, None, "13010")],
+    )
+    monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(cache_dir))
+    monkeypatch.setattr(server, "build_http_client", lambda config: http_client)
+    server.reset_for_tests()
+    try:
+        with TestClient(
+            server.app,
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+        ) as test_client:
+            server.get_repository().symbol_info("1301")
+            response = test_client.get(
+                "/api/session", params={"stem": "1301", "date": "2026-08-17"}
+            )
+            assert response.status_code == 200
+            assert response.json()["type"] == [""]
+            assert len(response.json()["dataHash"]) == 64
     finally:
         server.reset_for_tests()
