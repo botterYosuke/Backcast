@@ -904,3 +904,82 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 
   .transport { flex-wrap: wrap; }
 }
+
+
+/* ------------------------------------------------------------- AI Replay */
+
+.ai-replay-btn {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-left: 6px;
+}
+
+.ai-replay-btn:hover {
+  background: var(--surface-hover, #2a2a2a);
+}
+
+.ai-replay-btn.is-active {
+  background: #7c3aed;
+  border-color: #6d28d9;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(124, 58, 237, 0.4);
+}
+
+.ai-panel {
+  border-left: 2px solid #7c3aed;
+  padding-left: 14px;
+}
+
+.ai-model-select {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 5px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  max-width: 220px;
+  margin-left: 6px;
+}
+
+.ai-model-select[hidden],
+.ai-warning[hidden] {
+  display: none;
+}
+
+.ai-badge-item {
+  max-width: 460px;
+}
+
+.ai-badge {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: normal;
+}
+
+.ai-badge .ai-period {
+  display: inline-block;
+  padding: 0 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  border: 1px solid currentColor;
+}
+
+.ai-badge .ai-period[data-period="test"] { color: #15803d; }
+.ai-badge .ai-period[data-period="train"],
+.ai-badge .ai-period[data-period="val"] { color: #b45309; }
+
+.ai-warning {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #b45309;
+}

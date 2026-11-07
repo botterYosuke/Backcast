@@ -130,6 +130,15 @@ const els = {
   posAvg: document.getElementById('pos-avg'),
   posPnl: document.getElementById('pos-pnl'),
   posTotal: document.getElementById('pos-total'),
+  aiReplayBtn: document.getElementById('ai-replay-btn'),
+  aiPanel: document.getElementById('ai-panel'),
+  aiModelSelect: document.getElementById('ai-model-select'),
+  aiBadge: document.getElementById('ai-badge'),
+  aiWarning: document.getElementById('ai-warning'),
+  aiPosQty: document.getElementById('ai-pos-qty'),
+  aiPosAvg: document.getElementById('ai-pos-avg'),
+  aiPosPnl: document.getElementById('ai-pos-pnl'),
+  aiPosTotal: document.getElementById('ai-pos-total'),
   pnlModal: document.getElementById('pnl-modal'),
   pnlRealized: document.getElementById('pnl-realized'),
   pnlUnrealized: document.getElementById('pnl-unrealized'),
@@ -332,6 +341,18 @@ const tickSeries = tickChart.addLineSeries({
   priceLineColor: '#b7afa0',
   crosshairMarkerRadius: 3,
 });
+
+// AI 指値注文の「板に並んでいた区間」: 同時に並ぶ買い/売り指値は各1本まで。
+const aiOrderLineOptions = {
+  lineWidth: 2,
+  lineStyle: LightweightCharts.LineStyle.Dashed,
+  lineType: LightweightCharts.LineType.Simple,
+  priceLineVisible: false,
+  lastValueVisible: false,
+  crosshairMarkerVisible: false,
+};
+const aiBidSeries = tickChart.addLineSeries({ ...aiOrderLineOptions, color: 'rgba(124, 58, 237, 0.45)' });
+const aiAskSeries = tickChart.addLineSeries({ ...aiOrderLineOptions, color: 'rgba(217, 119, 6, 0.5)' });
 
 // ------------------------------------------------------------ replay state
 
@@ -1417,6 +1438,329 @@ function markerStyle(event) {
  * 約定イベントから両チャートのマーカーを作り直す。setMarkers は全差し替え
  * なので、シーク後の再描画でもこれを一度呼べば表示が整合する。
  */
+const aiReplay = {
+  enabled: false,
+  stem: null,
+  date: null,
+  trades: [],
+  orders: [],
+  summary: null,
+  available: false,
+  model: '',          // '' = サーバ既定
+  models: [],         // /api/ai/models
+  modelsLoaded: false,
+  info: null,         // model / period / in_universe ... of the last response
+  reason: null,
+  requestSeq: 0,
+};
+
+let prevAiTradeCount = -1;
+
+function clearAiReplayData() {
+  aiReplay.available = false;
+  aiReplay.trades = [];
+  aiReplay.orders = [];
+  aiReplay.summary = null;
+  aiReplay.info = null;
+}
+
+async function loadAiModels() {
+  if (aiReplay.modelsLoaded) return;
+  try {
+    const res = await fetch('/api/ai/models');
+    if (!res.ok) return;
+    const models = await res.json();
+    if (!Array.isArray(models)) return;
+    aiReplay.models = models;
+    aiReplay.modelsLoaded = true;
+    const select = els.aiModelSelect;
+    if (!select) return;
+    select.length = 1; // 先頭の「自動（既定）」だけ残す
+    models.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m.file;
+      opt.textContent = m.label + (m.default ? '（既定）' : '');
+      opt.title = m.file;
+      select.appendChild(opt);
+    });
+    select.value = aiReplay.model;
+    updateAiBadge();
+  } catch (err) {
+    console.warn('[AI Replay] model list failed', err);
+  }
+}
+
+async function loadAiReplayTrades(stem, date) {
+  if (!stem || !date) return;
+  const seq = (aiReplay.requestSeq += 1);
+  const modelParam = aiReplay.model ? `&model=${encodeURIComponent(aiReplay.model)}` : '';
+  try {
+    const res = await fetch(
+      `/api/ai/replay-trades?stem=${encodeURIComponent(stem)}&date=${encodeURIComponent(date)}${modelParam}`,
+    );
+    if (seq !== aiReplay.requestSeq) return; // 新しい要求が出ている
+    if (!res.ok) {
+      clearAiReplayData();
+      aiReplay.reason = 'HTTP ' + res.status;
+      prevAiTradeCount = -1;
+      updateAiReplayDisplay();
+      refreshMarkers();
+      return;
+    }
+    const data = await res.json();
+    if (seq !== aiReplay.requestSeq) return;
+    if (data.available && Array.isArray(data.trades)) {
+      aiReplay.available = true;
+      aiReplay.stem = stem;
+      aiReplay.date = date;
+      aiReplay.trades = data.trades.map((t) => ({
+        ...t,
+        time: t.us / 1e6,
+      }));
+      aiReplay.orders = (Array.isArray(data.orders) ? data.orders : []).map((o) => ({
+        ...o,
+        time: o.us / 1e6,
+      }));
+      aiReplay.summary = data.summary;
+      aiReplay.reason = null;
+      aiReplay.info = {
+        model: data.model,
+        kind: data.model_kind,
+        period: data.period,
+        inUniverse: data.in_universe,
+        isHeldout: data.is_heldout,
+        envConfig: data.env_config,
+      };
+    } else {
+      clearAiReplayData();
+      aiReplay.reason = data.reason || null;
+    }
+  } catch (err) {
+    if (seq !== aiReplay.requestSeq) return;
+    clearAiReplayData();
+    aiReplay.reason = String(err);
+  }
+  prevAiTradeCount = -1;
+  updateAiReplayDisplay();
+  refreshMarkers();
+}
+
+const AI_PERIOD_LABEL = { train: '学習期間', val: '検証期間', test: 'テスト期間', pre_train: '学習前' };
+
+/** モデル名・期間・注意書き。学習/検証期間と対象外銘柄では警告を出す。 */
+function updateAiBadge() {
+  if (!els.aiBadge) return;
+  const info = aiReplay.info;
+  let text = '—';
+  let warning = '';
+  let title = '';
+  let parts = null;
+  if (aiReplay.available && info) {
+    const meta = aiReplay.models.find((m) => m.file === info.model);
+    const label = meta ? meta.label : info.model;
+    const period = info.period;
+    const periodLabel = period ? (AI_PERIOD_LABEL[period] || period) : '';
+    text = label + (periodLabel ? ' / ' + periodLabel : '');
+    parts = { label, period, periodLabel };
+    const warns = [];
+    if (period === 'train') warns.push('学習に使った期間の再生です（実力ではありません）');
+    if (period === 'val') warns.push('モデル選択に使った検証期間です（未使用データではありません）');
+    if (info.inUniverse === false) warns.push('この日の売買代金上位50に入っていない銘柄です（学習対象外）');
+    warning = warns.join(' / ');
+    const cfg = info.envConfig || {};
+    const s = aiReplay.summary || {};
+    title = [
+      'model: ' + info.model + ' (' + info.kind + ')',
+      cfg.fill_rule ? '約定ルール: ' + cfg.fill_rule + ' / 遅延 ' + cfg.latency_ms + 'ms' : null,
+      '窓: ' + cfg.warmup_s + 's〜' + cfg.window_s + 's',
+      info.isHeldout === true ? '銘柄: 学習から除外した銘柄' : null,
+      s.limitExits !== undefined
+        ? '往復 ' + s.tradeCount + ' / 指値決済 ' + s.limitExits + ' / 強制決済 ' + s.forcedExits
+        : null,
+      warning || null,
+    ].filter(Boolean).join('\n');
+  } else if (aiReplay.enabled) {
+    text = aiReplay.reason ? '対象外: ' + aiReplay.reason : '—';
+  }
+  const key = text + '|' + warning + '|' + title;
+  if (els.aiBadge.dataset.key === key) return;
+  els.aiBadge.dataset.key = key;
+  els.aiBadge.title = title;
+  els.aiBadge.textContent = '';
+  if (parts) {
+    els.aiBadge.append(parts.label);
+    if (parts.periodLabel) {
+      const chip = document.createElement('span');
+      chip.className = 'ai-period';
+      chip.dataset.period = parts.period;
+      chip.textContent = parts.periodLabel;
+      els.aiBadge.appendChild(chip);
+    }
+  } else {
+    els.aiBadge.textContent = text;
+  }
+  if (els.aiWarning) {
+    els.aiWarning.hidden = !warning;
+    els.aiWarning.textContent = warning ? '⚠ ' + warning : '';
+  }
+}
+
+/** 指値(limit)/成行(market)/強制決済(forced) を区別するマーカー装飾。旧モデルは order 無し。 */
+function aiMarkerStyle(tr) {
+  const isBuy = tr.side === 'buy';
+  const position = isBuy ? 'belowBar' : 'aboveBar';
+  const kindTag = tr.order === 'limit' ? '指値' : tr.order === 'market' ? '成行' : '';
+  if (tr.kind === 'entry') {
+    return {
+      position,
+      color: tr.order === 'market' ? '#c026d3' : '#7c3aed',
+      shape: isBuy ? 'arrowUp' : 'arrowDown',
+      text: '🤖' + kindTag + (isBuy ? '買' : '売') + intFormat.format(tr.qty),
+    };
+  }
+  if (tr.forced) {
+    return { position, color: '#d97706', shape: 'square', text: '🤖強制決済 ' + signedYen(tr.pnl) };
+  }
+  return {
+    position,
+    color: tr.pnl >= 0 ? UP : DOWN,
+    shape: tr.order === 'market' ? 'square' : 'circle',
+    text: '🤖返済' + (kindTag ? '(' + kindTag + ')' : '') + ' ' + signedYen(tr.pnl),
+  };
+}
+
+/*
+ * 指値注文が板に並んでいた区間 (place → cancel/fill) を、ティックチャート上の
+ * 点線の水平線で描く。再生時刻 vt より先の情報は出さない（進行中の注文は vt まで）。
+ */
+let aiOrderLinesStamp = { sec: -1, at: 0, count: -1 };
+
+function aiOrderSegments(vt) {
+  const open = new Map();
+  const segs = [];
+  for (const o of aiReplay.orders) {
+    if (o.time > vt) break; // orders は時刻昇順
+    if (o.action === 'place') {
+      open.set(o.id, { side: o.side, price: o.price, from: o.time, to: null });
+    } else {
+      const seg = open.get(o.id);
+      if (seg) {
+        seg.to = o.time;
+        segs.push(seg);
+        open.delete(o.id);
+      }
+    }
+  }
+  for (const seg of open.values()) {
+    seg.to = vt;
+    segs.push(seg);
+  }
+  return segs;
+}
+
+function aiSegmentsToLine(segs) {
+  segs.sort((a, b) => a.from - b.from);
+  const data = [];
+  let lastT = -Infinity;
+  for (const seg of segs) {
+    const from = Math.max(seg.from, lastT + 0.001);
+    const to = Math.max(seg.to - 0.001, from + 0.001);
+    data.push({ time: from, value: seg.price }, { time: to, value: seg.price });
+    // 次の区間とつながらないよう空白点を挟む
+    lastT = to + 0.0005;
+    data.push({ time: lastT });
+  }
+  return data;
+}
+
+function refreshAiOrderLines(force) {
+  if (!aiReplay.enabled || !aiReplay.available || !aiReplay.orders.length) {
+    if (aiOrderLinesStamp.count !== 0) {
+      aiBidSeries.setData([]);
+      aiAskSeries.setData([]);
+      aiOrderLinesStamp = { sec: -1, at: 0, count: 0 };
+    }
+    return;
+  }
+  const now = performance.now();
+  const sec = Math.floor(state.vt);
+  if (!force && sec === aiOrderLinesStamp.sec) return;
+  if (!force && now - aiOrderLinesStamp.at < 250) return;
+  aiOrderLinesStamp = { sec, at: now, count: aiReplay.orders.length };
+  try {
+    const segs = aiOrderSegments(state.vt);
+    aiBidSeries.setData(aiSegmentsToLine(segs.filter((x) => x.side === 'buy')));
+    aiAskSeries.setData(aiSegmentsToLine(segs.filter((x) => x.side === 'sell')));
+  } catch (err) {
+    console.warn('[AI Replay] order lines failed', err);
+  }
+}
+
+function updateAiReplayDisplay() {
+  if (!aiReplay.enabled || !els.aiPanel) return;
+  updateAiBadge();
+  refreshAiOrderLines(false);
+  if (!aiReplay.available) {
+    els.aiPosQty.textContent = '対象外 / モデル無';
+    els.aiPosQty.dataset.tone = '';
+    els.aiPosAvg.textContent = '—';
+    els.aiPosPnl.textContent = '—';
+    els.aiPosTotal.textContent = '—';
+    return;
+  }
+
+  let aiQty = 0;
+  let aiAvg = 0;
+  let aiRealized = 0;
+  let count = 0;
+
+  for (const tr of aiReplay.trades) {
+    if (tr.time > state.vt) break;
+    count += 1;
+    const signed = tr.side === 'buy' ? 1 : -1;
+    let fillQty = tr.qty;
+    if (aiQty !== 0 && Math.sign(aiQty) !== signed) {
+      const closeQty = Math.min(fillQty, Math.abs(aiQty));
+      aiRealized += (tr.price - aiAvg) * closeQty * Math.sign(aiQty);
+      aiQty += signed * closeQty;
+      fillQty -= closeQty;
+      if (aiQty === 0) aiAvg = 0;
+    }
+    if (fillQty > 0) {
+      const held = Math.abs(aiQty);
+      aiAvg = held === 0 ? tr.price : (aiAvg * held + tr.price * fillQty) / (held + fillQty);
+      aiQty += signed * fillQty;
+    }
+  }
+
+  if (count !== prevAiTradeCount) {
+    prevAiTradeCount = count;
+    refreshMarkers();
+  }
+
+  const held = Math.abs(aiQty);
+  if (held === 0) {
+    els.aiPosQty.textContent = '—';
+    els.aiPosQty.dataset.tone = '';
+    els.aiPosAvg.textContent = '—';
+  } else {
+    els.aiPosQty.textContent = (aiQty > 0 ? '買 ' : '売 ') + intFormat.format(held) + ' 株';
+    els.aiPosQty.dataset.tone = aiQty > 0 ? 'up' : 'down';
+    els.aiPosAvg.textContent = priceFormat.format(aiAvg);
+  }
+
+  const currentPrice = state.last !== null
+    ? state.last
+    : (state.price && state.price.length ? state.price[0] : NaN);
+  const unreal = held && Number.isFinite(currentPrice) ? (currentPrice - aiAvg) * aiQty : 0;
+  const total = aiRealized + unreal;
+
+  els.aiPosPnl.textContent = held === 0 ? '—' : signedYen(unreal);
+  els.aiPosPnl.dataset.tone = held === 0 ? '' : pnlTone(unreal);
+  els.aiPosTotal.textContent = (count > 0 || held > 0) ? signedYen(total) : '—';
+  els.aiPosTotal.dataset.tone = (count > 0 || held > 0) ? pnlTone(total) : '';
+}
+
 function refreshMarkers() {
   const firstBar = state.bars.length ? state.bars[0].time : null;
   const lastBar = state.bars.length ? state.bars[state.bars.length - 1].time : null;
@@ -1433,6 +1777,21 @@ function refreshMarkers() {
     if (tickTime !== null) tickMarkers.push({ ...style, time: tickTime });
   });
 
+  if (aiReplay.enabled && aiReplay.available && aiReplay.trades) {
+    aiReplay.trades.forEach((tr) => {
+      if (tr.time > state.vt) return;
+      const style = aiMarkerStyle(tr);
+      const barTime = Math.floor(tr.time / MINUTE) * MINUTE;
+      if (firstBar !== null && barTime >= firstBar && barTime <= lastBar) {
+        minuteMarkers.push({ ...style, time: barTime });
+      }
+      const tickTime = snapTickTime(tr.time);
+      if (tickTime !== null) tickMarkers.push({ ...style, time: tickTime });
+    });
+  }
+
+  refreshAiOrderLines(true);
+
   commitMarkerWrites({
     mode: chartMode,
     minuteMarkers,
@@ -1448,6 +1807,7 @@ function refreshMarkers() {
 // -------------------------------------------------------------- 建玉パネル
 
 function updatePositionPanel() {
+  updateAiReplayDisplay();
   const portfolio = trading.portfolio;
   const held = Math.abs(portfolio.qty);
 
@@ -2044,6 +2404,9 @@ async function loadSession(stem, date, direction) {
     board.spread = rollSpread();
     clearBoard();
 
+    if (aiReplay.enabled && nextMeta.stem && nextMeta.date) {
+      void loadAiReplayTrades(nextMeta.stem, nextMeta.date);
+    }
     seekTo(state.t[0] - 0.001);
     minuteChart.timeScale().applyOptions({ rightOffset: 3 });
     minuteHistory.markSessionReady(generation, sessionIdentity);
@@ -2065,6 +2428,53 @@ async function loadSession(stem, date, direction) {
 }
 
 // ----------------------------------------------------------------- wiring
+
+function toggleAiReplay() {
+  const btn = document.getElementById('ai-replay-btn');
+  const panel = document.getElementById('ai-panel');
+  aiReplay.enabled = !aiReplay.enabled;
+  console.log('[AI Replay] Toggled:', aiReplay.enabled);
+
+  if (aiReplay.enabled) {
+    if (btn) {
+      btn.classList.add('is-active');
+      btn.textContent = '🤖 AI Play: ON';
+    }
+    if (panel) panel.style.display = 'flex';
+    if (els.aiModelSelect) els.aiModelSelect.hidden = false;
+    void loadAiModels();
+    if (state.meta?.stem && state.meta?.date) {
+      void loadAiReplayTrades(state.meta.stem, state.meta.date);
+    } else {
+      updateAiReplayDisplay();
+    }
+  } else {
+    if (btn) {
+      btn.classList.remove('is-active');
+      btn.textContent = '🤖 AI Play: OFF';
+    }
+    if (panel) panel.style.display = 'none';
+    if (els.aiModelSelect) els.aiModelSelect.hidden = true;
+    aiReplay.requestSeq += 1; // 飛行中の応答を捨てる
+    refreshMarkers();
+  }
+}
+
+if (els.aiModelSelect) {
+  els.aiModelSelect.addEventListener('change', () => {
+    aiReplay.model = els.aiModelSelect.value;
+    if (aiReplay.enabled && state.meta?.stem && state.meta?.date) {
+      void loadAiReplayTrades(state.meta.stem, state.meta.date);
+    }
+  });
+}
+
+document.addEventListener('click', (e) => {
+  if (e.target && (e.target.id === 'ai-replay-btn' || e.target.closest('#ai-replay-btn'))) {
+    e.preventDefault();
+    toggleAiReplay();
+  }
+});
 
 els.loadButton.addEventListener('click', () => {
   const stem = els.symbolInput.value.trim().toUpperCase();

@@ -295,3 +295,67 @@ def get_session_dates(
             params,
         ).fetchall()
         return [str(row[0]) for row in rows if row[0]]
+
+
+def extract_opening_session_from_ticks(
+    stem: str,
+    code: str,
+    date: str | Date,
+    us: list[int] | np.ndarray,
+    price: list[float] | np.ndarray,
+    qty: list[int] | np.ndarray,
+    trade_type: list[str] | np.ndarray,
+    *,
+    window_us: int = OPENING_WINDOW_US,
+) -> OpeningSessionData:
+    """Extract bounded [T_open, T_open + 15m] ticks from in-memory session ticks.
+
+    Finds T_open as the first execution in the morning session (Timestamp >= 09:00:00 JST / UTC epoch).
+    """
+    day_str = date.isoformat() if isinstance(date, Date) else str(date)
+    morning_start_dt = datetime.fromisoformat(f"{day_str} 09:00:00+00:00")
+    morning_start_us = int(morning_start_dt.timestamp() * 1_000_000)
+    day_end_dt = datetime.fromisoformat(f"{day_str} 23:59:59.999999+00:00")
+    day_end_us = int(day_end_dt.timestamp() * 1_000_000)
+
+    us_arr = np.asarray(us, dtype=np.int64)
+    price_arr = np.asarray(price, dtype=np.float64)
+    qty_arr = np.asarray(qty, dtype=np.int64)
+    type_arr = np.asarray(trade_type, dtype=object)
+
+    if len(us_arr) == 0:
+        raise NoMorningSessionError(f"No executions found for code {code} on {day_str}")
+
+    morning_mask = (us_arr >= morning_start_us) & (us_arr <= day_end_us)
+    morning_indices = np.where(morning_mask)[0]
+    if len(morning_indices) == 0:
+        raise NoMorningSessionError(
+            f"No morning session executions found for code {code} on {day_str} (>= 09:00:00)"
+        )
+
+    first_idx = morning_indices[0]
+    t_open_us = int(us_arr[first_idx])
+    p_open = float(price_arr[first_idx])
+    v_open = int(qty_arr[first_idx])
+    t_end_us = t_open_us + window_us
+
+    window_mask = (us_arr >= t_open_us) & (us_arr <= t_end_us)
+    sliced_indices = np.where(window_mask)[0]
+    if len(sliced_indices) == 0:
+        raise NoMorningSessionError(
+            f"No valid ticks found within 15m window for code {code} on {day_str}"
+        )
+
+    return OpeningSessionData(
+        stem=stem,
+        code=code,
+        date=day_str,
+        t_open_us=t_open_us,
+        p_open=p_open,
+        v_open=v_open,
+        epoch_us=us_arr[sliced_indices],
+        price=price_arr[sliced_indices],
+        qty=qty_arr[sliced_indices],
+        trade_type=type_arr[sliced_indices],
+    )
+

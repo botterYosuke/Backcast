@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .data import OpeningSessionData
 from .env import TickTradingEnv
-from .policy import ActorCritic
+from .policy import ActorCritic, load_policy_from_checkpoint
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class EvaluationResult:
     episodes: int
     mean_episode_pnl: float
     closed_trade_pnls: tuple[float, ...] = field(default_factory=tuple)
+    fill_offset_min_s: float | None = None  # earliest fill, seconds after T_open
+    fill_offset_max_s: float | None = None  # latest fill, seconds after T_open
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,48 +87,54 @@ def evaluate_policy(
     extra_features: list[np.ndarray] | None = None,
     auto_features: bool = False,
 ) -> EvaluationResult:
-    """Evaluate a trained policy deterministically across sessions.
+    """Evaluate a policy across sessions, driving the env as the only executor.
 
     Args:
-        policy: Trained ActorCritic network.
-        env: TickTradingEnv environment instance.
+        policy: Trained ActorCritic network or baseline policy.
+        env: TickTradingEnv environment instance (its window/warmup/slippage apply).
         sessions: Optional list of sessions to evaluate sequentially. If None,
-            evaluates over the env's configured session(s).
+            evaluates over the env's own (truncated, feature-equipped) sessions.
         deterministic: Whether to take argmax action (True) or sample from policy (False).
-        extra_features: Precomputed feature matrices aligned with sessions.
-        auto_features: Automatically extract microstructure features for sessions.
+        extra_features: Precomputed feature matrices aligned with ``sessions``.
+        auto_features: Automatically extract microstructure features for ``sessions``.
 
     Returns:
-        EvaluationResult with total PnL, win rate, profit factor, max drawdown, and trade count.
+        EvaluationResult with total PnL, win rate, profit factor, max drawdown, and
+        trade count. Closed trades are the env's exit fills, so breakeven exits
+        count towards the win-rate denominator.
     """
     policy.eval()
 
-    eval_sessions = sessions if sessions is not None else env._sessions
+    num_sessions = env.num_sessions if sessions is None else len(sessions)
 
     total_pnl_all = 0.0
     all_trade_pnls: list[float] = []
     total_trades_count = 0
     pnl_trajectory: list[float] = [0.0]
     running_cumulative_pnl = 0.0
+    offsets_s: list[float] = []
 
-    for i, sess in enumerate(eval_sessions):
-        extra = extra_features[i] if extra_features is not None else None
-        env.set_session(sess, extra_features=extra, auto_features=auto_features)
-
-        obs, info = env.reset()
+    for i in range(num_sessions):
+        if sessions is None:
+            obs, info = env.reset(options={"session_index": i})
+        else:
+            extra = extra_features[i] if extra_features is not None else None
+            env.set_session(
+                sessions[i], extra_features=extra, auto_features=auto_features
+            )
+            obs, info = env.reset()
+        t_open_us = env.current_session.t_open_us
         done = False
-        prev_realized = 0.0
 
         while not done:
             act = policy.predict(obs, deterministic=deterministic)
             next_obs, _reward, terminated, truncated, info = env.step(act)
             done = terminated or truncated
 
-            curr_realized = float(info.get("realized_pnl", 0.0))
-            if curr_realized != prev_realized:
-                trade_diff = curr_realized - prev_realized
-                all_trade_pnls.append(trade_diff)
-                prev_realized = curr_realized
+            for fill in info.get("fills", []):
+                offsets_s.append((fill["us"] - t_open_us) / 1_000_000.0)
+                if fill["kind"] == "exit":
+                    all_trade_pnls.append(float(fill["pnl"]))
 
             curr_step_total = running_cumulative_pnl + float(info.get("total_pnl", 0.0))
             pnl_trajectory.append(curr_step_total)
@@ -136,9 +145,9 @@ def evaluate_policy(
         running_cumulative_pnl += ep_final_pnl
         total_trades_count += int(info.get("trades_count", 0))
 
+
     # Metric computations
-    num_episodes = len(eval_sessions)
-    mean_pnl = total_pnl_all / max(1, num_episodes)
+    mean_pnl = total_pnl_all / max(1, num_sessions)
     max_dd = compute_max_drawdown(pnl_trajectory)
 
     # Closed trades metrics
@@ -164,7 +173,82 @@ def evaluate_policy(
         win_rate=win_rate,
         profit_factor=profit_factor,
         max_drawdown=max_dd,
-        episodes=num_episodes,
+        episodes=num_sessions,
         mean_episode_pnl=mean_pnl,
         closed_trade_pnls=tuple(all_trade_pnls),
+        fill_offset_min_s=min(offsets_s) if offsets_s else None,
+        fill_offset_max_s=max(offsets_s) if offsets_s else None,
     )
+
+
+def resolve_env_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Env config stored in a checkpoint, with legacy defaults filled in.
+
+    Old checkpoints carry no ``env_config``: window 900s, warmup 15s, slippage 0.
+    """
+    cfg = dict(checkpoint.get("env_config") or {})
+    cfg.setdefault("window_seconds", 900.0)
+    cfg.setdefault("opening_warmup_seconds", 15.0)
+    cfg.setdefault("slippage", 0.0)
+    return cfg
+
+
+def read_checkpoint_env_config(model_path: Path | str) -> dict[str, Any]:
+    """Load a checkpoint and return its resolved env config."""
+    _policy, checkpoint = load_policy_from_checkpoint(model_path)
+    return resolve_env_config(checkpoint)
+
+
+def simulate_ai_trades(
+    opening_session: OpeningSessionData,
+    model_path: Path | str,
+    *,
+    slippage: float | None = None,
+    qty: int = 100,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Simulate deterministic policy execution on an opening session.
+
+    The env is built from the checkpoint's ``env_config`` (window, warmup,
+    slippage; legacy defaults 900 / 15 / 0) and is the single source of fills:
+    this function only drives it and converts ``info["fills"]`` to the replay
+    JSON shape (pnl scaled by ``qty``). ``slippage`` overrides the checkpoint's.
+    """
+    policy, checkpoint = load_policy_from_checkpoint(model_path)
+    cfg = resolve_env_config(checkpoint)
+    env = TickTradingEnv(
+        opening_session,
+        slippage=float(cfg["slippage"] if slippage is None else slippage),
+        opening_warmup_seconds=float(cfg["opening_warmup_seconds"]),
+        window_seconds=float(cfg["window_seconds"]),
+        auto_features=True,
+    )
+    obs, _info = env.reset()
+
+    trades: list[dict[str, Any]] = []
+    done = False
+    while not done:
+        action = policy.predict(obs, deterministic=True)
+        obs, _reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        for fill in info["fills"]:
+            trades.append(
+                {
+                    "us": int(fill["us"]),
+                    "side": fill["side"],
+                    "qty": qty,
+                    "price": float(round(fill["price"], 2)),
+                    "kind": fill["kind"],
+                    "pnl": float(round(fill["pnl"] * qty, 2)),
+                }
+            )
+
+    closed_pnls = [t["pnl"] for t in trades if t["kind"] == "exit"]
+    wins = [p for p in closed_pnls if p > 0]
+    win_rate = float(round(len(wins) / len(closed_pnls), 4)) if closed_pnls else 0.0
+    total_pnl = float(round(sum(closed_pnls), 2))
+    summary = {
+        "totalPnl": total_pnl,
+        "tradeCount": len(closed_pnls),
+        "winRate": win_rate,
+    }
+    return trades, summary

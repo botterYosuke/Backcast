@@ -18,10 +18,11 @@ In Japanese equities (TSE), symbols do not all open at fixed 09:00:00 JST:
 
 ### Core Architectural Decisions:
 1. **Target Window**: Dynamic **$[T_{\text{open}}, T_{\text{open}} + 15\text{ min}]$** (900 seconds from the symbol's first trade). Mandatory square-off at $T_{\text{open}} + 15\text{ min}$.
-2. **Execution Layer**: Dedicated Python backend for ultra-fast headless simulation directly reading DuckDB tick files.
-3. **Strategy Paradigm**: PPO (Actor-Critic) trained on specialized post-open microstructure features (gap size, opening match volume, rolling range breakouts, volume velocity).
-4. **Execution Model**: Market orders (immediate fills at current tick price with slippage penalty; day-credit single net position rules).
-5. **Target Universe**: High-liquidity Japanese equities (starting with benchmark stem `7203` Toyota Motor, expandable to other liquid leaders).
+2. **Opening Warmup Prohibition**: Orders are strictly prohibited at the initial opening match ($T_{\text{open}}$) and for the first 15 seconds post-open ($t < T_{\text{open}} + 15\text{s}$) to model realistic post-auction order processing.
+3. **Execution Layer**: Dedicated Python backend for ultra-fast headless simulation directly reading DuckDB tick files.
+4. **Strategy Paradigm**: PPO (Actor-Critic) trained on specialized post-open microstructure features (gap size, opening match volume, rolling range breakouts, volume velocity).
+5. **Execution Model**: Market orders (immediate fills at current tick price with slippage penalty; day-credit single net position rules).
+6. **Target Universe**: High-liquidity Japanese equities (starting with benchmark stem `7203` Toyota Motor, expandable to other liquid leaders).
 
 ---
 
@@ -124,6 +125,7 @@ To capture the dynamics of the first 15 minutes post-open without lookahead bias
   - Normalized holding time in position: steps held / total episode steps.
   - Window time progress $\tau = (t - T_{\text{open}}) / 900 \in [0, 1]$.
 - **Execution & Realism Model**:
+  - **15-Second Opening Warmup**: Orders are strictly masked to `HOLD` for $t < T_{\text{open}} + 15\text{s}$. No execution at the opening auction.
   - Filled at current tick price $P_t$.
   - Fixed slippage penalty (e.g. 0.5 ~ 1.0 minimum tick increment per round trip).
   - **Mandatory 15-Minute Square-Off**: At the final tick before or at $T_{\text{open}} + 15\text{ min}$ ($\tau = 1.0$), any active position is forcibly liquidated at market with standard slippage, terminating the episode.
@@ -186,6 +188,24 @@ To capture the dynamics of the first 15 minutes post-open without lookahead bias
 - Validate on held-out validation partition (15%).
 - Final out-of-sample backtest on test partition (15%).
 - Generate performance report, equity curve plots, and trade logs.
+
+### Step 6: Web UI Integration (Visual AI Play / Autopilot Replay)
+- **Backend API (`src/tickreplay/server.py`)**:
+  - Add `GET /api/ai/replay-trades?stem=<stem>&date=<YYYY-MM-DD>`
+  - Evaluates trained PPO model (e.g. `models/ppo_7203_opening15m.pt`) deterministically across the session's $[T_{\text{open}}, T_{\text{open}} + 15\text{m}]$ ticks.
+  - Returns JSON payload:
+    `{"available": true|false, "stem": "...", "date": "...", "t_open_us": ..., "trades": [{"us": ..., "side": "buy"|"sell", "qty": 100, "price": ..., "kind": "entry"|"exit", "pnl": ...}], "summary": {"totalPnl": ..., "tradeCount": ..., "winRate": ...}}`
+  - Safe degradation: if model file does not exist or symbol has no session, returns `{"available": false, "trades": [], "summary": null}` with HTTP 200.
+- **Frontend UI (`src/tickreplay/static/index.html` & `app.js`)**:
+  - Add an "🤖 AI Replay" toggle button to the top control bar.
+  - When enabled:
+    - Queries `/api/ai/replay-trades` on session load.
+    - Synchronizes AI order executions with the replay clock/cursor ($t \ge \text{trade.us}$).
+    - Renders AI buy/sell/close markers on both tick and minute charts in real time.
+    - Displays an AI performance indicator badge showing live AI position and PnL.
+    - Supports full scrubbing, speed controls (1x to 30x), and stepping.
+- **Automated Tests**:
+  - Create `tests/test_ai_replay_api.py` validating API responses, error handling, and trade event synchronization.
 
 ---
 

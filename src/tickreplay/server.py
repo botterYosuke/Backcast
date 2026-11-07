@@ -471,6 +471,220 @@ def read_session(
     return {"pending": False, "operationId": None, **session.as_dict()}
 
 
+SCALP_MODEL = Path("models/ppo_scalp_top50_open10m.pt")
+
+
+def _resolve_model_checkpoint(
+    stem: str, model_param: str | None = None
+) -> Path | None:
+    if model_param:
+        p = Path(model_param)
+        if p.is_file():
+            return p
+        models_dir_p = Path("models") / model_param
+        if models_dir_p.is_file():
+            return models_dir_p
+        return None
+
+    # The multi-symbol limit-order scalper works for every stem, so it comes first;
+    # the single-stock market-order models follow.
+    candidates = [
+        SCALP_MODEL,
+        Path(f"models/ppo_{stem.lower()}_opening10m.pt"),
+        Path(f"models/ppo_{stem.upper()}_opening10m.pt"),
+        Path(f"models/ppo_{stem.lower()}_opening15m.pt"),
+        Path(f"models/ppo_{stem.upper()}_opening15m.pt"),
+        Path("models/ppo_7203_opening15m.pt"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _model_label(path: Path, kind: str) -> str:
+    if kind == "scalp":
+        return f"指値スキャルプ（全銘柄・top50学習）: {path.stem}"
+    return f"成行（銘柄別・旧）: {path.stem}"
+
+
+@app.get("/api/ai/models")
+def read_ai_models() -> list[dict[str, object]]:
+    """``models/*.pt`` with kind (``scalp`` limit-order / ``market`` legacy) and a label.
+
+    ``default`` marks the checkpoint the replay uses when no ``model`` is given
+    (for a stem without its own model).
+    """
+    from trading_rl.scalp_replay import checkpoint_kind, load_checkpoint_cached
+
+    default = _resolve_model_checkpoint("")
+    out: list[dict[str, object]] = []
+    for path in sorted(Path("models").glob("*.pt")):
+        try:
+            _policy, checkpoint = load_checkpoint_cached(path)
+            kind = checkpoint_kind(checkpoint)
+        except Exception:  # noqa: BLE001 - unreadable checkpoint is not selectable
+            continue
+        out.append(
+            {
+                "file": path.name,
+                "kind": kind,
+                "label": _model_label(path, kind),
+                "default": default is not None and path.name == default.name,
+            }
+        )
+    return out
+
+
+@app.get("/api/ai/replay-trades")
+def read_ai_replay_trades(
+    stem: str = Query(..., description="銘柄ファイル名 (例: 7203)"),
+    date: str = Query(..., description="対象日 YYYY-MM-DD"),
+    model: str | None = Query(
+        default=None, description="モデルファイルパスまたはファイル名 (任意)"
+    ),
+) -> dict[str, object]:
+    """Returns AI replay trades for the opening session (checkpoint window/warmup/slippage).
+
+    Dispatches on the checkpoint kind: ``scalp`` checkpoints are replayed on
+    ``ScalpEnv`` (limit orders, needs prev_close / 20d volume, see
+    ``trading_rl.scalp_replay``), legacy ones on the market-order ``TickTradingEnv``.
+    """
+    symbol = stem.upper()
+    unavailable_resp: dict[str, object] = {
+        "available": False,
+        "stem": stem,
+        "date": date,
+        "trades": [],
+        "summary": None,
+    }
+
+    def unavailable(reason: str) -> dict[str, object]:
+        return {**unavailable_resp, "reason": reason}
+
+    # 1. Resolve model checkpoint
+    model_path = _resolve_model_checkpoint(stem, model)
+    if model_path is None:
+        return unavailable("model checkpoint not found")
+
+    # 2. Resolve session ticks
+    repository = get_repository()
+    try:
+        day = _parse_date(date)
+    except HTTPException:
+        return unavailable("invalid date")
+
+    try:
+        session = repository.resolve_and_load_session(symbol, day, direction=0)
+    except (
+        SymbolNotFoundError,
+        SymbolAvailabilityUnknownError,
+        SymbolUnavailableError,
+        Exception,
+    ):
+        return unavailable("session ticks unavailable")
+
+    if session is None or len(session.us) == 0:
+        return unavailable("session ticks unavailable")
+
+    # 3. Extract opening session ticks
+    from trading_rl.data import (
+        NoMorningSessionError,
+        extract_opening_session_from_ticks,
+    )
+    from trading_rl.evaluator import resolve_env_config, simulate_ai_trades
+    from trading_rl.scalp_replay import (
+        checkpoint_kind,
+        is_heldout,
+        load_checkpoint_cached,
+        lookup_session_info,
+        period_of,
+        simulate_scalp_trades,
+    )
+
+    try:
+        _policy, checkpoint = load_checkpoint_cached(model_path)
+        kind = checkpoint_kind(checkpoint)
+        # Replay with the window the checkpoint was trained on (legacy: 900s).
+        env_config = resolve_env_config(checkpoint)
+        window_us = int(round(float(env_config["window_seconds"]) * 1_000_000))
+    except Exception:
+        return unavailable("checkpoint unreadable")
+
+    scalp_info = None
+    if kind == "scalp":
+        scalp_info = lookup_session_info(session.stem, session.date)
+        if scalp_info is None:
+            return unavailable(
+                "prev_close / avg_volume_20d unavailable (no universe row or daily panel)"
+            )
+
+    try:
+        opening_data = extract_opening_session_from_ticks(
+            stem=session.stem,
+            code=session.code,
+            date=session.date,
+            us=session.us,
+            price=session.price,
+            qty=session.qty,
+            trade_type=session.trade_type,
+            window_us=window_us,
+        )
+    except (NoMorningSessionError, Exception):
+        return unavailable("no morning session")
+
+    # 4. Run deterministic simulation with policy
+    response: dict[str, object] = {
+        # market-order checkpoints have no order book / universe notion
+        "orders": [],
+        "in_universe": None,
+        "period": None,
+        "is_heldout": None,
+    }
+    try:
+        if kind == "scalp":
+            assert scalp_info is not None
+            trades, summary, orders = simulate_scalp_trades(
+                opening_data,
+                model_path,
+                prev_close=scalp_info.prev_close,
+                avg_volume_20d=scalp_info.avg_volume_20d,
+                is_topix100=scalp_info.is_topix100,
+            )
+            response = {
+                "orders": orders,
+                "in_universe": scalp_info.in_universe,
+                "period": period_of(session.date),
+                "is_heldout": is_heldout(session.stem),
+                "is_topix100": scalp_info.is_topix100,
+                "session_info_source": scalp_info.source,
+                "topix100_source": scalp_info.topix100_source,
+                "features": env_config.get("features", "base"),
+            }
+        else:
+            trades, summary = simulate_ai_trades(opening_data, model_path)
+    except Exception as error:  # noqa: BLE001 - degrade, never 5xx the UI
+        return unavailable(f"simulation failed: {type(error).__name__}")
+
+    return {
+        "available": True,
+        "stem": stem,
+        "date": session.date,
+        "t_open_us": opening_data.t_open_us,
+        "trades": trades,
+        "summary": summary,
+        "model": model_path.name,
+        "model_kind": kind,
+        "env_config": {
+            "window_s": env_config.get("window_seconds"),
+            "warmup_s": env_config.get("opening_warmup_seconds"),
+            "fill_rule": env_config.get("fill_rule"),
+            "latency_ms": env_config.get("latency_ms"),
+        },
+        **response,
+    }
+
+
 @app.get("/api/minute-context")
 def read_minute_context(
     stem: str = Query(..., description="銘柄ファイル名 (例: 7203)"),
@@ -544,7 +758,7 @@ async def read_daily_context(
 
 @app.get("/")
 def read_index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 # Python's mimetypes module derives its table from the OS registry on

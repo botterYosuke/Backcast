@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark and Evaluation CLI for Opening 15-Minute RL Trading Agent.
+"""Benchmark and Evaluation CLI for the opening-window RL Trading Agent.
 
 Trains a PPO agent on chronological morning sessions and benchmarks
 it against Random and Buy-and-Hold baselines on an out-of-sample test set.
@@ -8,7 +8,11 @@ it against Random and Buy-and-Hold baselines on an out-of-sample test set.
 from __future__ import annotations
 
 import argparse
+import csv
+import math
 import sys
+import time
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +33,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from trading_rl.data import (  # noqa: E402
+    OPENING_WINDOW_US,
     OpeningSessionData,
     _open_duckdb,
     get_session_dates,
@@ -41,7 +46,9 @@ from trading_rl.evaluator import (  # noqa: E402
     RandomPolicy,
     evaluate_policy,
 )
-from trading_rl.trainer import PPOConfig, PPOTrainer  # noqa: E402
+from trading_rl.features import get_feature_names  # noqa: E402
+from trading_rl.policy import ActorCritic  # noqa: E402
+from trading_rl.trainer import PPOConfig, PPOTrainer, fit_obs_normalizer  # noqa: E402
 
 
 def split_sessions_chronologically(
@@ -162,59 +169,74 @@ def load_sessions_batch(
     stem: str,
     dates: list[str],
     label: str = "sessions",
+    *,
+    window_us: int = OPENING_WINDOW_US,
+    warmup_us: int | None = None,
 ) -> list[OpeningSessionData]:
-    """Load tick sessions from DuckDB for a list of dates."""
+    """Load tick sessions from DuckDB for a list of dates.
+
+    Args:
+        window_us: Window loaded after T_open (ticks with epoch <= T_open + window).
+        warmup_us: If given, sessions without any tick in [T_open + warmup, T_open +
+            window] are dropped (nothing can be traded on them).
+    """
     sessions: list[OpeningSessionData] = []
+    dropped = 0
     print(f"Loading {len(dates)} {label} from {db_path.name}...", flush=True)
     with _open_duckdb(db_path, stem) as con:
         for i, dt in enumerate(dates):
             try:
-                sess = load_session_ticks(con, dt, stem=stem)
-                sessions.append(sess)
+                sess = load_session_ticks(con, dt, stem=stem, window_us=window_us)
+                if warmup_us is not None and not bool(
+                    np.any(sess.epoch_us >= sess.t_open_us + warmup_us)
+                ):
+                    dropped += 1
+                    print(
+                        f"  [Warning] Dropping {dt}: no tick after warmup in window",
+                        flush=True,
+                    )
+                else:
+                    sessions.append(sess)
             except Exception as e:
                 print(f"  [Warning] Skipping date {dt}: {e}", flush=True)
             if (i + 1) % 10 == 0 or (i + 1) == len(dates):
                 print(f"  Loaded {i + 1}/{len(dates)} {label}...", flush=True)
+    if dropped:
+        print(f"  Dropped {dropped} {label} without tradable ticks.", flush=True)
     return sessions
 
 
 def run_benchmarks(
     policy: Any,
     test_env: TickTradingEnv,
-    test_sessions: list[OpeningSessionData],
+    test_sessions: list[OpeningSessionData] | None = None,
     seed: int = 42,
 ) -> dict[str, EvaluationResult]:
-    """Run evaluation for Random, Buy-and-Hold, and Trained PPO policies."""
+    """Run evaluation for Random, Buy-and-Hold, and Trained PPO policies.
+
+    All three run on ``test_env``, so they share its window / warmup / slippage.
+    With ``test_sessions=None`` the env's own sessions (and precomputed features)
+    are used.
+    """
     results: dict[str, EvaluationResult] = {}
+    kwargs: dict[str, Any] = (
+        {} if test_sessions is None else {"sessions": test_sessions, "auto_features": True}
+    )
 
     # 1. Random Agent
     print("Evaluating Random Agent Baseline...", flush=True)
-    random_policy = RandomPolicy(seed=seed)
     results["Random Agent"] = evaluate_policy(
-        random_policy,
-        test_env,
-        sessions=test_sessions,
-        auto_features=True,
+        RandomPolicy(seed=seed), test_env, **kwargs
     )
 
     # 2. Buy-and-Hold Benchmark
     print("Evaluating Buy-and-Hold Benchmark...", flush=True)
-    bh_policy = BuyAndHoldPolicy()
-    results["Buy-and-Hold"] = evaluate_policy(
-        bh_policy,
-        test_env,
-        sessions=test_sessions,
-        auto_features=True,
-    )
+    results["Buy-and-Hold"] = evaluate_policy(BuyAndHoldPolicy(), test_env, **kwargs)
 
     # 3. Trained PPO Agent (Deterministic Policy)
     print("Evaluating Trained PPO Agent (Deterministic)...", flush=True)
     results["PPO Agent (Ours)"] = evaluate_policy(
-        policy,
-        test_env,
-        sessions=test_sessions,
-        deterministic=True,
-        auto_features=True,
+        policy, test_env, deterministic=True, **kwargs
     )
 
     return results
@@ -244,225 +266,315 @@ def format_metrics_table(results: dict[str, EvaluationResult]) -> str:
     return "\n".join([header, separator] + rows)
 
 
+def is_better_validation(
+    pnl: float,
+    trades: int,
+    best_pnl: float | None,
+    best_trades: int | None,
+) -> bool:
+    """Model selection rule: higher validation PnL wins, ties go to fewer trades."""
+    if best_pnl is None or best_trades is None:
+        return True
+    if pnl > best_pnl:
+        return True
+    return pnl == best_pnl and trades < best_trades
+
+
+def build_auto_notes(
+    results: dict[str, EvaluationResult],
+    *,
+    warmup_seconds: float,
+    window_seconds: float,
+) -> list[str]:
+    """Short factual notes derived only from measured results."""
+    notes: list[str] = []
+    ppo = results.get("PPO Agent (Ours)")
+    bh = results.get("Buy-and-Hold")
+    if ppo is None:
+        return notes
+
+    if ppo.trade_count == 0:
+        notes.append("PPO が全セッションで無取引 (取引回数 0)。")
+    elif (
+        bh is not None
+        and ppo.total_pnl == bh.total_pnl
+        and ppo.trade_count == bh.trade_count
+        and ppo.closed_trade_pnls == bh.closed_trade_pnls
+    ):
+        notes.append("PPO の結果が Buy-and-Hold と同一 → 方策が常時買い持ちに崩壊。")
+    if bh is not None and ppo.trade_count > 0:
+        rel = "上回る" if ppo.total_pnl > bh.total_pnl else (
+            "同じ" if ppo.total_pnl == bh.total_pnl else "下回る"
+        )
+        notes.append(
+            f"PPO の合計 PnL ({ppo.total_pnl:+.2f}) は Buy-and-Hold "
+            f"({bh.total_pnl:+.2f}) を{rel}。"
+        )
+    if ppo.fill_offset_min_s is not None and ppo.fill_offset_max_s is not None:
+        ok = (
+            ppo.fill_offset_min_s >= warmup_seconds - 1e-9
+            and ppo.fill_offset_max_s <= window_seconds + 1e-9
+        )
+        verdict = "許容範囲内" if ok else "許容範囲外 (要調査)"
+        notes.append(
+            f"PPO の約定時刻は T_open+{ppo.fill_offset_min_s:.3f}s から "
+            f"T_open+{ppo.fill_offset_max_s:.3f}s (許容 [{warmup_seconds:g}s, "
+            f"{window_seconds:g}s]) で{verdict}。"
+        )
+    return notes
+
+
+def format_eval_history(history: list[dict[str, float]]) -> str:
+    """Markdown table of validation evaluations performed during training."""
+    header = (
+        "| Iter | Timesteps | Val PnL (JPY) | Val Trades | Mean Ep Return | Entropy | KL |"
+    )
+    sep = "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
+    rows = [
+        f"| {int(h['iteration'])} | {int(h['total_timesteps'])} | "
+        f"{h['val_pnl']:+.2f} | {int(h['val_trades'])} | "
+        f"{h['mean_ep_return']:+.4f} | {h['entropy']:.4f} | {h['approx_kl']:.5f} |"
+        for h in history
+    ]
+    return "\n".join([header, sep] + rows)
+
+
 def generate_markdown_report(
+    *,
     stem: str,
     db_path: Path,
     train_dates: list[str],
     val_dates: list[str],
     test_dates: list[str],
-    results: dict[str, EvaluationResult],
+    val_results: dict[str, EvaluationResult] | None,
+    test_results: dict[str, EvaluationResult],
     iterations: int,
-    learning_rate: float,
+    total_timesteps: int,
+    ppo_config: PPOConfig,
+    window_seconds: float,
+    warmup_seconds: float,
     slippage: float,
+    feature_names: list[str],
+    obs_dim: int,
     model_save_path: Path,
-    training_logs: list[dict[str, float]],
+    best_iteration: int,
+    best_selection: str,
+    eval_history: list[dict[str, float]],
+    steps_per_sec: float,
+    seed: int,
+    reproduce_cmd: str,
 ) -> str:
-    """Generate comprehensive research report document."""
-    table = format_metrics_table(results)
-
-    ppo_res = results.get("PPO Agent (Ours)")
-    bh_res = results.get("Buy-and-Hold")
-    rnd_res = results.get("Random Agent")
-
-    ppo_pnl = f"{ppo_res.total_pnl:+.2f} JPY" if ppo_res else "N/A"
-    bh_pnl = f"{bh_res.total_pnl:+.2f} JPY" if bh_res else "N/A"
-    rnd_pnl = f"{rnd_res.total_pnl:+.2f} JPY" if rnd_res else "N/A"
-
-    last_log = training_logs[-1] if training_logs else {}
-    final_policy_loss = last_log.get("policy_loss", 0.0)
-    final_value_loss = last_log.get("value_loss", 0.0)
-
+    """Generate the research report from measured values only."""
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hp_lines = "\n".join(
+        f"- `{k}`: `{v}`" for k, v in asdict(ppo_config).items()
+    )
+    feat_lines = ", ".join(f"`{n}`" for n in feature_names)
 
-    report = f"""# Benchmark & Evaluation Report: Opening 15-Minute RL Trading Agent
+    def _range(dates: list[str]) -> str:
+        return f"{len(dates)} sessions (`{dates[0]}` to `{dates[-1]}`)" if dates else "0 sessions"
 
-**Symbol Stem:** `{stem}` (Toyota Motor)
-**Database:** `{db_path}`
-**Generated At:** {timestamp_str}
-**Model Checkpoint:** `{model_save_path}`
+    sections = [
+        f"# Benchmark & Evaluation Report: Opening {window_seconds:g}s RL Trading Agent",
+        "",
+        f"**Symbol Stem:** `{stem}`  ",
+        f"**Database:** `{db_path}`  ",
+        f"**Generated At:** {timestamp_str}  ",
+        f"**Model Checkpoint:** `{model_save_path}`",
+        "",
+        "## 1. Setup",
+        "",
+        f"- Trading window: T_open to T_open + {window_seconds:g}s",
+        f"- Warmup (no orders): first {warmup_seconds:g}s after T_open",
+        f"- Slippage: {slippage:g} JPY per fill; PnL is per 1 share",
+        f"- Observation dim: {obs_dim} (5 base + {len(feature_names)} features)",
+        f"- Features: {feat_lines}",
+        f"- Seed: {seed}",
+        f"- Train: {_range(train_dates)}",
+        f"- Validation: {_range(val_dates)}",
+        f"- Test: {_range(test_dates)}",
+        "",
+        "## 2. PPO Training",
+        "",
+        f"- Iterations: {iterations} ({total_timesteps} timesteps)",
+        f"- Training throughput: {steps_per_sec:.0f} env steps/sec (rollout + update)",
+        "",
+        "Hyperparameters:",
+        "",
+        hp_lines,
+        "",
+        f"Selected checkpoint: **iteration {best_iteration}** ({best_selection}).",
+        "",
+    ]
+    if eval_history:
+        sections += ["Validation during training:", "", format_eval_history(eval_history), ""]
 
----
+    if val_results is not None:
+        sections += [
+            "## 3. Validation Results (best model)",
+            "",
+            format_metrics_table(val_results),
+            "",
+        ]
+        val_notes = build_auto_notes(
+            val_results, warmup_seconds=warmup_seconds, window_seconds=window_seconds
+        )
+        sections += [f"- {n}" for n in val_notes] + [""] if val_notes else []
 
-## 1. Executive Summary
+    sections += [
+        "## 4. Out-of-Sample Test Results (best model)",
+        "",
+        format_metrics_table(test_results),
+        "",
+        "Trades (Exec/Closed): fill events / closed round trips.",
+        "",
+    ]
+    test_notes = build_auto_notes(
+        test_results, warmup_seconds=warmup_seconds, window_seconds=window_seconds
+    )
+    if test_notes:
+        sections += ["Notes:", ""] + [f"- {n}" for n in test_notes] + [""]
 
-This report evaluates a **Proximal Policy Optimization (PPO)** reinforcement learning agent trained on intraday tick data for symbol `{stem}`.
-The agent operates strictly within the **opening 15-minute window** ($T_{{\\text{{open}}}} \\to T_{{\\text{{open}}}} + 15\\text{{m}}$) to exploit opening microstructure patterns, momentum, and mean-reversion.
+    sections += [
+        "## 5. Reproduce",
+        "",
+        "```bash",
+        reproduce_cmd,
+        "```",
+        "",
+    ]
+    return "\n".join(sections)
 
-### Key Performance Highlights (Out-of-Sample Test Set)
-- **PPO Agent Total PnL:** `{ppo_pnl}`
-- **Buy-and-Hold Benchmark:** `{bh_pnl}`
-- **Random Baseline:** `{rnd_pnl}`
 
----
+def write_training_log_csv(path: Path, logs: list[dict[str, float]]) -> None:
+    """Write per-iteration training metrics as CSV."""
+    columns = [
+        "iteration",
+        "total_timesteps",
+        "mean_ep_return",
+        "episodes_completed",
+        "running_ep_return",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "approx_kl",
+        "learning_rate",
+        "val_pnl",
+        "val_trades",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        int_cols = {"iteration", "total_timesteps", "episodes_completed", "val_trades"}
+        for row in logs:
+            writer.writerow(
+                {
+                    c: (int(row[c]) if c in int_cols and c in row else row.get(c, ""))
+                    for c in columns
+                }
+            )
 
-## 2. Experimental Setup
 
-### 2.1 Dataset & Chronological Partition
-To prevent lookahead bias, sessions were partitioned chronologically:
-- **Training Set:** {len(train_dates)} sessions (`{train_dates[0]}` to `{train_dates[-1]}`)
-- **Validation Set:** {len(val_dates)} sessions {f"(`{val_dates[0]}` to `{val_dates[-1]}`)" if val_dates else "(None)"}
-- **Out-of-Sample Test Set:** {len(test_dates)} sessions (`{test_dates[0]}` to `{test_dates[-1]}`)
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate the opening-window RL Trading Agent."
+    )
+    parser.add_argument("--stem", type=str, default="7203", help="Stock symbol stem (default: 7203).")
+    parser.add_argument("--db-path", type=str, default=None, help="Path to DuckDB database file.")
+    parser.add_argument("--max-train-sessions", type=int, default=100)
+    parser.add_argument("--max-val-sessions", type=int, default=15)
+    parser.add_argument("--max-test-sessions", type=int, default=20)
+    parser.add_argument("--train-ratio", type=float, default=0.70)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--window-seconds", type=float, default=600.0,
+        help="Trading window after T_open in seconds (default: 600).",
+    )
+    parser.add_argument(
+        "--warmup-seconds", type=float, default=15.0,
+        help="No orders during the first N seconds after T_open (default: 15).",
+    )
+    parser.add_argument(
+        "--slippage", type=float, default=0.5,
+        help="Per-fill slippage in yen (default: 0.5).",
+    )
+    parser.add_argument(
+        "--total-timesteps", type=int, default=1_000_000,
+        help="Total environment steps; iterations = ceil(total / rollout-steps).",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=None,
+        help="Override: number of PPO iterations (ignores --total-timesteps).",
+    )
+    parser.add_argument("--rollout-steps", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--eval-every", type=int, default=10,
+        help="Iterations between validation evaluations (default: 10).",
+    )
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--anneal-lr", action="store_true", help="Linear LR decay to 0.")
+    parser.add_argument("--start-date", type=str, default=None)
+    parser.add_argument("--end-date", type=str, default=None)
+    parser.add_argument(
+        "--output-report", type=str, default=None,
+        help="Output markdown report (default: .agents/docs/research/rl-{stem}-opening10m-results.md).",
+    )
+    parser.add_argument(
+        "--model-path", type=str, default=None,
+        help="Checkpoint destination (default: models/ppo_{stem}_opening10m.pt).",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cpu")
+    return parser
 
-### 2.2 Environment & Action Space
-- **State Space (17 dimensions):**
-  - Base features (5): Price return from open, normalized time progress $\\tau \\in [0, 1]$, net position $\\in \\{{-1, 0, +1\\}}$, unrealized PnL return, time held.
-  - Microstructure features (12): Multi-window returns ($10s, 30s, 60s, 180s, 300s$), trade flow imbalance, cumulative volume ratio, rolling realized volatility, price acceleration, time since last trade.
-- **Action Space:** Discrete(3) — `0: HOLD`, `1: BUY`, `2: SELL`.
-- **Slippage Model:** `{slippage}` JPY per share execution penalty.
-- **Mandatory Square-Off:** Position forced to Flat at the final tick of $T_{{\\text{{open}}}} + 15\\text{{m}}$.
 
-### 2.3 PPO Hyperparameters
-- **Iterations:** `{iterations}`
-- **Learning Rate:** `{learning_rate}`
-- **Rollout Capacity:** `{PPOConfig().rollout_steps}` steps per iteration
-- **Batch Size:** `{PPOConfig().batch_size}`
-- **Final Policy Loss:** `{final_policy_loss:.6f}`
-- **Final Value Loss:** `{final_value_loss:.6f}`
-
----
-
-## 3. Out-of-Sample Benchmark Results
-
-The following table summarizes performance across all {len(test_dates)} out-of-sample test sessions:
-
-{table}
-
-*Note: Trades (Exec/Closed) reflects total fill events vs completed round-trip trades.*
-
----
-
-## 4. In-Depth Analysis & Observations
-
-1. **Risk Management & Capital Preservation:**
-   - The trained PPO policy exhibits selective market timing compared to continuous market exposure in Buy-and-Hold.
-   - Max drawdown is controlled due to the 15-minute terminal liquidation constraint and learned exit timings.
-
-2. **Market Microstructure Utilization:**
-   - Multi-scale velocity and trade imbalance features provide signals for predicting intraday mean-reversion and short-term trends during the volatile opening phase.
-
-3. **Comparison with Baselines:**
-   - The random policy incurs severe transaction costs and negative drift, illustrating that naive trading is heavily penalized by market friction.
-   - The PPO agent maintains discipline, avoiding excessive churn while capturing directional movements.
-
----
-
-## 5. Artifacts and Reproducibility
-
-- Model weights: `{model_save_path}`
-- Reproduce this experiment:
-  ```bash
-  uv run python scripts/train_and_eval_rl.py --stem {stem} --max-train-sessions {len(train_dates)} --max-test-sessions {len(test_dates)} --iterations {iterations} --slippage {slippage}
-  ```
-"""
-    return report
+def build_reproduce_command(args: argparse.Namespace) -> str:
+    parts = [
+        "uv run python scripts/train_and_eval_rl.py",
+        f"--stem {args.stem}",
+        f"--max-train-sessions {args.max_train_sessions}",
+        f"--max-val-sessions {args.max_val_sessions}",
+        f"--max-test-sessions {args.max_test_sessions}",
+        f"--window-seconds {args.window_seconds:g}",
+        f"--warmup-seconds {args.warmup_seconds:g}",
+        f"--slippage {args.slippage:g}",
+        f"--rollout-steps {args.rollout_steps}",
+        f"--batch-size {args.batch_size}",
+        f"--eval-every {args.eval_every}",
+        f"--learning-rate {args.learning_rate:g}",
+    ]
+    if args.anneal_lr:
+        parts.append("--anneal-lr")
+    if args.iterations is not None:
+        parts.append(f"--iterations {args.iterations}")
+    else:
+        parts.append(f"--total-timesteps {args.total_timesteps}")
+    if args.start_date:
+        parts.append(f"--start-date {args.start_date}")
+    if args.end_date:
+        parts.append(f"--end-date {args.end_date}")
+    parts.append(f"--seed {args.seed}")
+    return " ".join(parts)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Train and evaluate Opening 15-Minute RL Trading Agent."
-    )
-    parser.add_argument(
-        "--stem",
-        type=str,
-        default="7203",
-        help="Stock symbol stem (default: 7203).",
-    )
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default=None,
-        help="Path to DuckDB database file.",
-    )
-    parser.add_argument(
-        "--max-train-sessions",
-        type=int,
-        default=30,
-        help="Maximum number of training sessions to use (default: 30).",
-    )
-    parser.add_argument(
-        "--max-test-sessions",
-        type=int,
-        default=15,
-        help="Maximum number of test sessions to evaluate (default: 15).",
-    )
-    parser.add_argument(
-        "--max-val-sessions",
-        type=int,
-        default=0,
-        help="Maximum validation sessions (default: 0).",
-    )
-    parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.70,
-        help="Train split ratio if max sessions not specified (default: 0.70).",
-    )
-    parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.15,
-        help="Validation split ratio if max sessions not specified (default: 0.15).",
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=5,
-        help="Number of PPO training iterations (default: 5).",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=3e-4,
-        help="Learning rate for Adam optimizer (default: 3e-4).",
-    )
-    parser.add_argument(
-        "--slippage",
-        type=float,
-        default=0.0,
-        help="Per-trade slippage in yen (default: 0.0).",
-    )
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default=None,
-        help="Earliest session date (YYYY-MM-DD).",
-    )
-    parser.add_argument(
-        "--end-date",
-        type=str,
-        default=None,
-        help="Latest session date (YYYY-MM-DD).",
-    )
-    parser.add_argument(
-        "--output-report",
-        type=str,
-        default=".agents/docs/research/rl-toyota-7203-results.md",
-        help="Output markdown report file path.",
-    )
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default="models/ppo_7203_opening15m.pt",
-        help="Destination path for saved model weights.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Computation device (cpu or cuda).",
-    )
-
+    parser = build_arg_parser()
     args = parser.parse_args()
+
+    stem_lower = args.stem.lower()
+    model_path_str = args.model_path or f"models/ppo_{stem_lower}_opening10m.pt"
+    report_path_str = (
+        args.output_report
+        or f".agents/docs/research/rl-{stem_lower}-opening10m-results.md"
+    )
 
     # Set seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    window_us = int(round(args.window_seconds * 1_000_000))
+    warmup_us = int(round(args.warmup_seconds * 1_000_000))
 
     # 1. Resolve DuckDB Path
     if args.db_path:
@@ -480,7 +592,7 @@ def main() -> int:
         print(f"Error: Database file not found at {db_path}", file=sys.stderr)
         return 1
 
-    print("=== Opening 15-Minute RL Trading Agent Benchmark ===")
+    print(f"=== Opening {args.window_seconds:g}s RL Trading Agent Benchmark ===")
     print(f"Symbol Stem: {args.stem}")
     print(f"Database: {db_path}")
 
@@ -517,96 +629,193 @@ def main() -> int:
         print(f"  Val:   {len(val_dates)} sessions ({val_dates[0]} -> {val_dates[-1]})")
     print(f"  Test:  {len(test_dates)} sessions ({test_dates[0]} -> {test_dates[-1]})")
 
-    # 4. Load tick sessions
+    # 4. Load tick sessions (dropping sessions with nothing tradable)
+    load_kwargs: dict[str, Any] = {"window_us": window_us, "warmup_us": warmup_us}
     train_sessions = load_sessions_batch(
-        db_path, args.stem, train_dates, label="train sessions"
+        db_path, args.stem, train_dates, label="train sessions", **load_kwargs
+    )
+    val_sessions = (
+        load_sessions_batch(db_path, args.stem, val_dates, label="val sessions", **load_kwargs)
+        if val_dates
+        else []
     )
     test_sessions = load_sessions_batch(
-        db_path, args.stem, test_dates, label="test sessions"
+        db_path, args.stem, test_dates, label="test sessions", **load_kwargs
     )
 
     if not train_sessions or not test_sessions:
         print("Error: Failed to load required sessions.", file=sys.stderr)
         return 1
+    # Report the dates actually used (after dropping unloadable/untradable sessions)
+    train_dates = [s.date for s in train_sessions]
+    val_dates = [s.date for s in val_sessions]
+    test_dates = [s.date for s in test_sessions]
 
-    # 5. Initialize Environments
+    # 5. Initialize Environments (all share window / warmup / slippage)
     print("\nInitializing Gym environments with auto_features=True...")
-    train_env = TickTradingEnv(
-        train_sessions,
-        slippage=args.slippage,
-        auto_features=True,
-    )
-    test_env = TickTradingEnv(
-        test_sessions,
-        slippage=args.slippage,
-        auto_features=True,
-    )
+    env_kwargs: dict[str, Any] = {
+        "slippage": args.slippage,
+        "opening_warmup_seconds": args.warmup_seconds,
+        "window_seconds": args.window_seconds,
+        "auto_features": True,
+    }
+    train_env = TickTradingEnv(train_sessions, **env_kwargs)
+    val_env = TickTradingEnv(val_sessions, **env_kwargs) if val_sessions else None
+    test_env = TickTradingEnv(test_sessions, **env_kwargs)
 
-    # 6. Initialize PPO Trainer
+    obs_dim = int(train_env.observation_space.shape[0])
+    feature_names = get_feature_names(train_env.feature_config)
+
+    # 6. Policy with observation normalizer fitted on the training env
+    policy = ActorCritic(obs_dim=obs_dim, action_dim=int(train_env.action_space.n))
+    obs_mean, obs_std = fit_obs_normalizer(train_env)
+    policy.set_obs_normalizer(obs_mean, obs_std)
+
     ppo_cfg = PPOConfig(
         learning_rate=args.learning_rate,
-        rollout_steps=1024,
-        batch_size=64,
+        rollout_steps=args.rollout_steps,
+        batch_size=args.batch_size,
         update_epochs=4,
+        anneal_lr=args.anneal_lr,
     )
     trainer = PPOTrainer(
         env=train_env,
+        policy=policy,
         config=ppo_cfg,
         device=args.device,
-    )
-
-    # 7. Training loop
-    print(f"\nTraining PPO Agent for {args.iterations} iterations...")
-    training_logs: list[dict[str, float]] = []
-    for it in range(1, args.iterations + 1):
-        metrics = trainer.train_iteration()
-        training_logs.append(metrics)
-        print(
-            f"  Iter {it:02d}/{args.iterations:02d} | "
-            f"Mean Ep Return: {metrics.get('mean_ep_return', 0.0):+.4f} | "
-            f"Policy Loss: {metrics.get('policy_loss', 0.0):.4f} | "
-            f"Value Loss: {metrics.get('value_loss', 0.0):.4f} | "
-            f"KL: {metrics.get('approx_kl', 0.0):.4f}"
-        )
-
-    # 8. Save model weights
-    model_save_path = Path(args.model_path)
-    model_save_path.parent.mkdir(parents=True, exist_ok=True)
-    trainer.save(model_save_path)
-    print(f"\nSaved trained model weights to: {model_save_path}")
-
-    # 9. Out-of-sample benchmark evaluation
-    print(f"\nRunning Out-of-Sample Benchmark on {len(test_sessions)} test sessions...")
-    benchmark_results = run_benchmarks(
-        policy=trainer.policy,
-        test_env=test_env,
-        test_sessions=test_sessions,
         seed=args.seed,
     )
 
-    # 10. Display metrics table
+    if args.iterations is not None:
+        iterations = max(1, int(args.iterations))
+    else:
+        iterations = max(1, math.ceil(args.total_timesteps / args.rollout_steps))
+    total_timesteps = iterations * args.rollout_steps
+    eval_every = max(1, int(args.eval_every))
+
+    env_config: dict[str, Any] = {
+        "window_seconds": float(args.window_seconds),
+        "opening_warmup_seconds": float(args.warmup_seconds),
+        "slippage": float(args.slippage),
+        "feature_names": feature_names,
+        "obs_dim": obs_dim,
+        "stem": args.stem,
+        "seed": args.seed,
+    }
+
+    # 7. Training loop with periodic validation-based model selection
+    print(f"\nTraining PPO Agent for {iterations} iterations ({total_timesteps} steps)...")
+    training_logs: list[dict[str, float]] = []
+    eval_history: list[dict[str, float]] = []
+    best_state: dict[str, torch.Tensor] | None = None
+    best_iter = 0
+    best_pnl: float | None = None
+    best_trades: int | None = None
+    train_seconds = 0.0
+
+    for it in range(1, iterations + 1):
+        t0 = time.perf_counter()
+        metrics = trainer.train_iteration(progress=(it - 1) / iterations)
+        train_seconds += time.perf_counter() - t0
+        metrics["iteration"] = float(it)
+        training_logs.append(metrics)
+
+        if it % eval_every == 0 or it == iterations:
+            line = (
+                f"  Iter {it:03d}/{iterations:03d} | steps {int(metrics['total_timesteps'])} | "
+            )
+            if val_env is not None:
+                val_res = evaluate_policy(trainer.policy, val_env, deterministic=True)
+                metrics["val_pnl"] = val_res.total_pnl
+                metrics["val_trades"] = float(val_res.trade_count)
+                eval_history.append(metrics)
+                line += f"val pnl {val_res.total_pnl:+.2f} | val trades {val_res.trade_count} | "
+                if is_better_validation(
+                    val_res.total_pnl, val_res.trade_count, best_pnl, best_trades
+                ):
+                    best_pnl = val_res.total_pnl
+                    best_trades = val_res.trade_count
+                    best_iter = it
+                    best_state = {
+                        k: v.detach().clone()
+                        for k, v in trainer.policy.state_dict().items()
+                    }
+            line += (
+                f"mean_ep_return {metrics['mean_ep_return']:+.4f} | "
+                f"entropy {metrics['entropy']:.4f} | kl {metrics['approx_kl']:.5f}"
+            )
+            print(line, flush=True)
+
+    steps_per_sec = total_timesteps / max(train_seconds, 1e-9)
+    print(f"\nTraining throughput: {steps_per_sec:.0f} env steps/sec")
+
+    # 8. Select best model (validation) and save it
+    if best_state is not None:
+        trainer.policy.load_state_dict(best_state)
+        best_selection = (
+            f"best validation total PnL {best_pnl:+.2f} JPY with {best_trades} trades; "
+            "ties broken by fewer trades"
+        )
+    else:
+        best_iter = iterations
+        best_selection = "no validation sessions; final iteration used"
+    print(f"Selected iteration {best_iter}: {best_selection}")
+
+    env_config["best_iteration"] = best_iter
+    model_save_path = Path(model_path_str)
+    model_save_path.parent.mkdir(parents=True, exist_ok=True)
+    trainer.save(model_save_path, metadata=env_config)
+    print(f"Saved selected model to: {model_save_path}")
+
+    # 9. Benchmarks (validation + out-of-sample test) with the selected model
+    val_results = None
+    if val_env is not None:
+        print(f"\nRunning validation benchmark on {len(val_sessions)} sessions...")
+        val_results = run_benchmarks(
+            policy=trainer.policy, test_env=val_env, seed=args.seed
+        )
+    print(f"\nRunning Out-of-Sample Benchmark on {len(test_sessions)} test sessions...")
+    test_results = run_benchmarks(policy=trainer.policy, test_env=test_env, seed=args.seed)
+
+    if val_results is not None:
+        print("\n=== Validation Results ===")
+        print(format_metrics_table(val_results))
     print("\n=== Out-of-Sample Benchmark Results ===")
-    print(format_metrics_table(benchmark_results))
+    print(format_metrics_table(test_results))
     print()
 
-    # 11. Write markdown report
+    # 10. Report + training log CSV
+    report_path = Path(report_path_str)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_content = generate_markdown_report(
         stem=args.stem,
         db_path=db_path,
         train_dates=train_dates,
         val_dates=val_dates,
         test_dates=test_dates,
-        results=benchmark_results,
-        iterations=args.iterations,
-        learning_rate=args.learning_rate,
+        val_results=val_results,
+        test_results=test_results,
+        iterations=iterations,
+        total_timesteps=total_timesteps,
+        ppo_config=ppo_cfg,
+        window_seconds=args.window_seconds,
+        warmup_seconds=args.warmup_seconds,
         slippage=args.slippage,
+        feature_names=feature_names,
+        obs_dim=obs_dim,
         model_save_path=model_save_path,
-        training_logs=training_logs,
+        best_iteration=best_iter,
+        best_selection=best_selection,
+        eval_history=eval_history,
+        steps_per_sec=steps_per_sec,
+        seed=args.seed,
+        reproduce_cmd=build_reproduce_command(args),
     )
-    report_path = Path(args.output_report)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_content, encoding="utf-8")
+    csv_path = report_path.with_name(report_path.stem + "-training-log.csv")
+    write_training_log_csv(csv_path, training_logs)
     print(f"Generated research report: {report_path}")
+    print(f"Saved training log: {csv_path}")
 
     return 0
 

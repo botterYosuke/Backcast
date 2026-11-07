@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>歩み値リプレイ</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23faf8f4'/%3E%3Crect x='5' y='2' width='1' height='12' fill='%23c0392b'/%3E%3Crect x='3' y='4' width='5' height='7' fill='%23c0392b'/%3E%3Crect x='11' y='3' width='1' height='11' fill='%231d5fa8'/%3E%3Crect x='9' y='6' width='5' height='6' fill='%231d5fa8'/%3E%3C/svg%3E" />
-<link rel="stylesheet" href="/static/styles.css" />
+<link rel="stylesheet" href="/static/styles.css?v=3" />
 <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
@@ -29,6 +29,10 @@
     </div>
 
     <button id="load-button" class="primary" type="button">読み込む</button>
+    <button id="ai-replay-btn" class="ai-replay-btn" type="button" title="学習済みAIによる寄り付き後の自動売買の再生（売買窓はモデル設定に従う）">🤖 AI Play: OFF</button>
+    <select id="ai-model-select" class="ai-model-select" title="再生するAIモデル（自動 = サーバ既定）" hidden>
+      <option value="">自動（既定）</option>
+    </select>
   </div>
 
   <div class="position-panel">
@@ -47,6 +51,30 @@
     <div class="pos-item pos-total-item">
       <span class="pos-label">合計損益</span>
       <span id="pos-total" class="pos-value">—</span>
+    </div>
+  </div>
+
+  <div id="ai-panel" class="position-panel ai-panel" style="display: none;">
+    <div class="pos-item ai-badge-item">
+      <span class="pos-label">🤖 モデル</span>
+      <span id="ai-badge" class="pos-value ai-badge">—</span>
+      <span id="ai-warning" class="ai-warning" hidden></span>
+    </div>
+    <div class="pos-item">
+      <span class="pos-label">🤖 AI建玉</span>
+      <span id="ai-pos-qty" class="pos-value">—</span>
+    </div>
+    <div class="pos-item">
+      <span class="pos-label">AI平均単価</span>
+      <span id="ai-pos-avg" class="pos-value">—</span>
+    </div>
+    <div class="pos-item">
+      <span class="pos-label">AI評価損益</span>
+      <span id="ai-pos-pnl" class="pos-value">—</span>
+    </div>
+    <div class="pos-item pos-total-item">
+      <span class="pos-label">AI合計損益</span>
+      <span id="ai-pos-total" class="pos-value">—</span>
     </div>
   </div>
 </header>
@@ -187,6 +215,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/app.js"></script>
+<script type="module" src="/static/app.js?v=4"></script>
 </body>
 </html>

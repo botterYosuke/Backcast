@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions.categorical import Categorical
 
-from .env import TickTradingEnv
-from .policy import ActorCritic
+from .env import BASE_OBS_DIM, TickTradingEnv
+from .policy import ActorCritic, state_dict_with_default_buffers
 
 
 @dataclass
@@ -28,6 +30,31 @@ class PPOConfig:
     update_epochs: int = 4
     batch_size: int = 64
     rollout_steps: int = 1024
+    anneal_lr: bool = False
+
+
+def fit_obs_normalizer(env: TickTradingEnv) -> tuple[np.ndarray, np.ndarray]:
+    """Fit (mean, std) observation statistics from flat-position observations.
+
+    Uses every tradable step (tick at/after the warmup) of all env sessions.
+    Base dims tau (1), position (2) and time_held (4) stay at mean 0 / std 1;
+    unrealized_return (3) gets mean 0 and the std of price_return (0); price_return
+    and the extra feature dims are z-scored. Any std < 1e-8 becomes 1.
+    """
+    chunks = [env.flat_observations(i) for i in range(env.num_sessions)]
+    obs = np.concatenate(chunks, axis=0).astype(np.float64)
+    if obs.shape[1] < BASE_OBS_DIM:
+        raise ValueError("observation smaller than base layout")
+    mean = obs.mean(axis=0)
+    std = obs.std(axis=0)
+
+    for dim in (1, 2, 4):  # tau, position, time_held
+        mean[dim] = 0.0
+        std[dim] = 1.0
+    mean[3] = 0.0
+    std[3] = std[0]
+    std = np.where(std < 1e-8, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 class RolloutBuffer:
@@ -45,6 +72,9 @@ class RolloutBuffer:
         self.rewards = np.zeros(self.capacity, dtype=np.float32)
         self.values = np.zeros(self.capacity, dtype=np.float32)
         self.dones = np.zeros(self.capacity, dtype=np.float32)
+        # Optional (capacity, action_dim) bool legal-action masks, set by trainers
+        # that collect them; None = unmasked (the default / legacy path).
+        self.masks: np.ndarray | None = None
         self.ptr = 0
 
     def add(
@@ -80,18 +110,29 @@ class PPOTrainer:
         policy: ActorCritic | None = None,
         config: PPOConfig | None = None,
         device: str | torch.device = "cpu",
+        seed: int | None = None,
     ) -> None:
         self.env = env
         self.config = config or PPOConfig()
         self.device = torch.device(device)
+        self.seed = seed
+        self._rng = np.random.default_rng(seed)
+        # Private generator for action sampling: two trainers with the same seed
+        # stay reproducible even if their runs interleave in one process.
+        self._torch_gen = torch.Generator()
+        if seed is not None:
+            self._torch_gen.manual_seed(seed)
 
         obs_dim = int(env.observation_space.shape[0])
         action_dim = int(env.action_space.n)
 
         if policy is None:
-            self.policy = ActorCritic(obs_dim=obs_dim, action_dim=action_dim).to(
-                self.device
-            )
+            with torch.random.fork_rng(devices=[]):
+                if seed is not None:
+                    torch.manual_seed(seed)
+                self.policy = ActorCritic(obs_dim=obs_dim, action_dim=action_dim).to(
+                    self.device
+                )
         else:
             self.policy = policy.to(self.device)
 
@@ -103,6 +144,15 @@ class PPOTrainer:
         self.last_obs: np.ndarray | None = None
         self.last_done: bool = True
         self.total_timesteps: int = 0
+        self._running_ep_return: float = 0.0
+        self._first_reset_done: bool = False
+
+    def _reset_env(self) -> np.ndarray:
+        """Reset the env; the very first reset is seeded for reproducible sampling."""
+        seed = None if self._first_reset_done else self.seed
+        self._first_reset_done = True
+        obs, _ = self.env.reset(seed=seed)
+        return obs
 
     def collect_rollouts(self) -> dict[str, float]:
         """Collect self.config.rollout_steps of interaction with the environment."""
@@ -110,12 +160,11 @@ class PPOTrainer:
         self.buffer.reset()
 
         ep_returns: list[float] = []
-        current_ep_return = 0.0
 
-        if self.last_obs is None or self.last_done:
-            obs, _ = self.env.reset()
-            self.last_obs = obs
+        if self.last_obs is None:
+            self.last_obs = self._reset_env()
             self.last_done = False
+            self._running_ep_return = 0.0
 
         for _ in range(self.config.rollout_steps):
             obs_tensor = (
@@ -125,7 +174,12 @@ class PPOTrainer:
             )
 
             with torch.no_grad():
-                action, logprob, _, value = self.policy.get_action_and_value(obs_tensor)
+                logits, value = self.policy(obs_tensor)
+                dist = Categorical(logits=logits)
+                action = torch.multinomial(
+                    dist.probs, 1, generator=self._torch_gen
+                ).squeeze(-1)
+                logprob = dist.log_prob(action)
 
             act_int = int(action.cpu().item())
             logprob_float = float(logprob.cpu().item())
@@ -143,23 +197,25 @@ class PPOTrainer:
                 done=done,
             )
 
-            current_ep_return += float(reward)
+            # The running episode return persists across rollout boundaries.
+            self._running_ep_return += float(reward)
             self.total_timesteps += 1
 
             if done:
-                ep_returns.append(current_ep_return)
-                current_ep_return = 0.0
-                obs, _ = self.env.reset()
-                self.last_obs = obs
+                ep_returns.append(self._running_ep_return)
+                self._running_ep_return = 0.0
+                self.last_obs = self._reset_env()
                 self.last_done = True
             else:
                 self.last_obs = next_obs
                 self.last_done = False
 
-        mean_ep_return = float(np.mean(ep_returns)) if ep_returns else 0.0
+        # NaN (not 0.0) when no episode finished inside this rollout.
+        mean_ep_return = float(np.mean(ep_returns)) if ep_returns else float("nan")
         return {
             "mean_ep_return": mean_ep_return,
-            "episodes_completed": len(ep_returns),
+            "episodes_completed": float(len(ep_returns)),
+            "running_ep_return": float(self._running_ep_return),
         }
 
     def compute_gae(
@@ -167,7 +223,11 @@ class PPOTrainer:
         next_obs: np.ndarray,
         next_done: bool,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute Generalized Advantage Estimation (GAE)."""
+        """Compute Generalized Advantage Estimation (GAE).
+
+        ``buffer.dones[t]`` is True when the transition taken at step ``t`` ended the
+        episode, so the bootstrap term of step ``t`` is masked by ``dones[t]``.
+        """
         n = self.buffer.capacity
         obs_tensor = (
             torch.as_tensor(next_obs, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -183,7 +243,7 @@ class PPOTrainer:
                 next_non_terminal = 1.0 - float(next_done)
                 next_val = next_value
             else:
-                next_non_terminal = 1.0 - self.buffer.dones[t + 1]
+                next_non_terminal = 1.0 - float(self.buffer.dones[t])
                 next_val = self.buffer.values[t + 1]
 
             delta = (
@@ -218,6 +278,11 @@ class PPOTrainer:
         )
         b_advantages = torch.as_tensor(norm_adv, dtype=torch.float32).to(self.device)
         b_returns = torch.as_tensor(returns, dtype=torch.float32).to(self.device)
+        b_masks = (
+            None
+            if self.buffer.masks is None
+            else torch.as_tensor(self.buffer.masks, dtype=torch.bool).to(self.device)
+        )
 
         n = len(self.buffer.obs)
         indices = np.arange(n)
@@ -228,7 +293,7 @@ class PPOTrainer:
         approx_kls: list[float] = []
 
         for _ in range(self.config.update_epochs):
-            np.random.shuffle(indices)
+            self._rng.shuffle(indices)
             for start in range(0, n, self.config.batch_size):
                 end = start + self.config.batch_size
                 batch_idx = indices[start:end]
@@ -239,8 +304,10 @@ class PPOTrainer:
                 mb_advantages = b_advantages[batch_idx]
                 mb_returns = b_returns[batch_idx]
 
+                # Stored masks keep the ratio consistent with the sampling policy.
+                mask_kw = {} if b_masks is None else {"mask": b_masks[batch_idx]}
                 _, newlogprob, entropy, newvalue = self.policy.get_action_and_value(
-                    mb_obs, mb_actions
+                    mb_obs, mb_actions, **mask_kw
                 )
 
                 logratio = newlogprob - mb_logprobs
@@ -293,8 +360,19 @@ class PPOTrainer:
             "approx_kl": float(np.mean(approx_kls)),
         }
 
-    def train_iteration(self) -> dict[str, float]:
-        """Perform a single PPO iteration (rollout + GAE + optimization)."""
+    def train_iteration(self, progress: float | None = None) -> dict[str, float]:
+        """Perform a single PPO iteration (rollout + GAE + optimization).
+
+        Args:
+            progress: Training progress in [0, 1]. With ``config.anneal_lr`` the
+                learning rate decays linearly: ``lr * (1 - progress)``.
+        """
+        if self.config.anneal_lr and progress is not None:
+            frac = min(1.0, max(0.0, float(progress)))
+            lr_now = self.config.learning_rate * (1.0 - frac)
+            for group in self.optimizer.param_groups:
+                group["lr"] = lr_now
+
         rollout_info = self.collect_rollouts()
 
         assert self.last_obs is not None
@@ -305,19 +383,27 @@ class PPOTrainer:
             **rollout_info,
             **update_info,
             "total_timesteps": float(self.total_timesteps),
+            "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
         }
         return metrics
 
     def train(self, total_timesteps: int) -> list[dict[str, float]]:
         """Run training until total_timesteps is reached."""
         logs: list[dict[str, float]] = []
+        start = self.total_timesteps
+        span = max(1, total_timesteps - start)
         while self.total_timesteps < total_timesteps:
-            info = self.train_iteration()
-            logs.append(info)
+            progress = (self.total_timesteps - start) / span
+            logs.append(self.train_iteration(progress=progress))
         return logs
 
-    def save(self, path: str | Path) -> None:
-        """Save policy and optimizer state dicts along with config."""
+    def save(self, path: str | Path, metadata: dict[str, Any] | None = None) -> None:
+        """Save policy and optimizer state dicts along with config.
+
+        ``metadata`` (window_seconds, opening_warmup_seconds, slippage,
+        feature_names, ...) is stored under ``"env_config"`` so replay can rebuild
+        the exact environment the policy was trained on.
+        """
         save_path = Path(path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -326,6 +412,8 @@ class PPOTrainer:
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "obs_dim": self.policy.obs_dim,
                 "action_dim": self.policy.action_dim,
+                "hidden_dim": self.policy.hidden_dim,
+                "env_config": dict(metadata) if metadata is not None else None,
                 "config": self.config,
                 "total_timesteps": self.total_timesteps,
             },
@@ -333,9 +421,13 @@ class PPOTrainer:
         )
 
     def load(self, path: str | Path) -> None:
-        """Load weights from saved checkpoint."""
+        """Load weights from saved checkpoint (old checkpoints without obs buffers ok)."""
         checkpoint = torch.load(str(path), map_location=self.device, weights_only=False)
-        self.policy.load_state_dict(checkpoint["policy_state_dict"])
+        self.policy.load_state_dict(
+            state_dict_with_default_buffers(
+                self.policy, checkpoint["policy_state_dict"]
+            )
+        )
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "total_timesteps" in checkpoint:

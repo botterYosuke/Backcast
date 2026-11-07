@@ -1,0 +1,2 @@
+steps,wall_s,train_ep_ticks,train_ep_yen,train_shaped_ticks,entropy,ent_coef,p_tt,val_yen,val_ticks,val_trips,val_orders,val_invalid
+106496,13.489704608917236,-119.89999999999995,-42910.84269662921,-119.89999999999995,0.7527361754328012,0.02,nan,0.0,0.0,0.0,0.0,0.0

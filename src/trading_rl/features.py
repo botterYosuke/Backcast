@@ -1,4 +1,4 @@
-"""Feature engineering for the post-open 15-minute window.
+"""Feature engineering for the post-open trading window.
 
 Computes strictly causal (t' <= t) microstructure features from OpeningSessionData
 or raw tick arrays with zero lookahead bias.
@@ -15,7 +15,8 @@ import numpy as np
 if TYPE_CHECKING:
     from .data import OpeningSessionData
 
-OPENING_WINDOW_US: int = 900_000_000  # 15 minutes in microseconds
+OPENING_WINDOW_US: int = 900_000_000  # default 15 minutes in microseconds
+OPENING_DELAY_NORM_SECONDS: float = 900.0  # opening-delay normalization (fixed)
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,11 @@ class FeatureConfig:
     volume_window: int = 20
     include_cumulative: bool = True
     epsilon: float = 1e-5
+    window_seconds: float = 900.0
+
+    @property
+    def window_us(self) -> int:
+        return int(round(float(self.window_seconds) * 1_000_000))
 
 
 def compute_opening_delay_seconds(
@@ -109,14 +115,16 @@ def compute_microstructure_features(
 
     features: list[np.ndarray] = []
 
-    # 1. Normalized elapsed time tau in [0, 1]
-    tau = (epoch_us.astype(np.float64) - float(t_open_val)) / float(OPENING_WINDOW_US)
+    # 1. Normalized elapsed time tau in [0, 1] over the configured window
+    tau = (epoch_us.astype(np.float64) - float(t_open_val)) / float(
+        max(1, config.window_us)
+    )
     tau = np.clip(tau, 0.0, 1.0)
     features.append(tau)
 
     # 2. Opening delay in seconds & normalized
     delay_s = compute_opening_delay_seconds(t_open_val, session_date)
-    delay_arr = np.full(n, delay_s / 900.0, dtype=np.float64)
+    delay_arr = np.full(n, delay_s / OPENING_DELAY_NORM_SECONDS, dtype=np.float64)
     features.append(delay_arr)
 
     # 3. Relative return from open: (P_t - P_open) / P_open
@@ -192,30 +200,23 @@ def compute_microstructure_features(
     vol_per_sec = roll_vol / time_elapsed_s
     features.append(np.log1p(vol_per_sec))
 
-    # 9. Trade aggressor skew (Buy ratio in window)
-    if trade_type is not None and len(trade_type) == n:
-        # Backcast standard: '1' or 1 or 'BUY' represents Buy
-        type_str = np.asarray(trade_type, dtype=object)
-        is_buy = (
-            (type_str == "1")
-            | (type_str == 1)
-            | (type_str == "BUY")
-            | (type_str == "buy")
-        )
-        buy_qty = np.where(is_buy, qty_f64, 0.0)
-        cum_buy = np.cumsum(buy_qty)
-        pad_cum_buy = np.pad(cum_buy, (w_vol, 0), mode="constant", constant_values=0.0)
-        roll_buy = cum_buy - pad_cum_buy[:n]
-        # Skew in [-1.0, 1.0]: +1 all buy, -1 all sell, 0 balanced
-        skew = np.where(
-            roll_vol > 0,
-            2.0 * (roll_buy / np.maximum(roll_vol, 1.0)) - 1.0,
-            0.0,
-        )
-        features.append(skew)
-    else:
-        # Default neutral skew
-        features.append(np.zeros(n, dtype=np.float64))
+    # 9. Tick-rule aggressor skew: sign of the price change (zero changes carry
+    # the last non-zero sign forward, first tick is 0), volume-weighted over the
+    # trailing volume_window ticks. Strictly causal. The raw ``Type`` column is the
+    # trading SESSION (1=morning, 2=afternoon), NOT the trade side, so it is unused.
+    diff = np.zeros(n, dtype=np.float64)
+    diff[1:] = np.diff(price_f64)
+    raw_sign = np.sign(diff)
+    last_nonzero_idx = np.maximum.accumulate(
+        np.where(raw_sign != 0.0, np.arange(n), 0)
+    )
+    tick_sign = raw_sign[last_nonzero_idx]
+    signed_qty = tick_sign * qty_f64
+    cum_signed = np.cumsum(signed_qty)
+    pad_cum_signed = np.pad(cum_signed, (w_vol, 0), mode="constant", constant_values=0.0)
+    roll_signed = cum_signed - pad_cum_signed[:n]
+    skew = np.where(roll_vol > 0, roll_signed / np.maximum(roll_vol, 1.0), 0.0)
+    features.append(np.clip(skew, -1.0, 1.0))
 
     # Stack into 2D array (N, K)
     matrix = np.column_stack(features).astype(np.float32)
@@ -249,7 +250,7 @@ def get_feature_names(config: FeatureConfig | None = None) -> list[str]:
             f"roll_vwap_dev_{config.vwap_window}",
             f"log_roll_vol_{config.volume_window}",
             f"log_vol_rate_{config.volume_window}",
-            "trade_aggressor_skew",
+            f"tick_rule_skew_{config.volume_window}",
         ]
     )
     return names

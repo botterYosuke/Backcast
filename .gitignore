@@ -64,3 +64,6 @@ logs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# RL dataset cache (universe + opening-window tick shards)
+.cache/

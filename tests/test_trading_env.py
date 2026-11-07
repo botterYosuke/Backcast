@@ -18,11 +18,12 @@ def make_sample_session(
     date: str = "2026-08-14",
     t_open_us: int = 1786698000000000,
     interval_s: int = 60,
+    start_offset_s: int = 20,
 ) -> OpeningSessionData:
     """Helper to synthesize a test OpeningSessionData with predictable prices."""
     n = len(prices)
     epoch_us = np.array(
-        [t_open_us + i * interval_s * 1_000_000 for i in range(n)], dtype=np.int64
+        [t_open_us + (start_offset_s + i * interval_s) * 1_000_000 for i in range(n)], dtype=np.int64
     )
     price_arr = np.array(prices, dtype=np.float64)
     qty_arr = np.ones(n, dtype=np.int64) * 100
@@ -253,3 +254,209 @@ def test_telescopic_reward_sum_equals_final_pnl():
     # Net PnL = +5 (long) - 7 (short) = -2.0
     assert info3["realized_pnl"] == pytest.approx(-2.0)
     assert total_rewards == pytest.approx(-2.0)
+
+
+def _make_warmup_session(
+    offsets_s: list[float],
+    prices: list[float],
+    *,
+    t_open_us: int = 1_700_000_000_000_000,
+) -> OpeningSessionData:
+    epoch_us = np.array(
+        [t_open_us + int(s * 1_000_000) for s in offsets_s], dtype=np.int64
+    )
+    return OpeningSessionData(
+        stem="7203",
+        code="72030",
+        date="2026-08-19",
+        t_open_us=t_open_us,
+        p_open=float(prices[0]),
+        v_open=1000,
+        epoch_us=epoch_us,
+        price=np.array(prices, dtype=np.float64),
+        qty=np.array([100] * len(prices), dtype=np.int64),
+        trade_type=np.array(["1"] * len(prices), dtype=object),
+    )
+
+
+def test_warmup_period_prohibits_orders_in_first_15_seconds():
+    """reset() starts the episode at the first tick >= T_open + 15s (no action substitution)."""
+    session = _make_warmup_session(
+        [0, 5, 14, 16, 30, 45], [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    )
+    env = TickTradingEnv(session, opening_warmup_seconds=15.0)
+    _obs, info = env.reset()
+
+    # The warmup ticks (0s, 5s, 14s) are skipped by reset itself
+    assert info["step"] == 3
+    assert info["epoch_us"] == session.t_open_us + 16_000_000
+    assert info["price"] == 103.0
+
+    # First BUY is executed immediately at the 16s tick price
+    _obs, _reward, _term, _trunc, info3 = env.step(Action.BUY)
+    assert info3["position"] == 1, "Order at 16s post-open should be executed"
+    assert info3["avg_price"] == 103.0
+    assert info3["fills"][0]["us"] == session.t_open_us + 16_000_000
+
+
+def test_warmup_in_step_masking_safety_net():
+    """Even if the cursor is forced into the warmup, in-step masking blocks orders."""
+    session = _make_warmup_session(
+        [0, 5, 14, 16, 30, 45], [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    )
+    env = TickTradingEnv(session, opening_warmup_seconds=15.0)
+    env.reset()
+    env._step_idx = 0  # force the cursor back to the opening match
+
+    # Step 0 (0s = initial opening match): Action.BUY should be masked to HOLD
+    _obs, _reward, _term, _trunc, info0 = env.step(Action.BUY)
+    assert info0["position"] == 0, "Order at opening match must be prohibited"
+    assert info0["fills"] == []
+
+    # Step 1 (5s post-open): Action.BUY should be masked to HOLD
+    _obs, _reward, _term, _trunc, info1 = env.step(Action.BUY)
+    assert info1["position"] == 0, "Order at 5s post-open must be prohibited"
+
+    # Step 2 (14s post-open): Action.BUY should be masked to HOLD
+    _obs, _reward, _term, _trunc, info2 = env.step(Action.BUY)
+    assert info2["position"] == 0, "Order at 14s post-open must be prohibited"
+
+    # Step 3 (16s post-open >= 15s): Action.BUY is permitted
+    _obs, _reward, _term, _trunc, info3 = env.step(Action.BUY)
+    assert info3["position"] == 1
+    assert info3["avg_price"] == 103.0
+
+
+def test_no_fill_can_precede_warmup_end():
+    """Random actions over many episodes never produce a fill outside [15s, window]."""
+    offsets = [0, 3, 7, 12, 14.9, 15, 15.1, 20, 40, 80, 160, 300, 500, 599, 600, 650]
+    prices = [100.0 + (i % 5) for i in range(len(offsets))]
+    session = _make_warmup_session(offsets, prices)
+    env = TickTradingEnv(
+        session, opening_warmup_seconds=15.0, window_seconds=600.0, allow_flip=True
+    )
+    rng = np.random.default_rng(0)
+    n_fills = 0
+    for _ in range(200):
+        env.reset()
+        done = False
+        while not done:
+            _o, _r, term, trunc, info = env.step(int(rng.integers(0, 3)))
+            done = term or trunc
+            for fill in info["fills"]:
+                n_fills += 1
+                assert fill["us"] >= session.t_open_us + 15_000_000
+                assert fill["us"] <= session.t_open_us + 600_000_000
+    assert n_fills > 0
+
+
+def test_reset_with_no_tradable_tick_terminates_without_trade():
+    """If every tick is inside the warmup, the episode starts at the last tick and ends flat."""
+    session = _make_warmup_session([0, 5, 10], [100.0, 101.0, 102.0])
+    env = TickTradingEnv(session, opening_warmup_seconds=15.0)
+    _obs, info = env.reset()
+    assert info["step"] == 2
+    _obs, reward, terminated, _trunc, info = env.step(Action.BUY)
+    assert terminated
+    assert reward == 0.0
+    assert info["fills"] == []
+    assert info["trades_count"] == 0
+    assert info["position"] == 0
+
+
+def test_single_tradable_tick_cannot_open_and_instantly_close():
+    """A session whose only tradable tick is the last one yields no trade."""
+    session = _make_warmup_session([0, 5, 16], [100.0, 101.0, 102.0])
+    env = TickTradingEnv(session, slippage=0.5)
+    env.reset()
+    _obs, _reward, terminated, _trunc, info = env.step(Action.BUY)
+    assert terminated
+    assert info["trades_count"] == 0
+    assert info["fills"] == []
+
+
+def test_env_truncates_session_to_window():
+    """Ticks beyond T_open + window are dropped; the last window tick force-closes."""
+    # Ticks at 20s and 80s kept, 140s+ dropped for a 100s window
+    session = make_sample_session([100.0, 101.0, 102.0, 103.0, 104.0], interval_s=60)
+    env = TickTradingEnv(session, window_seconds=100.0)
+    assert len(env.current_session.price) == 2
+    env.reset()
+    _obs, _reward, terminated, _trunc, info = env.step(Action.BUY)
+    assert terminated
+    assert info["forced_square_off"]
+    assert info["price"] == 101.0
+    assert info["realized_pnl"] == pytest.approx(1.0)
+    exit_fill = info["fills"][-1]
+    assert exit_fill["forced"] is True
+    assert exit_fill["us"] <= session.t_open_us + 100_000_000
+
+
+def test_window_boundary_tick_is_inclusive():
+    """A tick exactly at T_open + window is the (inclusive) last tick."""
+    session = _make_warmup_session([16, 100, 600, 601], [100.0, 101.0, 102.0, 103.0])
+    env = TickTradingEnv(session, window_seconds=600.0)
+    assert len(env.current_session.price) == 3
+    assert int(env.current_session.epoch_us[-1]) == session.t_open_us + 600_000_000
+
+
+def test_tau_uses_configured_window():
+    session = _make_warmup_session([20, 300, 600], [100.0, 101.0, 102.0])
+    env = TickTradingEnv(session, window_seconds=600.0)
+    obs, _ = env.reset()
+    assert obs[1] == pytest.approx(20 / 600, rel=1e-5)
+    obs, _r, _t, _tr, _i = env.step(Action.HOLD)
+    assert obs[1] == pytest.approx(0.5)
+
+
+def test_auto_features_use_env_window():
+    from trading_rl.features import FeatureConfig, extract_features
+
+    session = _make_warmup_session([20, 300, 600], [100.0, 101.0, 102.0])
+    env = TickTradingEnv(session, window_seconds=600.0, auto_features=True)
+    expected = extract_features(session, FeatureConfig(window_seconds=600.0))
+    obs, _ = env.reset()
+    np.testing.assert_allclose(obs[5:], expected[0], rtol=1e-5)
+    # tau feature (first extra feature) is relative to the 600s window
+    assert obs[5] == pytest.approx(20 / 600, rel=1e-5)
+
+
+def test_fills_info_entries_exits_and_flip():
+    """info['fills'] is the single source of truth for executions."""
+    session = make_sample_session([100.0, 105.0, 95.0, 98.0])
+    env = TickTradingEnv(session, allow_flip=True, slippage=0.5)
+    env.reset()
+
+    _o, _r, _t, _tr, info0 = env.step(Action.BUY)
+    assert [f["kind"] for f in info0["fills"]] == ["entry"]
+    assert info0["fills"][0]["side"] == "buy"
+    assert info0["fills"][0]["price"] == pytest.approx(100.5)
+    assert info0["fills"][0]["pnl"] == 0.0
+    assert info0["fills"][0]["forced"] is False
+
+    # Flip: sell long (exit) + open short (entry) in the same step
+    _o, _r, _t, _tr, info1 = env.step(Action.SELL)
+    assert [(f["kind"], f["side"]) for f in info1["fills"]] == [
+        ("exit", "sell"),
+        ("entry", "sell"),
+    ]
+    assert info1["fills"][0]["pnl"] == pytest.approx((105.0 - 0.5) - 100.5)
+    assert info1["fills"][0]["us"] == info1["fills"][1]["us"]
+
+    # Hold into the final tick: forced buy-to-cover
+    _o, _r, terminated, _tr, info2 = env.step(Action.HOLD)
+    assert terminated
+    assert info2["fills"][-1]["forced"] is True
+    assert info2["fills"][-1]["kind"] == "exit"
+    assert info2["fills"][-1]["side"] == "buy"
+    total = sum(f["pnl"] for f in info0["fills"] + info1["fills"] + info2["fills"])
+    assert total == pytest.approx(info2["realized_pnl"])
+
+
+def test_flat_observations_cover_tradable_ticks_only():
+    session = _make_warmup_session([0, 5, 16, 30], [100.0, 101.0, 102.0, 103.0])
+    env = TickTradingEnv(session, window_seconds=600.0)
+    flat = env.flat_observations(0)
+    assert flat.shape == (2, 5)
+    assert flat[0, 0] == pytest.approx(0.02)
+    assert (flat[:, 2:] == 0).all()
