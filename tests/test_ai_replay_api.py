@@ -317,3 +317,23 @@ def test_replay_model_param_selects_legacy_path(client, models_dir):
     assert data["orders"] == []
     assert [t["kind"] for t in data["trades"]] == ["entry", "exit"]
     assert "order" not in data["trades"][0]
+
+
+def test_ai_models_lists_screen_subdir_with_feature_label(client, models_dir):
+    from tickreplay import server
+
+    (models_dir / "screen").mkdir()
+    _write_scalp_checkpoint(models_dir / "screen" / "s1_base_G.pt")
+    by_file = {m["file"]: m for m in client.get("/api/ai/models").json()}
+    assert "screen/s1_base_G.pt" in by_file
+    assert by_file["screen/s1_base_G.pt"]["kind"] == "scalp"
+    assert by_file["screen/s1_base_G.pt"]["label"].startswith("ふるい分け")
+    assert server._resolve_model_checkpoint("7203", "screen/s1_base_G.pt") == (
+        Path("models") / "screen/s1_base_G.pt"
+    )
+    assert server._features_ja("base+C+G-J") == "市場全体+前日高安 / 板活動系なし"
+    assert server._features_ja("base") == "追加情報なし"
+    label = server._model_label(
+        Path("models/x.pt"), "scalp", {"order_mode": "market", "features": "base+H"}
+    )
+    assert label == "スキャルプ（成行・最初の1分）: x"

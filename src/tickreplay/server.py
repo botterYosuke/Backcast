@@ -502,10 +502,48 @@ def _resolve_model_checkpoint(
     return None
 
 
-def _model_label(path: Path, kind: str) -> str:
+_ORDER_MODE_JA = {"limit": "指値", "market": "成行", "both": "指値+成行"}
+_FEATURE_GROUP_JA = {
+    "A": "ギャップ区分",
+    "B": "ギャップ埋め",
+    "C": "市場全体",
+    "D": "業種内ギャップ",
+    "E": "前日までの傾向",
+    "F": "寄り遅れ・値幅制限",
+    "G": "前日高安",
+    "H": "最初の1分",
+    "I": "約定の重み",
+    "J": "板活動系",
+}
+
+
+def _features_ja(spec: str) -> str:
+    """``base+C+G-J`` -> ``市場全体+前日高安 / 板活動系なし`` (``base`` -> 追加なし)."""
+    import re
+
+    adds = [_FEATURE_GROUP_JA.get(g, g) for g in re.findall(r"\+([A-Z])", spec)]
+    drops = [_FEATURE_GROUP_JA.get(g, g) for g in re.findall(r"-([A-Z])", spec)]
+    text = "+".join(adds) if adds else "追加情報なし"
+    if drops:
+        text += " / " + "・".join(drops) + "なし"
+    return text
+
+
+def _model_label(path: Path, kind: str, env_config: dict | None = None) -> str:
     if kind == "scalp":
-        return f"指値スキャルプ（全銘柄・top50学習）: {path.stem}"
+        cfg = env_config or {}
+        mode = _ORDER_MODE_JA.get(str(cfg.get("order_mode", "limit")), "指値")
+        prefix = "ふるい分け" if path.parent.name == "screen" else "スキャルプ"
+        return f"{prefix}（{mode}・{_features_ja(str(cfg.get('features') or 'base'))}）: {path.stem}"
     return f"成行（銘柄別・旧）: {path.stem}"
+
+
+def _model_file_key(path: Path) -> str:
+    """Name relative to ``models/`` (``x.pt`` or ``screen/x.pt``), the ``model`` param."""
+    try:
+        return path.relative_to("models").as_posix()
+    except ValueError:
+        return path.name
 
 
 @app.get("/api/ai/models")
@@ -519,17 +557,21 @@ def read_ai_models() -> list[dict[str, object]]:
 
     default = _resolve_model_checkpoint("")
     out: list[dict[str, object]] = []
-    for path in sorted(Path("models").glob("*.pt")):
+    paths = sorted(Path("models").glob("*.pt")) + sorted(
+        Path("models/screen").glob("*.pt")
+    )
+    for path in paths:
         try:
             _policy, checkpoint = load_checkpoint_cached(path)
             kind = checkpoint_kind(checkpoint)
         except Exception:  # noqa: BLE001 - unreadable checkpoint is not selectable
             continue
+        env_config = checkpoint.get("env_config") if isinstance(checkpoint, dict) else None
         out.append(
             {
-                "file": path.name,
+                "file": _model_file_key(path),
                 "kind": kind,
-                "label": _model_label(path, kind),
+                "label": _model_label(path, kind, env_config),
                 "default": default is not None and path.name == default.name,
             }
         )
@@ -673,7 +715,7 @@ def read_ai_replay_trades(
         "t_open_us": opening_data.t_open_us,
         "trades": trades,
         "summary": summary,
-        "model": model_path.name,
+        "model": _model_file_key(model_path),
         "model_kind": kind,
         "env_config": {
             "window_s": env_config.get("window_seconds"),
