@@ -98,8 +98,14 @@ def compute_session_grid(
     is_topix100: bool,
     horizons: tuple[int, ...] = HORIZONS,
     s_grid: np.ndarray | None = None,
+    window_s: int = WINDOW_S,
 ) -> SessionGrid:
-    """Causal features at every grid second plus forward targets."""
+    """Causal features at every grid second plus forward targets.
+
+    ``window_s`` is the session length in seconds since ``T_open`` (600 for the
+    opening cache; longer for the morning-session cache).  Forward targets past
+    ``window_s`` are invalid.
+    """
     s = default_grid(horizons) if s_grid is None else np.asarray(s_grid, dtype=np.int64)
     t_rel = np.asarray(session.epoch_us, dtype=np.int64) - int(session.t_open_us)
     price = np.asarray(session.price, dtype=np.float64)
@@ -108,7 +114,8 @@ def compute_session_grid(
     if n_ticks == 0:
         raise ValueError("empty session")
 
-    secs = np.arange(0, WINDOW_S + 1, dtype=np.int64)
+    W = int(window_s)
+    secs = np.arange(0, W + 1, dtype=np.int64)
     cnt = np.searchsorted(t_rel, secs * 1_000_000, side="right").astype(np.int64)
     last = np.maximum(cnt - 1, 0)
     P = price[last]  # last trade price at each second (opening print before any trade)
@@ -189,8 +196,8 @@ def compute_session_grid(
 
     h_arr = np.asarray(horizons, dtype=np.int64)
     s_fwd = s[:, None] + h_arr[None, :]
-    valid = s_fwd <= WINDOW_S
-    fwd_price = np.where(valid, P[np.minimum(s_fwd, WINDOW_S)], np.nan)
+    valid = s_fwd <= W
+    fwd_price = np.where(valid, P[np.minimum(s_fwd, W)], np.nan)
     fwd_bps = (fwd_price / p_s[:, None] - 1.0) * 1e4
     fwd_ticks = (fwd_price - p_s[:, None]) / tk[:, None]
     fwd_sign = np.where(valid, np.sign(fwd_price - p_s[:, None]), 0).astype(np.int8)

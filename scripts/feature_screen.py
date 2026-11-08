@@ -5,7 +5,8 @@
         --tag s1 --train-steps 1500000 --order-mode market --seed 0
 
 Each arm is a feature spec (``base``; a bare group ``A`` = ``base+A``; ``-J`` =
-``base-J``; combinations like ``A+C`` work too).  The arms run **sequentially** as
+``base-J``; combinations like ``A+C`` work too; groups K-Q need the ext cache, see
+``scripts/build_scalp_ext_cache.py``).  The arms run **sequentially** as
 ``scripts/train_scalp.py --features <spec> --no-test ...`` (the test split is never
 loaded), with a short ``--train-steps`` and shared fixed arguments: every option this
 driver does not know is passed through to ``train_scalp.py`` unchanged (so

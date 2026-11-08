@@ -3,6 +3,8 @@
 
     uv run python scripts/build_rl_dataset.py --start 2024-01-04 --top-n 50
     uv run python scripts/build_rl_dataset.py --universe-only
+    # morning-session cache (T_open .. T_open + 9000 s) next to the opening one:
+    uv run python scripts/build_rl_dataset.py --cache-only --window-s 9000         --cache-dir .cache/trading_rl_am   # needs universe.parquet copied there
 
 Both stages are resumable: the universe is rebuilt from the local daily panel
 (cheap) and the tick cache skips every (date, stem) it already holds.
@@ -50,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--end", default=None, help="default: last date with tick data")
     ap.add_argument("--top-n", type=int, default=50)
     ap.add_argument("--universe-only", action="store_true")
+    ap.add_argument("--cache-only", action="store_true",
+                    help="skip the universe build (use the universe.parquet in --cache-dir)")
+    ap.add_argument("--window-s", type=int, default=600,
+                    help="tick window after T_open in seconds (600 = opening cache)")
     ap.add_argument("--include-funds", action="store_true",
                     help="keep ETFs/ETNs/REITs/infrastructure funds in the ranking")
     ap.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -65,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
 
     end = args.end or last_tick_date(args.trades_dir)
     _say(f"range {args.start}..{end} top_n={args.top_n} include_funds={args.include_funds}")
+    if args.cache_only:
+        return _build_cache(args, end)
     uni = build_universe(
         start=args.start, end=end, top_n=args.top_n,
         include_funds=args.include_funds, daily_dir=args.daily_dir,
@@ -76,10 +84,14 @@ def main(argv: list[str] | None = None) -> int:
     _say(f"universe: {uni.n_dates} dates, {uni.n_rows} rows ({uni.first_date}..{uni.last_date})")
     if args.universe_only:
         return 0
+    return _build_cache(args, end)
 
+
+def _build_cache(args: argparse.Namespace, end: str) -> int:
     summary = build_cache(
         cache_dir=args.cache_dir, trades_dir=args.trades_dir,
         start=args.start, end=end, workers=args.workers, progress=_say,
+        window_us=int(args.window_s) * 1_000_000,
     )
     counts = cache_status_counts(args.cache_dir, args.start, end)
     _say(

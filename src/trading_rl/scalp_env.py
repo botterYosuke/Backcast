@@ -21,6 +21,17 @@ Conventions
       been filled by earlier queue members).  Neither rule models a marketable
       limit order (a buy at the last price while the ask is lower) filling
       immediately.
+      ``queue_est`` (calibrated, :mod:`trading_rl.fill_model`): on arrival the order
+      is marketable with the session's precomputed probability ``fill_pmkt`` (then it
+      fills at once at its price); otherwise it waits behind ``fill_qhat`` shares and
+      fills once prints at exactly its price exceed ``fill_qhat + 100`` shares, or on
+      a print through its price.  The draw uses the env RNG (seed it for evaluation).
+    * ``sequential_cancel`` (kabu has no order amendment): replacing a working order
+      on the same side, or a market order while limit orders are working, first
+      cancels (effective at ``decision + latency``) and only then sends the new order
+      (effective at ``decision + 2 * latency``).
+    * Session length: ``ScalpSession.window_s`` / ``start_s`` (default 600 / 10, the
+      opening cache).  Morning sessions (:func:`morning_window_s`) end at 11:29:00.
     * Market orders: buy at ``last + 0.5 tick``, sell at ``last - 0.5 tick`` using
       the last print at activation time and the tick size of that price.  Market
       buy / sell (``order_mode`` "market" or "both") are position-changing orders
@@ -69,6 +80,7 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
@@ -123,6 +135,58 @@ ACTION_INDEX: dict[str, dict[int, int]] = {
     m: {g: i for i, g in enumerate(ids)} for m, ids in ACTION_IDS.items()
 }
 DT_S: float = 1.0  # seconds per decision step (penalty arithmetic)
+FILL_RULES: tuple[str, ...] = ("trade_through", "touch", "queue_est")
+MORNING_END_TOD_S: int = 11 * 3600 + 29 * 60  # forced flatten 11:29:00 (close 11:30)
+MORNING_CACHE_S: int = 9000  # .cache/trading_rl_am window after T_open
+_EPS = 1e-6
+
+
+def tod_seconds(t_open_us: int) -> float:
+    """Seconds since midnight of ``t_open_us`` (naive JST epoch, see trading_rl.data)."""
+    return (int(t_open_us) % (86400 * US)) / US
+
+
+OBS_TAPES: tuple[str, ...] = ("tick", "push20")
+PUSH_GAP_US: int = 20_000
+
+
+def push_tape_index(epoch_us: np.ndarray, gap_us: int = PUSH_GAP_US) -> np.ndarray:
+    """Last-print index of each pseudo kabu push: greedy groups of prints that arrive
+    within ``gap_us`` of the group's first print (20 ms reproduces the measured
+    1.3-1.6 prints per volume-changing push, findings scalp-fill-calibration.md)."""
+    t = np.asarray(epoch_us, dtype=np.int64)
+    ends = []
+    i, n = 0, len(t)
+    while i < n:
+        j = int(np.searchsorted(t, t[i] + gap_us, side="left"))
+        j = max(j, i + 1)
+        ends.append(j - 1)
+        i = j
+    return np.asarray(ends, dtype=np.int64)
+
+
+def push_tape(sess: OpeningSessionData, gap_us: int = PUSH_GAP_US) -> OpeningSessionData:
+    """The session as kabu PUSH would show it: one print per push (last price,
+    summed volume, time of the push's last print)."""
+    from dataclasses import replace
+
+    ends = push_tape_index(sess.epoch_us, gap_us)
+    q = np.asarray(sess.qty, dtype=np.float64)
+    cq = np.concatenate([[0.0], np.cumsum(q)])
+    starts = np.concatenate([[0], ends[:-1] + 1])
+    return replace(
+        sess,
+        epoch_us=np.ascontiguousarray(np.asarray(sess.epoch_us)[ends]),
+        price=np.ascontiguousarray(np.asarray(sess.price)[ends]),
+        qty=np.ascontiguousarray((cq[ends + 1] - cq[starts]).astype(np.int64)),
+        trade_type=np.full(len(ends), "", dtype=object),
+    )
+
+
+def morning_window_s(t_open_us: int, cap: int = MORNING_CACHE_S) -> int:
+    """Seconds from ``T_open`` to 11:29:00 (whole seconds, capped at the cache window)."""
+    w = int(np.floor(MORNING_END_TOD_S - tod_seconds(t_open_us)))
+    return max(0, min(int(cap), w))
 
 
 def action_names(order_mode: str) -> list[str]:
@@ -226,13 +290,27 @@ class ScalpConfig:
     # Observation feature spec ("base", "base+A+C-J", see scalp_features); not a
     # reward / fill setting, only the market part of the observation.
     features: str = "base"
+    # kabu has no amendment: replace = cancel, then a new order one latency later.
+    sequential_cancel: bool = False
+    # "opening" (600 s cache) | "morning" (T_open .. 11:29:00, trading_rl_am cache);
+    # used by the session loaders and recorded in the metadata.
+    window: str = "opening"
+    # tape the observation features are computed from: "tick" (every print) or
+    # "push20" (kabu PUSH granularity, see push_tape).  Fills always use every print.
+    obs_tape: str = "tick"
 
     def __post_init__(self) -> None:
         parse_feature_spec(self.features)  # validates
-        if self.fill_rule not in ("trade_through", "touch"):
+        if self.fill_rule not in FILL_RULES:
             raise ValueError(f"unknown fill_rule {self.fill_rule!r}")
         if not 0 <= self.latency_ms < 1000:
             raise ValueError("latency_ms must be in [0, 1000)")
+        if self.sequential_cancel and 2 * self.latency_ms >= 1000:
+            raise ValueError("sequential_cancel needs 2 * latency_ms < 1000")
+        if self.window not in ("opening", "morning"):
+            raise ValueError(f"unknown window {self.window!r}")
+        if self.obs_tape not in OBS_TAPES:
+            raise ValueError(f"unknown obs_tape {self.obs_tape!r}")
         if self.reward_mode not in ("mtm", "realized"):
             raise ValueError(f"unknown reward_mode {self.reward_mode!r}")
         if self.order_mode not in ORDER_MODES:
@@ -252,7 +330,10 @@ class ScalpConfig:
 
     def metadata(self) -> dict[str, Any]:
         return {
-            "window_seconds": WINDOW_S,
+            "window_seconds": WINDOW_S if self.window == "opening" else "to 11:29:00",
+            "window": self.window,
+            "obs_tape": self.obs_tape,
+            "sequential_cancel": self.sequential_cancel,
             "opening_warmup_seconds": START_S,
             "decision_interval_seconds": 1,
             "fill_rule": self.fill_rule,
@@ -289,9 +370,15 @@ class ScalpSession:
     cnt: np.ndarray  # (601,) int64: number of ticks with t_rel <= s * 1e6
     last: np.ndarray  # (601,) float64: last print at each second
     tick: np.ndarray  # (601,) float64: tick size at that price
-    X: np.ndarray  # (590, n_market(features)) float32 market features at decisions
+    X: np.ndarray  # (window_s - start_s, n_market(features)) float32 at decisions
     t_open_us: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
+    window_s: int = WINDOW_S  # forced flatten at T_open + window_s
+    start_s: int = START_S  # first decision second
+    qty: np.ndarray | None = None  # (n,) shares per print (queue_est)
+    # queue_est fill model, (n_decisions, 2 [buy, sell], 3 [k]) float32
+    fill_pmkt: np.ndarray | None = None
+    fill_qhat: np.ndarray | None = None
 
 
 def build_scalp_session(
@@ -302,28 +389,48 @@ def build_scalp_session(
     is_topix100: bool,
     features: str = "base",
     store: ContextStore | None = None,
+    window_s: int = WINDOW_S,
+    fill_model: Any = None,
+    obs_tape: str = "tick",
 ) -> ScalpSession:
     """Build a :class:`ScalpSession` (causal gate features on the 1 s grid).
+
+    ``window_s``: session length after ``T_open`` (600 = opening cache; the feature
+    groups A-Q are only defined for 600).  ``fill_model``: a
+    :class:`trading_rl.fill_model.FillModel` to precompute the ``queue_est`` arrays.
+    ``obs_tape``: ``"push20"`` computes the market features from the kabu-PUSH-like
+    tape (:func:`push_tape`); fills / prices of the env always use every print.
 
     ``features`` is a feature spec (``"base"`` = the original 28 columns, identical
     to before); groups that need daily / cross-sectional context read it from
     ``store`` (default: the process-wide store of the default cache dir).
     """
     spec = parse_feature_spec(features)
+    W = int(window_s)
+    if W <= START_S + 1:
+        raise ValueError(f"window_s={W} too short")
+    if spec.groups and W != WINDOW_S:
+        raise ValueError("feature groups A-Q are defined for the 600 s window only")
     t_rel_all = np.asarray(sess.epoch_us, dtype=np.int64) - int(sess.t_open_us)
-    keep = (t_rel_all >= 0) & (t_rel_all <= WINDOW_S * US)
+    keep = (t_rel_all >= 0) & (t_rel_all <= W * US)
     t_rel = np.ascontiguousarray(t_rel_all[keep])
     price = np.ascontiguousarray(np.asarray(sess.price, dtype=np.float64)[keep])
     if len(t_rel) == 0:
         raise ValueError("empty session")
+    if obs_tape not in OBS_TAPES:
+        raise ValueError(f"unknown obs_tape {obs_tape!r}")
+    if spec.groups and obs_tape != "tick":
+        raise ValueError("feature groups A-Q are computed from the tick tape only")
+    obs_sess = push_tape(sess) if obs_tape == "push20" else sess
     grid = compute_session_grid(
-        sess,
+        obs_sess,
         prev_close=prev_close,
         avg_volume_20d=avg_volume_20d,
         is_topix100=is_topix100,
-        s_grid=DECISION_SECONDS,
+        s_grid=np.arange(START_S, W, dtype=np.int64),
+        window_s=W,
     )
-    secs = np.arange(0, WINDOW_S + 1, dtype=np.int64)
+    secs = np.arange(0, W + 1, dtype=np.int64)
     cnt = np.searchsorted(t_rel, secs * US, side="right").astype(np.int64)
     last = price[np.maximum(cnt - 1, 0)]
     tks = tick_sizes(last, np.full(len(last), bool(is_topix100)))
@@ -355,8 +462,17 @@ def build_scalp_session(
             else None
         )
         ctx = store.date_context(str(sess.date)) if needs_ctx else None
-        extra = compute_extras(spec, arrays, daily=daily, ctx=ctx)
+        extra = compute_extras(spec, arrays, daily=daily, ctx=ctx, store=store)
         X = np.concatenate([X, extra], axis=1)
+    qty = np.ascontiguousarray(np.asarray(sess.qty, dtype=np.float64)[keep])
+    pmkt = qhat = None
+    if fill_model is not None:
+        from .fill_model import session_fill_arrays
+
+        dec = np.arange(START_S, W, dtype=np.int64)
+        pmkt, qhat = session_fill_arrays(
+            fill_model, t_rel, price, qty, dec, tks[dec], tod_seconds(sess.t_open_us)
+        )
     return ScalpSession(
         date=str(sess.date),
         stem=str(sess.stem),
@@ -370,7 +486,12 @@ def build_scalp_session(
         tick=tks,
         X=X,
         t_open_us=int(sess.t_open_us),
-        meta={"features": spec.canonical},
+        meta={"features": spec.canonical, "obs_tape": obs_tape},
+        window_s=W,
+        start_s=START_S,
+        qty=qty,
+        fill_pmkt=pmkt,
+        fill_qhat=qhat,
     )
 
 
@@ -398,6 +519,8 @@ class ScalpEnv(gym.Env):
         )
         self._lat_us = int(self.config.latency_ms * 1000)
         self._tt = self.config.fill_rule == "trade_through"
+        self._queue = self.config.fill_rule == "queue_est"
+        self._seq = bool(self.config.sequential_cancel)
         self._inv_rate = (
             self.config.inventory_penalty + self.config.inventory_penalty_ticks_per_s
         )
@@ -439,17 +562,29 @@ class ScalpEnv(gym.Env):
         self._sess = sess
         # Per-episode fill rule override (training curriculum); default = config.
         rule = str(options.get("fill_rule", self.config.fill_rule))
-        if rule not in ("trade_through", "touch"):
+        if rule not in FILL_RULES:
             raise ValueError(f"unknown fill_rule {rule!r}")
         self.fill_rule = rule
         self._tt = rule == "trade_through"
+        self._queue = rule == "queue_est"
+        if self._queue and (sess.fill_qhat is None or sess.qty is None):
+            raise ValueError("fill_rule='queue_est' needs sessions built with a fill_model")
+        self._W = int(sess.window_s)
+        self._S = int(sess.start_s)
+        self._nsteps = self._W - self._S
         self._t = sess.t_rel
         self._p = sess.price
+        self._q = sess.qty
+        self._pmkt = sess.fill_pmkt
+        self._qhat = sess.fill_qhat
+        self._bid_need = 0.0
+        self._ask_need = 0.0
+        self._n_marketable = 0
         self._cnt = sess.cnt.tolist()
         self._last = sess.last.tolist()
         self._tick = sess.tick.tolist()
         self._ref_tick = sess.ref_tick
-        self._d = START_S  # current decision second
+        self._d = self._S  # current decision second
         self._pos = 0
         self._entry = 0.0
         self._entry_us = 0
@@ -481,7 +616,7 @@ class ScalpEnv(gym.Env):
     def _write_obs(self) -> None:
         d = self._d
         o = self._obs
-        idx = min(d, WINDOW_S - 1) - START_S
+        idx = min(d, self._W - 1) - self._S
         j = self.n_market
         o[:j] = self._sess.X[idx]  # type: ignore[union-attr]
         last = self._last[d]
@@ -507,7 +642,7 @@ class ScalpEnv(gym.Env):
             o[j + 5] = max(-10.0, min(10.0, (self._ask - last) / tk))
             o[j + 8] = min(10.0, (d - self._ask_d) / 60.0)
         o[j + 6] = min(10.0, (d - self._entry_d) / 60.0) if pos else 0.0
-        o[j + 9] = (WINDOW_S - d) / float(N_STEPS)
+        o[j + 9] = (self._W - d) / float(self._nsteps)
 
     # --------------------------------------------------------------- helpers
     def _mtm_ticks(self, last: float) -> float:
@@ -569,32 +704,53 @@ class ScalpEnv(gym.Env):
         if i1 <= i0 or (self._bid is None and self._ask is None):
             return
         pr = self._p[i0:i1]
+        qv = self._q[i0:i1] if self._queue else None
         base = i0
         tt = self._tt
+        queue = self._queue
         while True:
             jb = js = -1
+            cb = ca = None
             bid, ask = self._bid, self._ask
             if bid is not None:
-                m = (pr < bid) if tt else (pr <= bid)
+                if queue:
+                    cb = np.cumsum(np.where(np.abs(pr - bid) < _EPS, qv, 0.0))
+                    m = (pr < bid - _EPS) | (cb >= self._bid_need)
+                else:
+                    m = (pr < bid) if tt else (pr <= bid)
                 j = int(m.argmax())
                 if m[j]:
                     jb = j
             if ask is not None:
-                m = (pr > ask) if tt else (pr >= ask)
+                if queue:
+                    ca = np.cumsum(np.where(np.abs(pr - ask) < _EPS, qv, 0.0))
+                    m = (pr > ask + _EPS) | (ca >= self._ask_need)
+                else:
+                    m = (pr > ask) if tt else (pr >= ask)
                 j = int(m.argmax())
                 if m[j]:
                     js = j
             if jb < 0 and js < 0:
+                if cb is not None:
+                    self._bid_need -= float(cb[-1])
+                if ca is not None:
+                    self._ask_need -= float(ca[-1])
                 return
             if js < 0 or (0 <= jb <= js):
                 j, side, px = jb, 1, bid
                 self._bid = None
+                if ca is not None:
+                    self._ask_need -= float(ca[j])
             else:
                 j, side, px = js, -1, ask
                 self._ask = None
+                if cb is not None:
+                    self._bid_need -= float(cb[j])
             self._fill(side, float(px), int(self._t[base + j]), "limit", False)  # type: ignore[arg-type]
             base += j + 1
             pr = pr[j + 1 :]
+            if qv is not None:
+                qv = qv[j + 1 :]
             if len(pr) == 0 or (self._bid is None and self._ask is None):
                 return
 
@@ -623,7 +779,24 @@ class ScalpEnv(gym.Env):
         else:
             self._n_invalid += 1
 
-    def _apply_action(self, g: int) -> None:
+    def _place(self, side: int, k: int, px: float, t_act: int) -> bool:
+        """queue_est arrival: True if the order is marketable and already filled."""
+        if not self._queue:
+            return False
+        si = 0 if side > 0 else 1
+        idx = self._d - self._S
+        if self._rng.random() < float(self._pmkt[idx, si, k]):  # type: ignore[index]
+            self._n_marketable += 1
+            self._fill(side, float(px), int(t_act), "limit", False)
+            return True
+        need = float(self._qhat[idx, si, k]) + 100.0  # type: ignore[index]
+        if side > 0:
+            self._bid_need = need
+        else:
+            self._ask_need = need
+        return False
+
+    def _apply_action(self, g: int, t_act: int = 0) -> None:
         """Apply keep / cancel / place limit actions (global id ``g``).
 
         Market actions (flatten / market buy / sell) are handled in ``step``.
@@ -642,17 +815,24 @@ class ScalpEnv(gym.Env):
             if px <= 0:
                 self._bad(g)
                 return
+            self._n_orders += 1
+            self._bid = None
+            if self._place(1, g - G_BID0, px, t_act):
+                return
             self._bid = px
             self._bid_d = d
-            self._n_orders += 1
             return
         if G_ASK0 <= g <= G_ASK2:
             if self._pos < 0:
                 self._bad(g)
                 return
-            self._ask = round(self._last[d] + (g - G_ASK0) * self._tick[d], 4)
-            self._ask_d = d
+            px = round(self._last[d] + (g - G_ASK0) * self._tick[d], 4)
             self._n_orders += 1
+            self._ask = None
+            if self._place(-1, g - G_ASK0, px, t_act):
+                return
+            self._ask = px
+            self._ask_d = d
             return
         raise ValueError(f"invalid action {g}")
 
@@ -679,6 +859,22 @@ class ScalpEnv(gym.Env):
         self._bid = self._ask = None
         self._market_fill(side, i_ta, t_act, False)
         self._n_orders += 1
+
+    def _cancel_first(self, g: int) -> bool:
+        """sequential_cancel: does the (valid) action ``g`` need a cancel round-trip?"""
+        if G_BID0 <= g <= G_BID2:
+            return self._bid is not None and self._pos <= 0
+        if G_ASK0 <= g <= G_ASK2:
+            return self._ask is not None and self._pos >= 0
+        if g >= G_FLATTEN:
+            if self._bid is None and self._ask is None:
+                return False
+            if g == G_FLATTEN:
+                return self._pos != 0
+            if self._pos != self._dec[0]:
+                return False
+            return self._pos <= 0 if g == G_MBUY else self._pos >= 0
+        return False
 
     def action_mask(self) -> np.ndarray:
         """Boolean mask over this mode's actions: True = legal in the current state."""
@@ -712,21 +908,35 @@ class ScalpEnv(gym.Env):
             i_ta = int(np.searchsorted(self._t, t_act, side="right"))
             if working:
                 self._advance(cnt[d], i_ta)
+            if self._seq and self._cancel_first(g):
+                # cancel effective now, the new order one more latency later
+                if g >= G_FLATTEN:
+                    self._bid = self._ask = None
+                elif g <= G_BID2:
+                    self._bid = None
+                else:
+                    self._ask = None
+                t_act += self._lat_us
+                i_ta2 = int(np.searchsorted(self._t, t_act, side="right"))
+                if self._bid is not None or self._ask is not None:
+                    self._advance(i_ta, i_ta2)
+                i_ta = i_ta2
             if g >= G_FLATTEN:
                 self._apply_market(g, i_ta, t_act)
             else:
-                self._apply_action(g)
+                self._apply_action(g, t_act)
             if self._bid is not None or self._ask is not None:
                 self._advance(i_ta, cnt[d + 1])
         # a == KEEP / CANCEL with nothing working needs no tick processing
 
         d += 1
         self._d = d
-        terminated = d >= WINDOW_S
+        W = self._W
+        terminated = d >= W
         if terminated:
             self._bid = self._ask = None
             if self._pos != 0:
-                self._market_close(cnt[WINDOW_S], WINDOW_S * US, True)
+                self._market_close(cnt[W], W * US, True)
         last = self._last[d]
         mtm = self._mtm_ticks(last)
         if self._realized_reward:
@@ -808,7 +1018,7 @@ class ScalpEnv(gym.Env):
             "unreal_ticks": (
                 self._pos * (last - self._entry) / self._ref_tick if self._pos else 0.0
             ),
-            "remaining": WINDOW_S - d,
+            "remaining": self._W - d,
         }
 
     def episode_summary(self) -> dict[str, Any]:
@@ -843,6 +1053,8 @@ class ScalpEnv(gym.Env):
             "n_invalid_actions": self._n_invalid,
             "n_latency_noops": self._n_latency_noops,
             "fill_rule": self.fill_rule,
+            "n_limit_marketable": self._n_marketable,
+            "window_s": self._W,
             # shaped (training) return vs raw PnL: pnl_ticks is always raw
             "shaped_return_ticks": self._shaped,
             "penalty_ticks": self._penalty,
@@ -856,6 +1068,9 @@ class ScalpEnv(gym.Env):
 SessionRow = tuple[
     str, str, float, float, bool
 ]  # date, stem, prev_close, avg_vol, t100
+
+
+MORNING_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "trading_rl_am"
 
 
 def is_heldout(stem: str) -> bool:
@@ -897,14 +1112,22 @@ def load_scalp_session(
     cache_dir: Any = None,
     features: str = "base",
     store: ContextStore | None = None,
+    window: str = "opening",
+    fill_model: Any = None,
+    obs_tape: str = "tick",
 ) -> ScalpSession:
+    """``window="morning"``: read ``cache_dir`` (default ``MORNING_CACHE_DIR``) and
+    trade to 11:29:00 (:func:`morning_window_s`)."""
     from .cache import load_cached_session
     from .universe import DEFAULT_CACHE_DIR
 
     date, stem, prev_close, avg_vol, t100 = row
+    if window == "morning":
+        cache_dir = cache_dir or MORNING_CACHE_DIR
     raw = load_cached_session(date, stem, cache_dir or DEFAULT_CACHE_DIR)
     if store is None and parse_feature_spec(features).groups:
         store = default_store(cache_dir)
+    window_s = morning_window_s(raw.t_open_us) if window == "morning" else WINDOW_S
     return build_scalp_session(
         raw,
         prev_close=prev_close,
@@ -912,6 +1135,9 @@ def load_scalp_session(
         is_topix100=t100,
         features=features,
         store=store,
+        window_s=window_s,
+        fill_model=fill_model,
+        obs_tape=obs_tape,
     )
 
 
@@ -920,12 +1146,19 @@ def load_scalp_sessions(
     cache_dir: Any = None,
     progress_every: int = 0,
     features: str = "base",
+    window: str = "opening",
+    fill_model: Any = None,
+    obs_tape: str = "tick",
 ) -> list[ScalpSession]:
     out = []
     store = default_store(cache_dir) if parse_feature_spec(features).groups else None
     for i, row in enumerate(rows):
         try:
-            out.append(load_scalp_session(row, cache_dir, features, store))
+            out.append(
+                load_scalp_session(
+                    row, cache_dir, features, store, window, fill_model, obs_tape
+                )
+            )
         except Exception:  # noqa: BLE001 - skip unusable sessions (counted by caller)
             continue
         if progress_every and (i + 1) % progress_every == 0:

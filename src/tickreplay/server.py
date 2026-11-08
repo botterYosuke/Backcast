@@ -575,6 +575,14 @@ def read_ai_models() -> list[dict[str, object]]:
                 "default": default is not None and path.name == default.name,
             }
         )
+    from trading_rl import predictor_replay
+
+    if predictor_replay.is_available():
+        out.extend(
+            {"file": p.key, "kind": predictor_replay.KIND_PREDICTOR, "label": p.label,
+             "default": False}
+            for p in predictor_replay.PRESETS
+        )
     return out
 
 
@@ -604,10 +612,18 @@ def read_ai_replay_trades(
     def unavailable(reason: str) -> dict[str, object]:
         return {**unavailable_resp, "reason": reason}
 
-    # 1. Resolve model checkpoint
-    model_path = _resolve_model_checkpoint(stem, model)
-    if model_path is None:
-        return unavailable("model checkpoint not found")
+    from trading_rl import predictor_replay
+
+    # 1. Resolve model checkpoint (or a stage-2 predictor preset)
+    preset = predictor_replay.parse_key(model)
+    if preset is not None:
+        if not predictor_replay.is_available():
+            return unavailable("predictor models not built (stage2_trade.py --fit)")
+        model_path = None
+    else:
+        model_path = _resolve_model_checkpoint(stem, model)
+        if model_path is None:
+            return unavailable("model checkpoint not found")
 
     # 2. Resolve session ticks
     repository = get_repository()
@@ -644,17 +660,22 @@ def read_ai_replay_trades(
         simulate_scalp_trades,
     )
 
-    try:
-        _policy, checkpoint = load_checkpoint_cached(model_path)
-        kind = checkpoint_kind(checkpoint)
-        # Replay with the window the checkpoint was trained on (legacy: 900s).
-        env_config = resolve_env_config(checkpoint)
-        window_us = int(round(float(env_config["window_seconds"]) * 1_000_000))
-    except Exception:
-        return unavailable("checkpoint unreadable")
+    if preset is not None:
+        kind = predictor_replay.KIND_PREDICTOR
+        env_config: dict = {}
+        window_us = predictor_replay.REPLAY_WINDOW_US
+    else:
+        try:
+            _policy, checkpoint = load_checkpoint_cached(model_path)
+            kind = checkpoint_kind(checkpoint)
+            # Replay with the window the checkpoint was trained on (legacy: 900s).
+            env_config = resolve_env_config(checkpoint)
+            window_us = int(round(float(env_config["window_seconds"]) * 1_000_000))
+        except Exception:
+            return unavailable("checkpoint unreadable")
 
     scalp_info = None
-    if kind == "scalp":
+    if kind in ("scalp", predictor_replay.KIND_PREDICTOR):
         scalp_info = lookup_session_info(session.stem, session.date)
         if scalp_info is None:
             return unavailable(
@@ -684,7 +705,30 @@ def read_ai_replay_trades(
         "is_heldout": None,
     }
     try:
-        if kind == "scalp":
+        if kind == predictor_replay.KIND_PREDICTOR:
+            assert scalp_info is not None and model is not None
+            trades, summary, orders, env_config = (
+                predictor_replay.simulate_predictor_trades(
+                    opening_data,
+                    model,
+                    prev_close=scalp_info.prev_close,
+                    avg_volume_20d=scalp_info.avg_volume_20d,
+                    is_topix100=scalp_info.is_topix100,
+                )
+            )
+            response = {
+                "orders": orders,
+                "in_universe": scalp_info.in_universe,
+                "period": period_of(session.date),
+                "is_heldout": is_heldout(session.stem),
+                "is_topix100": scalp_info.is_topix100,
+                "session_info_source": scalp_info.source,
+                "topix100_source": scalp_info.topix100_source,
+                "features": "base+micro (push20)",
+                "predictor": {k: env_config[k] for k in
+                              ("horizon_s", "top_q", "threshold_ticks", "variant")},
+            }
+        elif kind == "scalp":
             assert scalp_info is not None
             trades, summary, orders = simulate_scalp_trades(
                 opening_data,
@@ -715,7 +759,7 @@ def read_ai_replay_trades(
         "t_open_us": opening_data.t_open_us,
         "trades": trades,
         "summary": summary,
-        "model": _model_file_key(model_path),
+        "model": model if model_path is None else _model_file_key(model_path),
         "model_kind": kind,
         "env_config": {
             "window_s": env_config.get("window_seconds"),

@@ -210,7 +210,11 @@ def _write_scalp_checkpoint(path: Path, action: int = 2) -> None:
 @pytest.fixture
 def models_dir(tmp_path, monkeypatch):
     """cwd with a models/ dir holding one scalp and one legacy checkpoint."""
+    from trading_rl import predictor_replay
+
     monkeypatch.chdir(tmp_path)
+    # the repo's stage-2 predictor (if built) must not leak into the listing
+    monkeypatch.setattr(predictor_replay, "PRED_MODELS_PATH", tmp_path / "no_predictor.pkl")
     d = tmp_path / "models"
     d.mkdir()
     _write_scalp_checkpoint(d / "ppo_scalp_top50_open10m.pt")

@@ -27,7 +27,6 @@ import duckdb
 from .data import OpeningSessionData
 from .policy import ActorCritic, load_policy_from_checkpoint
 from .scalp_env import (
-    G_BID0,
     G_CANCEL,
     G_FLATTEN,
     G_MBUY,
@@ -247,26 +246,30 @@ class _RecordingScalpEnv(ScalpEnv):
             {"t": int(t_us), "side": side, "price": float(price), "action": action, "id": oid}
         )
 
-    def _apply_action(self, a: int) -> None:  # ``a``: global action id
-        super()._apply_action(a)
-        t = self._d * US + self._lat_us
-        new = {+1: self._bid, -1: self._ask}
-        new_d = {+1: self._bid_d, -1: self._ask_d}
-        for side in (+1, -1):
-            placed = (
-                G_BID0 <= a < G_FLATTEN
-                and new[side] is not None
-                and new_d[side] == self._d
-            )
-            if a == G_CANCEL or placed:
+    def _apply_action(self, a: int, t_act: int = 0) -> None:  # ``a``: global action id
+        if a == G_CANCEL:
+            t = t_act if t_act else self._d * US + self._lat_us
+            for side in (+1, -1):
                 live = self._live.pop(side, None)
                 if live is not None:
                     self._ev(t, side, live[1], "cancel", live[0])
-            if placed:
-                oid = self._next_id
-                self._next_id += 1
-                self._live[side] = (oid, float(new[side]))  # type: ignore[arg-type]
-                self._ev(t, side, float(new[side]), "place", oid)  # type: ignore[arg-type]
+        super()._apply_action(a, t_act)
+
+    def _place(self, side: int, k: int, px: float, t_act: int) -> bool:
+        # Every limit placement passes through here (also the queue_est marketable
+        # draw that fills inside the parent's ``_place``), so the replaced order's
+        # cancel and the new order's place are recorded before any fill.
+        t = t_act if t_act else self._d * US + self._lat_us
+        live = self._live.pop(side, None)
+        if live is not None:
+            # sequential_cancel: the old order went away one latency before the new one
+            t_cancel = t - self._lat_us if self._seq else t
+            self._ev(t_cancel, side, live[1], "cancel", live[0])
+        oid = self._next_id
+        self._next_id += 1
+        self._live[side] = (oid, float(px))
+        self._ev(t, side, float(px), "place", oid)
+        return super()._place(side, k, px, t_act)
 
     def _fill(self, side: int, price: float, t_us: int, order: str, forced: bool) -> None:
         n_trips = len(self._trips)
@@ -288,7 +291,7 @@ class _RecordingScalpEnv(ScalpEnv):
                 t = (
                     d * US + self._lat_us
                     if g in (G_FLATTEN, G_MBUY, G_MSELL)
-                    else WINDOW_S * US
+                    else self._W * US
                 )
                 self._ev(t, side, px, "cancel", oid)
         return out
@@ -351,7 +354,13 @@ def simulate_scalp_trades(
             a = policy.predict(obs, deterministic=True)
         obs, _r, terminated, truncated, _info = env.step(a)
         done = terminated or truncated
+    return format_replay(env, sess, qty)
 
+
+def format_replay(
+    env: _RecordingScalpEnv, sess: Any, qty: int = 100
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    """``(trades, summary, orders)`` of a finished :class:`_RecordingScalpEnv` episode."""
     t_open = int(sess.t_open_us)
     scale = qty / 100.0
     trades: list[dict[str, Any]] = []
@@ -398,6 +407,7 @@ __all__ = [
     "KIND_SCALP",
     "ScalpSessionInfo",
     "checkpoint_kind",
+    "format_replay",
     "is_heldout",
     "load_checkpoint_cached",
     "lookup_session_info",

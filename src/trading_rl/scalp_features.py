@@ -21,6 +21,8 @@ data of sessions strictly before the session date, NaN/inf -> 0, clipped)::
     G prev-day range     open vs previous-day high / low (J-Quants daily OHLC)
     H first minute       return and volume of the first 60 s (zeros before, + known flag)
     I tick weight        tick / price [bps], 1 s sigma of the last 60 s [ticks]
+    K-Q                  index real-time, sector peers, disclosures, index regime, large
+                         prints, previous-day close flow, calendar: see scalp_features_ext
     -J                   drop ``log_ntrades_*``, ``log_vol_ratio_*``,
                          ``log_time_since_trade`` and ``imb_*``
 
@@ -51,6 +53,7 @@ import duckdb
 import numpy as np
 
 from .gate_features import FEATURE_NAMES, START_S, WINDOW_S
+from .scalp_features_ext import EXT_GROUPS, EXT_NAMES, ext_columns, ext_data
 from .universe import (
     DEFAULT_CACHE_DIR,
     DEFAULT_LISTED,
@@ -63,7 +66,7 @@ from .universe import (
 )
 
 US = 1_000_000
-ADD_GROUPS = "ABCDEFGHI"
+ADD_GROUPS = "ABCDEFGHIKLMNOPQ"  # K-Q live in scalp_features_ext
 DROP_GROUPS = "J"
 J_PREFIXES: tuple[str, ...] = (
     "log_ntrades_",
@@ -190,6 +193,7 @@ EXTRA_NAMES: dict[str, list[str]] = {
     "H": ["h_known", "h_ret60_bps", "h_sign60", "h_log_vol60_ratio"],
     "I": ["i_tick_bps", "i_sigma60_ticks"],
 }
+EXTRA_NAMES.update(EXT_NAMES)  # groups K-Q (computed in scalp_features_ext)
 
 
 def kept_base_index(spec: FeatureSpec) -> np.ndarray:
@@ -948,6 +952,7 @@ def compute_extras(
     *,
     daily: DailyStatic | None,
     ctx: DateContext | None,
+    store: ContextStore | None = None,
 ) -> np.ndarray:
     """``(590, n_extra)`` float32 for the groups of ``spec`` (in group order)."""
     daily = daily or DailyStatic()
@@ -972,6 +977,8 @@ def compute_extras(
             cols += _group_H(a)
         elif g == "I":
             cols += _group_I(a)
+        elif g in EXT_GROUPS:
+            cols += ext_columns(g, a, ext_data((store or default_store()).cache_dir))
     if not cols:
         return np.zeros((len(_DEC), 0), dtype=np.float32)
     X = np.stack(cols, axis=1)
