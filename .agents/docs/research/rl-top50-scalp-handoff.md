@@ -81,3 +81,35 @@ HGB 回帰を train 3000 セッションで学習 → val で評価。IC = 日�
 - サブエージェント: `src/trading_rl/scalp_features_ext.py`, `src/trading_rl/scalp_ext_build.py`, `scripts/build_scalp_ext_cache.py`, `scripts/ext_feature_report.py`, `tests/test_scalp_features_ext.py`, `scalp_features.py`（+9/-1）, `scalp_env.py`（1行）
 - 調査スクリプト: `scripts/probes/*.py`（predict_probe, predict_probe_long, probe_trade, probe_short, probe_jump, trips_check, entry_timing, hold_analysis）。`uv run python -W ignore scripts/probes/<name>.py`（cwd はリポジトリ直下）。
 - 既知: 全テストスイートではツール系テスト（test_validate_doc 等）が 287 件失敗するが RL とは無関係・未調査。RL 関連は `tests/test_scalp_*.py tests/test_ai_replay_api.py tests/test_scalp_replay.py` で 182 passed。
+
+## 傾向分析: 段階②の予測モデル（指値・前場）の売買を区分別に見る（2026-11-08、backcast-ed と分担）
+- **データ**: `scripts/probes/stage2_trends.py` が作った往復の記録（`.cache/trading_rl/stage2/trips_{val,val2}.npz`）。
+  - 対象: 10秒先の予測、自信上位1%と上位5%、O3。
+  - 規模: 各2500セッション。val 16.9万往復、val2 34.5万往復。
+- **追加の区分**: `scripts/probes/stage2_enrich.py`。値動きの激しさ、約定件数、順張り/逆張り、VWAP、日経のその時点までの動き、何回目の売買か、直前の勝敗、売買代金など。
+- **決済だけの再計算**: `scripts/probes/stage2_exits.py`。実際の約定をそのまま使い、損切り・利確・最長保有の 224 通りを試した。val と val2 の両方で済み。
+- **結果**:
+  - val・val2 とも、プラスの区分はない。全体は上位1%で −1.03 / −1.41、上位5%で −0.55 / −1.03 tick/回（val / val2）。
+  - 損の大きさは、直近60秒の激しさにほぼ比例する（上位5%で静か −0.03 / −0.10 → 激しい −1.32 / −1.64）。時間帯の差（寄り後1分が最悪、11時台が最もまし）、「1回目の売買が最悪」「予測が強いほど悪い」は、多くがこの言い換えに見える。
+  - 激しい瞬間は、勝ちが約5倍になるが、負けはそれより一回り大きい。約定後10秒の最大の含み損は、最大の含み益より大きい（逆選択）。
+  - 決済ルールでは直らない。最良でも +0.1 tick 程度で、val で良かったルールは val2 で基準を上回らない。
+  - **差がないもの**: 日経の上げ日/下げ日、日経の寄りのギャップ、日経のその時点までの動き（売買の向きと揃えたもの）、買い/空売り、曜日、月、直前の勝敗。
+  - 「その場で約定 × 静か」だけが +0.08〜+0.15 tick。ただし、queue_est のその場約定は、その後の値動きと無関係なくじ引き（`ScalpEnv._place`）なので、作り物とみなす。
+  - 呼値の粗さの差は、tick 単位による見かけの差（bp に直すと消える）。
+
+## 「激しく動く瞬間」特化 RL（2026-11-08、詳細 `rl-burst-results.md`）
+- **やったこと**: 検出器（「10秒以内に ±5 tick 動く」HGB、学習期間だけで学習・閾値は上位0.5%）が反応した時点から60秒を1エピソードにした、成行だけの練習場 `burst_env.py` を作った。PPO を seed 3本 × 2通り（基準の約定で練習＝plain、片道1 tickずれで練習＝slip1）学習させた。
+- **判定: 見つからなかった。** 事前に決めた本命（slip1 seed0）は、検証その1 / 検証その2 で +2.43 / +1.67 tick/回（CI 下端 +0.84 / +1.02）、学習外銘柄もプラスだった。しかし (d) で、検証その1の1日・1銘柄あたりの稼ぎが単純ルールに届かなかった（+0.33 対 +0.42）。
+  - さらに、1 tick ずれでは CI が 0 をまたぎ、遅れの間の最悪値で約定させるとマイナス。seed1・2 は検証その2で CI が 0 をまたぐ。
+- **plain**: 検証その1 +0.5 tick/回（3本そろって CI プラス、保有6秒、損小利大の出口）。ただし 1 tick ずれ・0.5〜1秒の遅れで消える。
+- **単純ルール**: 1,800通りの最良（逆張り・60秒保有）は、検証その1 +2.35 → 検証その2 −2.48 に反転した。
+- **一番の不確かさ**: 激しい瞬間の成行約定。200ms でも数 tick 飛ぶ。次は板の記録で、反応時点の気配の開きと実際の約定値を測るのがおすすめ。
+- 検証その2は、本方策で1回使用済み（`.cache/trading_rl/burst/val2_used.json`）。2026年は検出器の反応が 2025年後半の3倍以上あった。
+
+### 本セッションで触ったファイル（すべて新規・未コミット。既存ファイルは変更していない）
+- `src/trading_rl/burst_env.py`、`tests/test_burst_env.py`（17件）
+- `scripts/burst/{build_burst,train_burst,eval_burst,burst_rules,curve_table}.py`
+- `models/burst/`（`detector_v1.pkl`、`ppo_burst_plain_s{0,1,2}.pt`、`ppo_burst_slip1_s{0,1,2}.pt`、`ppo_burst_smoke_s0.pt`）
+- `.cache/trading_rl/burst/`（エピソード、報告の md/json、学習曲線 csv、`val2_plan.json`、`val2_used.json`、ログ）
+- `.agents/docs/research/rl-burst-results.md`（報告書）、本ファイルの末尾
+- テスト: `uv run pytest tests/test_scalp_*.py tests/test_ai_replay_api.py tests/test_predictor_replay.py tests/test_burst_env.py -q` → 236 passed
