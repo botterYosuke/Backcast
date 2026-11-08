@@ -67,3 +67,4 @@ logs/
 
 # RL dataset cache (universe + opening-window tick shards)
 .cache/
+node_modules
