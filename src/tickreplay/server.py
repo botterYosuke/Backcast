@@ -583,6 +583,13 @@ def read_ai_models() -> list[dict[str, object]]:
              "default": False}
             for p in predictor_replay.PRESETS
         )
+    from trading_rl import burst_replay
+
+    out.extend(
+        {"file": burst_replay.model_key(p), "kind": burst_replay.KIND_BURST,
+         "label": burst_replay.model_label(p), "default": False}
+        for p in burst_replay.model_files()
+    )
     return out
 
 
@@ -612,11 +619,16 @@ def read_ai_replay_trades(
     def unavailable(reason: str) -> dict[str, object]:
         return {**unavailable_resp, "reason": reason}
 
-    from trading_rl import predictor_replay
+    from trading_rl import burst_replay, predictor_replay
 
-    # 1. Resolve model checkpoint (or a stage-2 predictor preset)
+    # 1. Resolve model checkpoint (or a stage-2 predictor preset / a burst-RL model)
     preset = predictor_replay.parse_key(model)
-    if preset is not None:
+    burst_path = burst_replay.parse_key(model)
+    if model and model.startswith(burst_replay.KEY_PREFIX):
+        if burst_path is None or not burst_replay.is_available():
+            return unavailable("burst model or detector not found (models/burst/)")
+        model_path = None
+    elif preset is not None:
         if not predictor_replay.is_available():
             return unavailable("predictor models not built (stage2_trade.py --fit)")
         model_path = None
@@ -660,9 +672,13 @@ def read_ai_replay_trades(
         simulate_scalp_trades,
     )
 
-    if preset is not None:
-        kind = predictor_replay.KIND_PREDICTOR
+    if burst_path is not None:
+        kind = burst_replay.KIND_BURST
         env_config: dict = {}
+        window_us = burst_replay.REPLAY_WINDOW_US
+    elif preset is not None:
+        kind = predictor_replay.KIND_PREDICTOR
+        env_config = {}
         window_us = predictor_replay.REPLAY_WINDOW_US
     else:
         try:
@@ -675,7 +691,7 @@ def read_ai_replay_trades(
             return unavailable("checkpoint unreadable")
 
     scalp_info = None
-    if kind in ("scalp", predictor_replay.KIND_PREDICTOR):
+    if kind in ("scalp", predictor_replay.KIND_PREDICTOR, burst_replay.KIND_BURST):
         scalp_info = lookup_session_info(session.stem, session.date)
         if scalp_info is None:
             return unavailable(
@@ -705,7 +721,28 @@ def read_ai_replay_trades(
         "is_heldout": None,
     }
     try:
-        if kind == predictor_replay.KIND_PREDICTOR:
+        if kind == burst_replay.KIND_BURST:
+            assert scalp_info is not None and model is not None
+            trades, summary, episodes, env_config = burst_replay.simulate_burst_trades(
+                opening_data,
+                model,
+                prev_close=scalp_info.prev_close,
+                avg_volume_20d=scalp_info.avg_volume_20d,
+                is_topix100=scalp_info.is_topix100,
+                held=is_heldout(session.stem),
+            )
+            response = {
+                "orders": [],
+                "in_universe": scalp_info.in_universe,
+                "period": burst_replay.period_of(session.date),
+                "is_heldout": is_heldout(session.stem),
+                "is_topix100": scalp_info.is_topix100,
+                "session_info_source": scalp_info.source,
+                "topix100_source": scalp_info.topix100_source,
+                "features": "gate28+micro11 (push20) + detector",
+                "burst_episodes": episodes,
+            }
+        elif kind == predictor_replay.KIND_PREDICTOR:
             assert scalp_info is not None and model is not None
             trades, summary, orders, env_config = (
                 predictor_replay.simulate_predictor_trades(

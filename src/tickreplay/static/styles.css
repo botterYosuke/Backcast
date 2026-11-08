@@ -552,20 +552,43 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   font-variant-numeric: tabular-nums;
 }
 
-/* ------------------------------------------------------- 建玉パネル（左上） */
+/* ------------------------------------------------------- 建玉パネル（右上） */
 
 .position-panel {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 22px;
   flex-wrap: wrap;
 }
 
-.pos-item {
-  display: flex;
+/*
+ * 自分と AI を同じ列にそろえる表。1 行目が見出し、2 行目が自分、3 行目が AI。
+ * AI Play: OFF のときは行見出しの列と AI の行を消して、元の 1 行表示に戻る。
+ */
+.pos-grid {
+  display: grid;
+  grid-template-columns: repeat(4, auto);
+  column-gap: 18px;
+  row-gap: 0;
   align-items: baseline;
-  gap: 7px;
 }
+
+.pos-row-label { display: none; }
+.ai-row { display: none; }
+
+body.ai-on .pos-grid { grid-template-columns: auto repeat(4, auto); }
+body.ai-on .pos-row-label { display: block; }
+body.ai-on .ai-row { display: block; }
+
+.pos-row-label {
+  color: var(--ink-muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.pos-row-label.ai-row,
+.pos-value.ai-row { color: #6d28d9; }
 
 .pos-label {
   color: var(--ink-muted);
@@ -581,23 +604,23 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   font-size: 15px;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+  line-height: 1.35;
   white-space: nowrap;
 }
 
 .pos-value[data-tone="up"] { color: var(--up); }
 .pos-value[data-tone="down"] { color: var(--down); }
 
-/* 合計損益はこのパネルの主役なので、他より一段大きく出す */
-.pos-total-item {
-  padding-left: 22px;
+/* 合計損益はこのパネルの主役なので、区切り線を入れて一段大きく出す */
+.pos-total-cell {
+  padding-left: 18px;
   border-left: 1px solid var(--line);
 }
 
-.pos-total-item .pos-value {
+.pos-value.pos-total-cell {
   min-width: 74px;
   font-size: 18px;
 }
-
 
 /* --------------------------------------------------------- 注文数量の入力 */
 
@@ -815,11 +838,13 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 /* ------------------------------------------------------------ responsive */
 
 @media (max-width: 1180px) {
-  .split { flex-direction: column; }
-  .tape-card { width: auto; min-height: 200px; }
+  /* ティックと歩み値も横並びのまま。縦積みにすると高さが足りずティックが潰れる */
+  .tape-card { width: 240px; }
+  .transport { flex-wrap: wrap; row-gap: 8px; gap: 12px; }
   .topbar { padding: 8px 18px; }
-  .layout { flex-direction: column; padding: 12px 18px 14px; }
-  .board-card { width: auto; min-height: 320px; }
+  /* 板は横に置いたまま幅だけ詰める（縦積みにすると板が横幅いっぱいに伸びるため） */
+  .layout { padding: 12px 18px 14px; }
+  .board-card { width: 260px; }
   .position-panel { gap: 14px; }
 }
 
@@ -836,7 +861,10 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   .field input { width: 108px; }
   .day-nav { display: none; }
   .position-panel { gap: 10px; }
-  .pos-total-item { padding-left: 12px; }
+  .pos-grid { column-gap: 10px; }
+  .pos-value { min-width: 0; font-size: 13px; }
+  .pos-value.pos-total-cell { min-width: 0; font-size: 15px; }
+  .pos-total-cell { padding-left: 10px; }
 
   .mobile-trade-bar {
     display: flex;
@@ -846,7 +874,7 @@ button.primary:hover:not(:disabled) { background: #443e35; }
     border-bottom: 1px solid var(--line);
   }
 
-  .layout { padding: 12px 14px 18px; }
+  .layout { flex-direction: column; padding: 12px 14px 18px; }
   .layout-main { flex: 1 0 auto; min-height: auto; gap: 14px; }
 
   /*
@@ -933,9 +961,15 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 }
 
 .ai-panel {
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 460px;
   border-left: 2px solid #7c3aed;
   padding-left: 14px;
 }
+
+body.ai-on .ai-panel { display: flex; }
 
 .ai-model-select {
   background: var(--surface);
@@ -953,11 +987,8 @@ button.primary:hover:not(:disabled) { background: #443e35; }
   display: none;
 }
 
-.ai-badge-item {
-  max-width: 460px;
-}
-
 .ai-badge {
+  color: var(--ink);
   font-size: 12px;
   font-weight: 600;
   white-space: normal;
@@ -974,7 +1005,9 @@ button.primary:hover:not(:disabled) { background: #443e35; }
 
 .ai-badge .ai-period[data-period="test"] { color: #15803d; }
 .ai-badge .ai-period[data-period="train"],
-.ai-badge .ai-period[data-period="val"] { color: #b45309; }
+.ai-badge .ai-period[data-period="val"],
+.ai-badge .ai-period[data-period="val2"],
+.ai-badge .ai-period[data-period="final"] { color: #b45309; }
 
 .ai-warning {
   display: block;

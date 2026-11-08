@@ -24,6 +24,7 @@ from torch import nn
 sys.path.insert(0, "src")
 sys.path.insert(0, "scripts/burst")
 from trading_rl import burst_env as be  # noqa: E402
+from trading_rl.burst_replay import ActorCritic  # noqa: E402
 
 VAL_EVAL = 20000
 
@@ -32,28 +33,7 @@ def log(m: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, hidden: int, mean: np.ndarray, std: np.ndarray):
-        super().__init__()
-        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float32))
-        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float32))
-
-        def mlp(out, gain):
-            m = nn.Sequential(nn.Linear(obs_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden),
-                              nn.SiLU(), nn.Linear(hidden, out))
-            for i, layer in enumerate(m):
-                if isinstance(layer, nn.Linear):
-                    nn.init.orthogonal_(layer.weight, gain if i == 4 else np.sqrt(2))
-                    nn.init.zeros_(layer.bias)
-            return m
-
-        self.pi = mlp(be.N_ACT, 0.01)
-        self.v = mlp(1, 1.0)
-
-    def forward(self, obs: torch.Tensor, mask: torch.Tensor):
-        x = ((obs - self.mean) / self.std).clamp(-10, 10)
-        logits = self.pi(x).masked_fill(~mask, -1e9)
-        return logits, self.v(x).squeeze(-1)
+# the network lives in trading_rl.burst_replay (also used by the app replay)
 
 
 def normalizer(data: be.BurstData) -> tuple[np.ndarray, np.ndarray]:

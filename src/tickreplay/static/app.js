@@ -1545,7 +1545,10 @@ async function loadAiReplayTrades(stem, date) {
   refreshMarkers();
 }
 
-const AI_PERIOD_LABEL = { train: '学習期間', val: '検証期間', test: 'テスト期間', pre_train: '学習前' };
+const AI_PERIOD_LABEL = {
+  train: '学習期間', val: '検証期間', test: 'テスト期間', pre_train: '学習前',
+  val2: '検証その2', final: '最終テスト用',
+};
 
 /** モデル名・期間・注意書き。学習/検証期間と対象外銘柄では警告を出す。 */
 function updateAiBadge() {
@@ -1565,6 +1568,8 @@ function updateAiBadge() {
     const warns = [];
     if (period === 'train') warns.push('学習に使った期間の再生です（実力ではありません）');
     if (period === 'val') warns.push('モデル選択に使った検証期間です（未使用データではありません）');
+    if (period === 'val2') warns.push('最終判定に1回使った期間です（未使用データではありません）');
+    if (period === 'final') warns.push('オーナーの最終テスト用に取ってある期間です（ここで見ると最終テストの意味が薄れます）');
     if (info.inUniverse === false) warns.push('この日の売買代金上位50に入っていない銘柄です（学習対象外）');
     warning = warns.join(' / ');
     const cfg = info.envConfig || {};
@@ -2431,7 +2436,6 @@ async function loadSession(stem, date, direction) {
 
 function toggleAiReplay() {
   const btn = document.getElementById('ai-replay-btn');
-  const panel = document.getElementById('ai-panel');
   aiReplay.enabled = !aiReplay.enabled;
   console.log('[AI Replay] Toggled:', aiReplay.enabled);
 
@@ -2440,7 +2444,7 @@ function toggleAiReplay() {
       btn.classList.add('is-active');
       btn.textContent = '🤖 AI Play: ON';
     }
-    if (panel) panel.style.display = 'flex';
+    document.body.classList.add('ai-on'); // AI の行とモデル名を出す（styles.css）
     if (els.aiModelSelect) els.aiModelSelect.hidden = false;
     void loadAiModels();
     if (state.meta?.stem && state.meta?.date) {
@@ -2453,7 +2457,7 @@ function toggleAiReplay() {
       btn.classList.remove('is-active');
       btn.textContent = '🤖 AI Play: OFF';
     }
-    if (panel) panel.style.display = 'none';
+    document.body.classList.remove('ai-on');
     if (els.aiModelSelect) els.aiModelSelect.hidden = true;
     aiReplay.requestSeq += 1; // 飛行中の応答を捨てる
     refreshMarkers();
