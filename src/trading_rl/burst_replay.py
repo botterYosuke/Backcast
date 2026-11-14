@@ -6,6 +6,12 @@ a 60 s episode of :mod:`trading_rl.burst_env`, the policy acts greedily, market 
 the last print 200 ms after the decision +/- 0.5 tick.
 
 Model keys in the app are ``burst/ppo_burst_<tag>_s<seed>.pt`` (the path below ``models/``).
+
+v3 (_Aries work 4, ``docs/paper/BURST_V3_PLAN.md`` there; the five arm-B policies the
+_Aries paper trading runs since 2026-11-12): keys ``burst/v3/ppo_v3B_s<seed>.pt`` under
+``models/burst_v3/``, detector ``detector_v3.pkl``, and the ``is_topix100`` input replaced
+by "uses the TOPIX500 fine tick table" (:mod:`trading_rl.tick_rule`).  Each policy is
+replayed alone (argmax of its own action probabilities).
 """
 
 from __future__ import annotations
@@ -29,6 +35,13 @@ REPLAY_WINDOW_US = 9000 * be.US
 MAIN_MODEL = "ppo_burst_slip1_s0.pt"  # pre-registered main policy (rl-burst-results.md)
 _NAME_RE = re.compile(r"^ppo_burst_([a-z0-9]+)_s(\d+)\.pt$")
 _TAG_JA = {"plain": "基準の約定（ずれ0.5tick）で練習", "slip1": "1tickずれで練習"}
+
+V3_DIR_NAME = "burst_v3"
+V3_MODELS_DIR = Path("models") / V3_DIR_NAME
+V3_DETECTOR_NAME = "detector_v3.pkl"
+V3_KEY_PREFIX = KEY_PREFIX + "v3/"
+V3_ARM = "B"
+_V3_NAME_RE = re.compile(r"^ppo_v3B_s(\d+)\.pt$")
 
 
 def _torch_module():
@@ -77,11 +90,25 @@ def model_files() -> list[Path]:
             if _NAME_RE.match(p.name) and "smoke" not in p.name]
 
 
+def model_files_v3() -> list[Path]:
+    """The five v3 arm-B policies (empty unless the v3 detector is there too)."""
+    if not (V3_MODELS_DIR / V3_DETECTOR_NAME).is_file():
+        return []
+    return [p for p in sorted(V3_MODELS_DIR.glob("ppo_v3B_s*.pt")) if _V3_NAME_RE.match(p.name)]
+
+
+def is_v3(path: Path | None) -> bool:
+    return path is not None and path.parent.name == V3_DIR_NAME
+
+
 def model_key(path: Path) -> str:
-    return KEY_PREFIX + path.name
+    return (V3_KEY_PREFIX if is_v3(path) else KEY_PREFIX) + path.name
 
 
 def model_label(path: Path) -> str:
+    m3 = _V3_NAME_RE.match(path.name)
+    if is_v3(path) and m3:
+        return f"激しい瞬間AI v3・腕{V3_ARM}・s{m3.group(1)}（成行・TOPIX500の呼値）"
     m = _NAME_RE.match(path.name)
     tag, seed = (m.group(1), m.group(2)) if m else (path.stem, "?")
     main = "・本命" if path.name == MAIN_MODEL else ""
@@ -92,6 +119,12 @@ def parse_key(key: str | None) -> Path | None:
     """``burst/ppo_burst_slip1_s0.pt`` -> its path when it exists, else None."""
     if not key or not key.startswith(KEY_PREFIX):
         return None
+    if key.startswith(V3_KEY_PREFIX):
+        name = key[len(V3_KEY_PREFIX):]
+        if not _V3_NAME_RE.match(name):
+            return None
+        p = V3_MODELS_DIR / name
+        return p if p.is_file() and (V3_MODELS_DIR / V3_DETECTOR_NAME).is_file() else None
     name = key[len(KEY_PREFIX):]
     if not _NAME_RE.match(name):
         return None
@@ -100,7 +133,7 @@ def parse_key(key: str | None) -> Path | None:
 
 
 def is_available() -> bool:
-    return bool(model_files())
+    return bool(model_files()) or bool(model_files_v3())
 
 
 _CACHE: dict[str, tuple[int, Any]] = {}
@@ -117,6 +150,49 @@ def _cached(path: Path, loader) -> Any:
 
 def load_detector() -> be.Detector:
     return _cached(MODELS_DIR / DETECTOR_NAME, be.Detector.load)
+
+
+def load_detector_v3() -> be.Detector:
+    return _cached(V3_MODELS_DIR / V3_DETECTOR_NAME, be.Detector.load)
+
+
+def lookup_scale_category(stem: str, date: str, cache_dir: Path | str | None = None) -> tuple[str | None, str]:
+    """``(scale_category, source)`` of the stem on ``date`` from the point-in-time universe:
+    the row of that date (``universe``), else the stem's nearest row (``universe_nearest``),
+    else ``(None, "none")``."""
+    import duckdb
+
+    from .universe import DEFAULT_CACHE_DIR, UNIVERSE_FILE
+
+    uni = Path(cache_dir or DEFAULT_CACHE_DIR) / UNIVERSE_FILE
+    if not uni.is_file():
+        return None, "none"
+    con = duckdb.connect(":memory:")
+    try:
+        row = con.execute(
+            "SELECT scale_category, date = CAST(? AS DATE) FROM read_parquet(?) WHERE lower(stem) = ? "
+            "ORDER BY abs(date_diff('day', date, CAST(? AS DATE))), date LIMIT 1",
+            [date, uni.as_posix(), stem.lower(), date],
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None, "none"
+    return row[0], ("universe" if row[1] else "universe_nearest")
+
+
+def fine_tick_v3(stem: str, date: str, prices: np.ndarray) -> dict[str, Any]:
+    """The v3 ``is_topix100`` input: TOPIX500 fine tick table or not, and why."""
+    from . import tick_rule
+
+    scale, scale_src = lookup_scale_category(stem, date)
+    measured = tick_rule.measured_table(prices)
+    fine = tick_rule.fine_rule(scale, measured)
+    if measured in ("fine", "general"):
+        src = "price_grid"
+    else:
+        src = "scale_" + scale_src if scale is not None else "default_general"
+    return {"fine": bool(fine), "scale_category": scale, "measured": measured, "source": src}
 
 
 def load_model(path: Path):
@@ -176,12 +252,13 @@ def simulate_burst_trades(
     """
     from .scalp_env import morning_window_s
 
+    v3 = key.startswith(V3_KEY_PREFIX)
     if policy is None:
         path = parse_key(key)
         if path is None:
             raise ValueError(f"not a burst model key: {key!r}")
         policy = greedy_policy(load_model(path))
-    det = load_detector()
+    det = load_detector_v3() if v3 else load_detector()
     cfg = be.BurstConfig()
     W = morning_window_s(raw.t_open_us)
     g = be.session_grid(raw, prev_close=prev_close, avg_volume_20d=avg_volume_20d,
@@ -198,6 +275,7 @@ def simulate_burst_trades(
         "latency_ms": cfg.latency_ms,
         "episode_s": be.EP_S,
         "detector_threshold": round(det.threshold, 4),
+        "tick_rule": "topix500 (v3)" if v3 else "topix100 (v1)",
     }
     trades: list[dict[str, Any]] = []
     episodes: list[dict[str, Any]] = []
@@ -249,7 +327,10 @@ __all__ = [
     "REPLAY_WINDOW_US",
     "ActorCritic",
     "is_available",
+    "fine_tick_v3",
+    "is_v3",
     "model_files",
+    "model_files_v3",
     "model_key",
     "model_label",
     "parse_key",

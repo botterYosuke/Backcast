@@ -35,6 +35,9 @@ def client(cache_dir, http_client, tick_db_factory, monkeypatch):
     tick_db_factory("7203", ROWS_7203)
     tick_db_factory("9999", AFTERNOON_ONLY_ROWS)
     monkeypatch.setenv(CACHE_DIR_ENV_VAR, str(cache_dir))
+    # these tests cover every model kind; the app default lists only the v3 arm-B burst
+    # policies (tests/test_burst_replay.py)
+    monkeypatch.setenv(server.AI_MODELS_ENV, "all")
     monkeypatch.setattr(server, "build_http_client", lambda config: http_client)
     server.reset_for_tests()
     with TestClient(server.app) as test_client:

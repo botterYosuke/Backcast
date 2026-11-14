@@ -1475,7 +1475,11 @@ async function loadAiModels() {
     aiReplay.modelsLoaded = true;
     const select = els.aiModelSelect;
     if (!select) return;
-    select.length = 1; // 先頭の「自動（既定）」だけ残す
+    select.length = 0;
+    // 一覧にないモデル（未選択を含む）は、既定（無ければ先頭）にそろえる
+    if (models.length && !models.some((m) => m.file === aiReplay.model)) {
+      aiReplay.model = (models.find((m) => m.default) || models[0]).file;
+    }
     models.forEach((m) => {
       const opt = document.createElement('option');
       opt.value = m.file;
@@ -2446,12 +2450,15 @@ function toggleAiReplay() {
     }
     document.body.classList.add('ai-on'); // AI の行とモデル名を出す（styles.css）
     if (els.aiModelSelect) els.aiModelSelect.hidden = false;
-    void loadAiModels();
-    if (state.meta?.stem && state.meta?.date) {
-      void loadAiReplayTrades(state.meta.stem, state.meta.date);
-    } else {
-      updateAiReplayDisplay();
-    }
+    // モデル一覧を先に読み、選ばれたモデルで再生を頼む
+    void loadAiModels().then(() => {
+      if (!aiReplay.enabled) return;
+      if (state.meta?.stem && state.meta?.date) {
+        void loadAiReplayTrades(state.meta.stem, state.meta.date);
+      } else {
+        updateAiReplayDisplay();
+      }
+    });
   } else {
     if (btn) {
       btn.classList.remove('is-active');

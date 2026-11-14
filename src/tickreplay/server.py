@@ -22,6 +22,7 @@ operation-start handshake, consumed by Step 8's frontend polling).
 from __future__ import annotations
 
 import mimetypes
+import os
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -546,13 +547,38 @@ def _model_file_key(path: Path) -> str:
         return path.name
 
 
+#: Which AI models the app offers.  ``burst_v3B`` (default): only the five burst v3
+#: arm-B policies the _Aries paper trading runs; ``all``: every model as before.
+AI_MODELS_ENV = "TICKREPLAY_AI_MODELS"
+AI_MODELS_V3B = "burst_v3B"
+
+
+def _ai_model_set() -> str:
+    return (os.environ.get(AI_MODELS_ENV) or AI_MODELS_V3B).strip()
+
+
+def _v3b_models() -> list[dict[str, object]]:
+    from trading_rl import burst_replay
+
+    files = burst_replay.model_files_v3()
+    return [
+        {"file": burst_replay.model_key(p), "kind": burst_replay.KIND_BURST,
+         "label": burst_replay.model_label(p), "default": i == 0}
+        for i, p in enumerate(files)
+    ]
+
+
 @app.get("/api/ai/models")
 def read_ai_models() -> list[dict[str, object]]:
     """``models/*.pt`` with kind (``scalp`` limit-order / ``market`` legacy) and a label.
 
     ``default`` marks the checkpoint the replay uses when no ``model`` is given
-    (for a stem without its own model).
+    (for a stem without its own model).  Under the default model set
+    (``TICKREPLAY_AI_MODELS`` unset or ``burst_v3B``) only the five v3 arm-B burst
+    policies are listed, the first one as the default.
     """
+    if _ai_model_set() != "all":
+        return _v3b_models()
     from trading_rl.scalp_replay import checkpoint_kind, load_checkpoint_cached
 
     default = _resolve_model_checkpoint("")
@@ -588,7 +614,7 @@ def read_ai_models() -> list[dict[str, object]]:
     out.extend(
         {"file": burst_replay.model_key(p), "kind": burst_replay.KIND_BURST,
          "label": burst_replay.model_label(p), "default": False}
-        for p in burst_replay.model_files()
+        for p in [*burst_replay.model_files(), *burst_replay.model_files_v3()]
     )
     return out
 
@@ -620,6 +646,12 @@ def read_ai_replay_trades(
         return {**unavailable_resp, "reason": reason}
 
     from trading_rl import burst_replay, predictor_replay
+
+    if not model and _ai_model_set() != "all":
+        v3b = _v3b_models()
+        if not v3b:
+            return unavailable("burst v3 models not found (models/burst_v3/)")
+        model = str(v3b[0]["file"])
 
     # 1. Resolve model checkpoint (or a stage-2 predictor preset / a burst-RL model)
     preset = predictor_replay.parse_key(model)
@@ -723,12 +755,18 @@ def read_ai_replay_trades(
     try:
         if kind == burst_replay.KIND_BURST:
             assert scalp_info is not None and model is not None
+            # v3 was trained with is_topix100 = "uses the TOPIX500 fine tick table"
+            fine_info = (
+                burst_replay.fine_tick_v3(session.stem, session.date, opening_data.price)
+                if burst_replay.is_v3(burst_path) else None
+            )
+            t100 = fine_info["fine"] if fine_info else scalp_info.is_topix100
             trades, summary, episodes, env_config = burst_replay.simulate_burst_trades(
                 opening_data,
                 model,
                 prev_close=scalp_info.prev_close,
                 avg_volume_20d=scalp_info.avg_volume_20d,
-                is_topix100=scalp_info.is_topix100,
+                is_topix100=t100,
                 held=is_heldout(session.stem),
             )
             response = {
@@ -736,9 +774,12 @@ def read_ai_replay_trades(
                 "in_universe": scalp_info.in_universe,
                 "period": burst_replay.period_of(session.date),
                 "is_heldout": is_heldout(session.stem),
-                "is_topix100": scalp_info.is_topix100,
+                "is_topix100": t100,
+                "fine_tick": fine_info,
                 "session_info_source": scalp_info.source,
-                "topix100_source": scalp_info.topix100_source,
+                "topix100_source": (
+                    fine_info["source"] if fine_info else scalp_info.topix100_source
+                ),
                 "features": "gate28+micro11 (push20) + detector",
                 "burst_episodes": episodes,
             }
